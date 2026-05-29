@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  daemon:
+    name: notary-daemon (Rust)
+    runs-on: ubuntu-latest
+    # The daemon git-deps `rave_engine` from the PRIVATE unytco/unyt repo, so the
+    # build needs read access to it. CI uses a read-only token secret
+    # (UNYT_REPO_TOKEN) + git-fetch-with-cli; local devs use their own SSH/HTTPS
+    # creds. The dep branch (feat/migration-upgrade today, develop after merge)
+    # must be pushed for the build to resolve.
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    defaults:
+      run:
+        working-directory: notary-daemon
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure cargo git auth for private unyt repo
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.UNYT_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: notary-daemon
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
+  router:
+    name: router (Cloudflare Worker, TS)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: router
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: router/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

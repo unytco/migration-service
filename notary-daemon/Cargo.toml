@@ -1,0 +1,51 @@
+[package]
+name = "migration-notary"
+version = "0.1.0"
+edition = "2021"
+description = "Notary daemon for unyt DNA migration — reads + validates + signs a predecessor close state on the old DNA"
+license = "CAL-1.0"
+
+[lib]
+name = "migration_notary"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migration-notary"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async trait (Conductor abstraction for mockable zome calls)
+async-trait = "0.1"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+# Holochain bridge — same stack as pricing_oracle / watchtower-observer
+ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+holochain_client = "0.8.1"
+holo_hash = { version = "0.6.1", features = ["encoding"] }
+# Same hdi the unyt workspace pins (rave_engine uses hdi 0.7.1) so Signature /
+# Timestamp / hash types are identical to the ones in the zome-call payloads.
+hdi = "0.7.1"
+
+# Shared migration protocol types (NotaryReadRequest / NotaryReadResponse /
+# SummaryStatePayload / SummaryState / Signature). Git dep so this repo builds
+# and runs CI standalone. Pinned to the branch where the migration types live;
+# moves to `develop` once feat/migration-upgrade merges. Using the real types
+# (not a hand mirror) keeps the msgpack-in / JSON-out re-emission faithful.
+rave_engine = { git = "https://github.com/unytco/unyt.git", branch = "feat/migration-upgrade", package = "rave_engine" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

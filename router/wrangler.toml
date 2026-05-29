@@ -1,0 +1,17 @@
+name = "migration-router"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Bundled registry (registry.json) is imported by src/index.ts — no extra config.
+# JSON module imports are supported by the default bundler.
+
+# Runtime secrets (set once with `wrangler secret put`, NOT committed):
+#   MIGRATION_NOTARY_BEARER_TOKEN   bearer token shared with every notary daemon
+#   CF_ACCESS_CLIENT_ID             Cloudflare Access service-token id
+#   CF_ACCESS_CLIENT_SECRET         Cloudflare Access service-token secret
+#
+# Deploy is automated on push to `main` via .github/workflows/deploy.yml
+# (cloudflare/wrangler-action + CLOUDFLARE_API_TOKEN repo secret).
+
+[observability]
+enabled = true

@@ -1,0 +1,87 @@
+// Route handlers. Kept free of the Worker runtime so they're unit-testable with
+// an injected registry + fetch.
+
+import { errorJson, ok } from "./errors";
+import { Registry } from "./registry";
+import { notarize, type Env, type FetchLike } from "./notary";
+
+export const API_VERSIONS = ["v1"] as const;
+export const PROTOCOL_VERSIONS = ["v0_1"] as const;
+
+export function healthz(): Response {
+  return ok({ status: "ok", api_versions: API_VERSIONS, protocol_versions: PROTOCOL_VERSIONS });
+}
+
+/** GET /v1/migration-options?to_dna_hash= */
+export function migrationOptions(registry: Registry, toDnaHash: string | null): Response {
+  if (!toDnaHash) {
+    return errorJson(400, "unknown_to_dna", "to_dna_hash query parameter is required");
+  }
+  const predecessor = registry.predecessorOf(toDnaHash);
+  const options = predecessor
+    ? [{ from_dna_hash: predecessor.dna_hash, from_version: predecessor.version }]
+    : [];
+  return ok({ to_dna_hash: toDnaHash, options });
+}
+
+export interface MigrateBody {
+  from_dna_hash?: string;
+  to_dna_hash?: string;
+  agent_pubkey?: string;
+}
+
+/** POST /v1/migrate */
+export async function migrate(
+  registry: Registry,
+  body: MigrateBody,
+  env: Env,
+  fetchImpl: FetchLike,
+): Promise<Response> {
+  const { from_dna_hash, to_dna_hash, agent_pubkey } = body;
+  if (!from_dna_hash || !to_dna_hash || !agent_pubkey) {
+    return errorJson(400, "internal", "from_dna_hash, to_dna_hash and agent_pubkey are required");
+  }
+
+  // 1. Validate the pair against the upgrades_from chain.
+  const toEntry = registry.get(to_dna_hash);
+  if (!toEntry) return errorJson(400, "unknown_to_dna", `unknown to_dna_hash ${to_dna_hash}`);
+  if (!registry.get(from_dna_hash)) {
+    return errorJson(400, "unknown_from_dna", `unknown from_dna_hash ${from_dna_hash}`);
+  }
+  if (!toEntry.upgrades_from) {
+    return errorJson(400, "to_is_chain_root", `${to_dna_hash} is a chain root (no predecessor)`);
+  }
+  if (toEntry.upgrades_from !== from_dna_hash) {
+    return errorJson(
+      400,
+      "not_registered_predecessor",
+      `${from_dna_hash} is not the registered predecessor of ${to_dna_hash}`,
+      { expected_from_dna_hash: toEntry.upgrades_from },
+    );
+  }
+
+  // 2. Candidate notaries serving the from-DNA (1..N).
+  const candidates = registry.get(from_dna_hash)!.notaries;
+  if (candidates.length === 0) {
+    return errorJson(500, "all_orgs_unhealthy", `no notaries registered for ${from_dna_hash}`);
+  }
+
+  // 3. Try each in order; hard stops propagate immediately, transient → next.
+  let sawUnableToVerify = false;
+  for (const notaryEntry of candidates) {
+    const outcome = await notarize(notaryEntry.url, agent_pubkey, env, fetchImpl);
+    if (outcome.kind === "verified") {
+      // 4. Forward { payload, signature } verbatim.
+      return ok({ payload: outcome.payload, signature: outcome.signature });
+    }
+    if (outcome.kind === "hard_stop") {
+      return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
+    }
+    if (outcome.code === "unable_to_verify") sawUnableToVerify = true;
+  }
+
+  // All candidates failed transiently.
+  return sawUnableToVerify
+    ? errorJson(503, "unable_to_verify", "all notaries were unable to verify the close state")
+    : errorJson(503, "all_orgs_unhealthy", "all notaries for the from-DNA are unavailable");
+}

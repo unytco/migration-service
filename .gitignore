@@ -1,0 +1,15 @@
+# Rust
+/notary-daemon/target
+target/
+**/*.rs.bk
+
+# Node / Worker
+node_modules/
+router/node_modules/
+router/dist/
+router/.wrangler/
+.dev.vars
+
+# misc
+.DS_Store
+*.log
