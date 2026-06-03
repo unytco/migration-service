@@ -68,7 +68,8 @@ export async function migrate(
   // 1. Validate the pair against the upgrades_from chain.
   const toEntry = registry.get(to_dna_hash);
   if (!toEntry) return errorJson(400, "unknown_to_dna", `unknown to_dna_hash ${to_dna_hash}`);
-  if (!registry.get(from_dna_hash)) {
+  const fromEntry = registry.get(from_dna_hash);
+  if (!fromEntry) {
     return errorJson(400, "unknown_from_dna", `unknown from_dna_hash ${from_dna_hash}`);
   }
   if (!toEntry.upgrades_from) {
@@ -84,13 +85,13 @@ export async function migrate(
   }
 
   // 2. Candidate notaries serving the from-DNA (1..N).
-  const candidates = registry.get(from_dna_hash)!.notaries;
+  const candidates = fromEntry.notaries;
   if (candidates.length === 0) {
     return errorJson(500, "all_orgs_unhealthy", `no notaries registered for ${from_dna_hash}`);
   }
 
   // 3. Try each in order; hard stops propagate immediately, transient → next.
-  let sawUnableToVerify = false;
+  const transientCodes: string[] = [];
   for (const notaryEntry of candidates) {
     const outcome = await notarize(notaryEntry.url, agent_pubkey, env, fetchImpl);
     if (outcome.kind === "verified") {
@@ -100,11 +101,23 @@ export async function migrate(
     if (outcome.kind === "hard_stop") {
       return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
     }
-    if (outcome.code === "unable_to_verify") sawUnableToVerify = true;
+    transientCodes.push(outcome.code);
   }
 
-  // All candidates failed transiently.
-  return sawUnableToVerify
-    ? errorJson(503, "unable_to_verify", "all notaries were unable to verify the close state")
-    : errorJson(503, "all_orgs_unhealthy", "all notaries for the from-DNA are unavailable");
+  // All candidates failed transiently. Surface the most informative cause rather
+  // than collapsing a config/auth/rate-limit fault into a generic "unavailable".
+  if (transientCodes.includes("unable_to_verify")) {
+    return errorJson(503, "unable_to_verify", "all notaries were unable to verify the close state");
+  }
+  if (transientCodes.includes("auth_failed")) {
+    return errorJson(
+      502,
+      "auth_failed",
+      "notaries rejected the router's credentials — service misconfiguration",
+    );
+  }
+  if (transientCodes.includes("rate_limited")) {
+    return errorJson(503, "rate_limited", "notaries are rate limiting requests; retry shortly");
+  }
+  return errorJson(503, "all_orgs_unhealthy", "all notaries for the from-DNA are unavailable");
 }

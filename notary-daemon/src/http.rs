@@ -21,6 +21,19 @@ use crate::conductor::Conductor;
 pub const API_VERSIONS: &[&str] = &["v1"];
 pub const PROTOCOL_VERSIONS: &[&str] = &["v0_1"];
 
+/// Machine-readable error codes — the daemon half of the cross-service contract.
+/// These MUST stay in sync with the router's `ErrorCode` union in
+/// `router/src/errors.ts`, which switches on these exact strings. Defined once
+/// here rather than as scattered literals so a code can't silently drift.
+mod codes {
+    pub const AUTH_FAILED: &str = "auth_failed";
+    pub const WARRANTED: &str = "warranted";
+    pub const NO_CLOSE_FOUND: &str = "no_close_found";
+    pub const TOO_NEW: &str = "too_new";
+    pub const UNABLE_TO_VERIFY: &str = "unable_to_verify";
+    pub const INTERNAL: &str = "internal";
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub conductor: Arc<dyn Conductor>,
@@ -68,7 +81,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
             .into_response(),
         Err(e) => error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "internal",
+            codes::INTERNAL,
             format!("conductor unreachable: {e}"),
         ),
     }
@@ -95,7 +108,7 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
     if !check_bearer(&headers, &state.bearer_token) {
         return error(
             StatusCode::UNAUTHORIZED,
-            "auth_failed",
+            codes::AUTH_FAILED,
             "missing or invalid bearer token",
         );
     }
@@ -105,7 +118,7 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
         Err(e) => {
             return error(
                 StatusCode::BAD_REQUEST,
-                "internal",
+                codes::INTERNAL,
                 format!("invalid request body: {e}"),
             )
         }
@@ -115,7 +128,7 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
         Err(e) => {
             return error(
                 StatusCode::BAD_REQUEST,
-                "internal",
+                codes::INTERNAL,
                 format!("invalid agent_pubkey: {e}"),
             )
         }
@@ -134,33 +147,33 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
             .into_response(),
         Ok(NotaryReadResponse::Warranted(warrants)) => error_with_details(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "warranted",
+            codes::WARRANTED,
             "the agent's chain carries warrants",
             json!({ "warrants": warrants }),
         ),
         Ok(NotaryReadResponse::NoCloseFound) => error(
             StatusCode::NOT_FOUND,
-            "no_close_found",
+            codes::NO_CLOSE_FOUND,
             "no ClosingStateSummary on the agent's chain (close on the from-DNA first)",
         ),
         Ok(NotaryReadResponse::TooNew {
             earliest_acceptable,
         }) => error_with_details(
             StatusCode::CONFLICT,
-            "too_new",
+            codes::TOO_NEW,
             "close action is younger than the freshness window",
             json!({ "earliest_acceptable": earliest_acceptable }),
         ),
         Ok(NotaryReadResponse::UnableToVerify) => error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "unable_to_verify",
+            codes::UNABLE_TO_VERIFY,
             "notary could not read/verify the agent's chain",
         ),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "notary_read_predecessor_close failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
+                codes::INTERNAL,
                 "internal error",
             )
         }

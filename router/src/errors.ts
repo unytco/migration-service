@@ -1,5 +1,10 @@
 // Uniform error envelope shared shape with the notary daemon.
 // `code` is the stable machine-readable contract; clients switch on it.
+//
+// This `ErrorCode` union is the single source of truth for the contract. The
+// daemon mirrors the codes it emits in `notary-daemon/src/http.rs` (`mod codes`),
+// and the app maps them in `migration-open-service.ts`'s `fetchMigrate`. Keep all
+// three in sync when adding or renaming a code.
 
 export type ErrorCode =
   | "unknown_to_dna"
