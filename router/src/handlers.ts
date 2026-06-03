@@ -24,6 +24,29 @@ export function migrationOptions(registry: Registry, toDnaHash: string | null): 
   return ok({ to_dna_hash: toDnaHash, options });
 }
 
+/** GET /v1/update-check?current_dna_hash=
+ * Forward lookup: given the app's currently-installed DNA, is there a newer one to
+ * migrate to, and where to download it. Detection-only — no auth, no notary calls. */
+export function updateCheck(registry: Registry, currentDnaHash: string | null): Response {
+  if (!currentDnaHash) {
+    return errorJson(400, "unknown_current_dna", "current_dna_hash query parameter is required");
+  }
+  const successor = registry.successorOf(currentDnaHash);
+  if (!successor) {
+    // Unknown DNA or chain tip — either way, nothing to upgrade to.
+    return ok({ current_dna_hash: currentDnaHash, has_upgrade: false });
+  }
+  return ok({
+    current_dna_hash: currentDnaHash,
+    has_upgrade: true,
+    successor: {
+      to_dna_hash: successor.dna_hash,
+      to_version: successor.version,
+      ...(successor.release_url !== undefined ? { release_url: successor.release_url } : {}),
+    },
+  });
+}
+
 export interface MigrateBody {
   from_dna_hash?: string;
   to_dna_hash?: string;

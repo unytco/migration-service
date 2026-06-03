@@ -62,4 +62,17 @@ describe("Registry.load", () => {
     expect(r.predecessorOf(v01)).toBeUndefined(); // chain root
     expect(r.predecessorOf("unknown")).toBeUndefined();
   });
+
+  it("successorOf walks one step forward", () => {
+    const r = Registry.load(chain());
+    expect(r.successorOf(v01)?.dna_hash).toBe(v02); // not v03
+    expect(r.successorOf(v03)).toBeUndefined(); // chain tip
+    expect(r.successorOf("unknown")).toBeUndefined();
+  });
+
+  it("rejects a fork (two successors of one DNA)", () => {
+    const raw = chain();
+    raw.dnas.push({ dna_hash: "uhC0k_v02b", version: "alliance-v0.2.0b", upgrades_from: v01, notaries: [] });
+    expect(() => Registry.load(raw)).toThrow(/multiple successors/);
+  });
 });

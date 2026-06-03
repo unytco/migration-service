@@ -1,8 +1,8 @@
 //! Notary daemon library surface. The binary (`main.rs`) wires this up; tests
 //! drive `router()` with a mock `Conductor`.
 
-pub mod config;
 pub mod conductor;
+pub mod config;
 pub mod http;
 
 use std::sync::Arc;

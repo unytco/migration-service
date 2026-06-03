@@ -4,6 +4,7 @@
     {
       "dna_hash": "uhC0kREPLACE_WITH_v0_1_DNA_HASH",
       "version": "alliance-v0.1.0",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.1.0",
       "notaries": [
         { "url": "https://notary-1-v01.unyt.dev" }
       ]

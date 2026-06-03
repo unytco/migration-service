@@ -9,7 +9,7 @@ import registryJson from "../registry.json";
 import { Registry, type RawRegistry } from "./registry";
 import { errorJson } from "./errors";
 import type { Env } from "./notary";
-import { healthz, migrate, migrationOptions, type MigrateBody } from "./handlers";
+import { healthz, migrate, migrationOptions, updateCheck, type MigrateBody } from "./handlers";
 
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
@@ -42,6 +42,9 @@ export default {
       }
       if (request.method === "GET" && pathname === "/v1/migration-options") {
         return withCors(migrationOptions(registry, url.searchParams.get("to_dna_hash")));
+      }
+      if (request.method === "GET" && pathname === "/v1/update-check") {
+        return withCors(updateCheck(registry, url.searchParams.get("current_dna_hash")));
       }
       if (request.method === "POST" && pathname === "/v1/migrate") {
         let body: MigrateBody;

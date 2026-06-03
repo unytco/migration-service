@@ -4,6 +4,7 @@
 export type ErrorCode =
   | "unknown_to_dna"
   | "unknown_from_dna"
+  | "unknown_current_dna"
   | "to_is_chain_root"
   | "not_registered_predecessor"
   | "auth_failed"
