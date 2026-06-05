@@ -24,7 +24,7 @@ zome call on its new-DNA conductor — no daemon can do that (it opens the agent
 own chain).
 
 Design + protocol contract: see
-`workshop/docs/features/dna-migration/architecture/service-migration-service.md`.
+`workshop/documentation/specs/dna-migration/service-migration-service.md`.
 
 ## Layout
 
