@@ -23,8 +23,8 @@ The app completes the flow itself with a single `migration_init_with_signature`
 zome call on its new-DNA conductor — no daemon can do that (it opens the agent's
 own chain).
 
-Design + protocol contract: see the unyt repo's
-`docs/architecture/features/dna-migration/service-migration-service.md`.
+Design + protocol contract: see
+`workshop/docs/features/dna-migration/architecture/service-migration-service.md`.
 
 ## Layout
 
