@@ -45,6 +45,14 @@ impl MockConductor {
             response: Mutex::new(Some(resp)),
         })
     }
+
+    /// A conductor whose `ping()` fails — drives the `/healthz` down path.
+    fn down() -> Arc<Self> {
+        Arc::new(Self {
+            ping_ok: false,
+            response: Mutex::new(None),
+        })
+    }
 }
 
 #[async_trait]
@@ -88,6 +96,26 @@ fn notarize_req(token: Option<&str>) -> Request<Body> {
         agent_b64()
     )))
     .unwrap()
+}
+
+/// A `/v1/notarize` request with an arbitrary raw body (for the malformed-input
+/// path), bearer-authed so it reaches the body parse.
+fn notarize_req_raw(body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/notarize")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn healthz_req() -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn send(
@@ -225,4 +253,44 @@ fn verified_envelope_round_trips_into_migration_init_request() {
         "payload must survive the wire round-trip"
     );
     assert_eq!(req.signature, signature);
+}
+
+// C3 — `/healthz` reflects conductor liveness.
+
+#[tokio::test]
+async fn healthz_is_200_when_conductor_up() {
+    let c = MockConductor::with(Ok(NotaryReadResponse::NoCloseFound));
+    let (status, body) = send(c, healthz_req()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn healthz_is_503_when_conductor_down() {
+    let (status, body) = send(MockConductor::down(), healthz_req()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "internal");
+}
+
+// C3 + B5 — client-side input errors short-circuit to a distinct `bad_request`
+// 4xx (so the router hard-stops instead of fanning across every notary).
+
+#[tokio::test]
+async fn unparseable_body_is_400_bad_request() {
+    let c = MockConductor::with(Ok(NotaryReadResponse::NoCloseFound));
+    let (status, body) = send(c, notarize_req_raw("not json{")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn invalid_agent_pubkey_is_400_bad_request() {
+    let c = MockConductor::with(Ok(NotaryReadResponse::NoCloseFound));
+    let (status, body) = send(
+        c,
+        notarize_req_raw(r#"{"agent_pubkey":"not-a-valid-b64-key"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
 }

@@ -27,6 +27,18 @@ function withCors(resp: Response): Response {
 // so the Worker fails fast (and /healthz never returns ok).
 const registry = Registry.load(registryJson as RawRegistry);
 
+// B7: the shipped registry still carries the placeholder DNA hash + stub notary
+// URL (real provisioning is plan 07). Log an un-provisioned line at startup so a
+// mis-deploy of the placeholder to a real environment is obvious in the logs.
+const REGISTRY_PLACEHOLDER = "uhC0kREPLACE_WITH_v0_1_DNA_HASH";
+if ((registryJson as RawRegistry).dnas.some((d) => d.dna_hash === REGISTRY_PLACEHOLDER)) {
+  console.warn(
+    "migration-router: registry.json is UN-PROVISIONED — still contains the " +
+      `placeholder DNA hash "${REGISTRY_PLACEHOLDER}". /v1/migrate will not work ` +
+      "until registry.json is populated with live DNA hashes + notary URLs (plan 07).",
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") {
