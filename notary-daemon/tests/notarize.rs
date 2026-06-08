@@ -17,7 +17,8 @@ use migration_notary::conductor::Conductor;
 use migration_notary::http::{router, AppState};
 
 use rave_engine::types::entries::migration::v0_1::{
-    NotaryReadRequest, NotaryReadResponse, SummaryState, SummaryStatePayload, SummaryTx,
+    MigrationInitRequest, NotaryReadRequest, NotaryReadResponse, SummaryState, SummaryStatePayload,
+    SummaryTx,
 };
 
 const TOKEN: &str = "test-token";
@@ -115,6 +116,7 @@ fn dummy_summary_state() -> SummaryState {
             reclaims: vec![],
             spend_links: vec![],
         },
+        agreement_carry_forward: vec![],
     }
 }
 
@@ -137,6 +139,7 @@ async fn wrong_bearer_is_401() {
 #[tokio::test]
 async fn verified_is_200_with_payload_and_signature() {
     let payload = SummaryStatePayload {
+        agent_pubkey: holo_hash::AgentPubKey::from_raw_36(vec![3; 36]),
         dna_hash: holo_hash::DnaHash::from_raw_36(vec![1; 36]),
         closing_state: dummy_summary_state(),
         last_action: holo_hash::ActionHash::from_raw_36(vec![2; 36]),
@@ -190,4 +193,36 @@ async fn zome_error_is_500_internal() {
     let (status, body) = send(c, notarize_req(Some(TOKEN))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["error"]["code"], "internal");
+}
+
+/// Wire round-trip smoke (the one thing the mocked HTTP tests bypass): the
+/// envelope the daemon's `Verified` branch serializes (a `payload` plus a
+/// `signature`) must decode back into the app's `MigrationInitRequest` using
+/// the same `rave_engine` v0_1 types. Locks the agent-bound payload shape
+/// (`agent_pubkey` and `closing_state.agreement_carry_forward`) against silent
+/// serde drift between the daemon output and the app's
+/// `migration_init_with_signature` input. A live-conductor end-to-end smoke
+/// remains BACKLOG B26.
+#[test]
+fn verified_envelope_round_trips_into_migration_init_request() {
+    let payload = SummaryStatePayload {
+        agent_pubkey: holo_hash::AgentPubKey::from_raw_36(vec![3; 36]),
+        dna_hash: holo_hash::DnaHash::from_raw_36(vec![1; 36]),
+        closing_state: dummy_summary_state(),
+        last_action: holo_hash::ActionHash::from_raw_36(vec![2; 36]),
+    };
+    let signature = hdi::prelude::Signature([7u8; 64]);
+
+    // Exactly what `notarize`'s 200 branch emits.
+    let envelope = serde_json::json!({ "payload": payload, "signature": signature });
+
+    // Exactly what the app builds from the router's verbatim forward.
+    let req: MigrationInitRequest = serde_json::from_value(envelope)
+        .expect("daemon Verified envelope must decode into MigrationInitRequest");
+
+    assert_eq!(
+        req.payload, payload,
+        "payload must survive the wire round-trip"
+    );
+    assert_eq!(req.signature, signature);
 }
