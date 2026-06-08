@@ -13,6 +13,8 @@ export interface DnaEntry {
   version: string;
   /** dna_hash of the immediate predecessor; absent on chain roots. */
   upgrades_from?: string;
+  /** Where to download the build for this DNA (e.g. a GitHub release page). Surfaced by /v1/update-check. */
+  release_url?: string;
   /** 1..N notary daemons serving this DNA (redundancy / failover). */
   notaries: NotaryEntry[];
 }
@@ -52,10 +54,21 @@ export class Registry {
       if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
       if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
     }
-    // upgrades_from resolves
+    // upgrades_from resolves, and each predecessor has at most one successor
+    // (the chain is linear — forward lookup must be unambiguous).
+    const successorOfHash = new Map<string, string>();
     for (const d of raw.dnas) {
-      if (d.upgrades_from && !seen.has(d.upgrades_from)) {
-        throw new Error(`upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`);
+      if (d.upgrades_from) {
+        if (!seen.has(d.upgrades_from)) {
+          throw new Error(`upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`);
+        }
+        const existing = successorOfHash.get(d.upgrades_from);
+        if (existing) {
+          throw new Error(
+            `${d.upgrades_from} has multiple successors (${existing} and ${d.dna_hash})`,
+          );
+        }
+        successorOfHash.set(d.upgrades_from, d.dna_hash);
       }
     }
     // no cycles — walk each chain back to a root
@@ -83,5 +96,14 @@ export class Registry {
     const entry = this.byHash.get(toDnaHash);
     if (!entry?.upgrades_from) return undefined;
     return this.byHash.get(entry.upgrades_from);
+  }
+
+  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any.
+   * `load()` guarantees at most one, so this forward lookup is unambiguous. */
+  successorOf(fromDnaHash: string): DnaEntry | undefined {
+    for (const entry of this.byHash.values()) {
+      if (entry.upgrades_from === fromDnaHash) return entry;
+    }
+    return undefined;
   }
 }

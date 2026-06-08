@@ -27,12 +27,15 @@ export interface HardStop {
   details?: unknown;
 }
 
-/** Transient: this notary failed, but another may succeed. `code` distinguishes
- * a reachable-but-couldn't-verify daemon (`unable_to_verify`) from an
- * unreachable/unhealthy one (`all_orgs_unhealthy`), so the router can aggregate. */
+/** Transient: this notary failed, but another may succeed. `code` carries the
+ * daemon's machine-readable cause (`unable_to_verify`, `auth_failed`,
+ * `rate_limited`, `internal`, …) or `all_orgs_unhealthy` for an unreachable
+ * daemon, so the router can aggregate and surface the most informative final error
+ * — e.g. a fleet-wide `auth_failed` (shared-token misconfig) must not read as a
+ * generic outage. */
 export interface Transient {
   kind: "transient";
-  code: "unable_to_verify" | "all_orgs_unhealthy";
+  code: string;
 }
 
 export type NotarizeOutcome = VerifiedResult | HardStop | Transient;
@@ -87,11 +90,8 @@ export async function notarize(
   if (HARD_STOP_CODES.has(code)) {
     return { kind: "hard_stop", status: resp.status, code: code as ErrorCode, message, details };
   }
-  // A reachable daemon that couldn't verify → unable_to_verify; any other error
-  // (internal, auth_failed, unexpected) → treat the daemon as unhealthy and try
-  // the next candidate.
-  return {
-    kind: "transient",
-    code: code === "unable_to_verify" ? "unable_to_verify" : "all_orgs_unhealthy",
-  };
+  // Not a hard stop: this daemon failed but another candidate may succeed. Preserve
+  // the daemon's code (unable_to_verify, auth_failed, rate_limited, internal, …) so
+  // the router can surface the real cause if every candidate fails the same way.
+  return { kind: "transient", code };
 }

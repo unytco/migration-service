@@ -23,8 +23,8 @@ The app completes the flow itself with a single `migration_init_with_signature`
 zome call on its new-DNA conductor — no daemon can do that (it opens the agent's
 own chain).
 
-Design + protocol contract: see the unyt repo's
-`docs/architecture/features/dna-migration/service-migration-service.md`.
+Design + protocol contract: see
+`workshop/documentation/specs/dna-migration/service-migration-service.md`.
 
 ## Layout
 
@@ -37,28 +37,32 @@ notary-daemon/  Rust crate — axum + ham
 ## Build status
 
 - **router/** — builds and tests green: `npm ci && npm run typecheck && npm test`
-  (21 tests passing). Self-contained, no private deps.
-- **notary-daemon/** — written; **not yet compiled against the real deps** because
-  it git-deps `rave_engine` from the **private** `unytco/unyt` repo. First build
-  needs the preconditions below. The HTTP↔zome mapping tests mock the conductor,
-  so they need no Holochain — only the deps must resolve.
+  (36 tests passing). Self-contained, no private deps.
+- **notary-daemon/** — **builds and tests green** against the real
+  `rave_engine`/`ham` deps: `cd notary-daemon && cargo test` (8 `tests/notarize.rs`
+  cases). Needs read access to the private `unytco/unyt` repo (see local setup
+  below). The HTTP↔zome mapping tests mock the conductor, so they need no
+  Holochain conductor — only the deps must resolve.
 
-### First-build checklist (notary-daemon)
+### Local build setup (notary-daemon)
 
-1. **Push the `rave_engine` branch** the dep points at (`feat/migration-upgrade`
-   today; switch the dep to `develop` once it merges). The migration wire types
-   (`NotaryReadRequest`/`NotaryReadResponse`/`SummaryStatePayload`) live there.
-2. **Provide read access to the private `unytco/unyt` repo:**
-   - Local: SSH or an HTTPS credential helper for github.com.
-   - CI: set repo secret `UNYT_REPO_TOKEN` (read-only) — `ci.yml` already wires
-     it via `git config insteadOf` + `CARGO_NET_GIT_FETCH_WITH_CLI`.
-3. `cd notary-daemon && cargo test` — expect the 8 `tests/notarize.rs` cases to
-   pass. On first build, confirm the `hdi::prelude::{Signature, Timestamp}` and
-   `holo_hash` imports resolve against the pinned `hdi 0.7.1` / `holo_hash 0.6.1`
-   (version-aligned with the unyt workspace).
-4. **Manual smoke (real conductor):** lock the `payload`/`signature` JSON
-   round-trip (daemon output ⇄ app `MigrationInitRequest` decode) — the one thing
-   the mocked tests can't prove. See the service doc § "Wire format".
+The daemon git-deps `rave_engine` from the **private** `unytco/unyt` repo on the
+`feat/migration-upgrade` branch (switch the dep to `develop` once it merges).
+To build locally with an SSH key that has read access:
+
+```bash
+# Make cargo fetch git deps via the system git, and route unytco GitHub deps over SSH.
+printf '\n[net]\ngit-fetch-with-cli = true\n' >> ~/.cargo/config.toml
+git config --global url."git@github.com:unytco/".insteadOf "https://github.com/unytco/"
+cd notary-daemon && cargo test   # 8 tests pass
+```
+
+CI uses the read-only `UNYT_REPO_TOKEN` secret instead — `ci.yml` wires it via
+`git config insteadOf` + `CARGO_NET_GIT_FETCH_WITH_CLI`.
+
+**Still to verify — manual smoke (real conductor):** lock the `payload`/`signature`
+JSON round-trip (daemon output ⇄ app `MigrationInitRequest` decode) — the one
+thing the mocked tests can't prove. See the service doc § "Wire format".
 
 > If the private-repo dep becomes a friction point, the alternative is to mirror
 > the v0_1 wire types locally (as `pricing_oracle` does) or publish a small

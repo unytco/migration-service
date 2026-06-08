@@ -34,12 +34,9 @@ impl HamConductor {
         let ham_cfg = ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
             .with_request_timeout_secs(cfg.request_timeout_secs);
         let backoff = ham::BackoffConfig::default();
-        let ham = ham::connect_with_backoff(
-            || ham::Ham::connect(ham_cfg.clone()),
-            &backoff,
-            shutdown,
-        )
-        .await?;
+        let ham =
+            ham::connect_with_backoff(|| ham::Ham::connect(ham_cfg.clone()), &backoff, shutdown)
+                .await?;
         Some(Self {
             ham,
             role_name: cfg.role_name.clone(),
@@ -58,7 +55,12 @@ impl Conductor for HamConductor {
         req: NotaryReadRequest,
     ) -> Result<NotaryReadResponse> {
         self.ham
-            .call_zome(&self.role_name, "transactor", "notary_read_predecessor_close", req)
+            .call_zome(
+                &self.role_name,
+                "transactor",
+                "notary_read_predecessor_close",
+                req,
+            )
             .await
             .context("notary_read_predecessor_close zome call failed")
     }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
-import { migrate, migrationOptions, type MigrateBody } from "../src/handlers";
+import { migrate, migrationOptions, updateCheck, type MigrateBody } from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
 
 const v01 = "uhC0k_v01";
@@ -15,7 +15,13 @@ function registry(): Registry {
     version: 1,
     dnas: [
       { dna_hash: v01, version: "alliance-v0.1.0", notaries: [{ url: "https://n1a" }, { url: "https://n1b" }] },
-      { dna_hash: v02, version: "alliance-v0.2.0", upgrades_from: v01, notaries: [{ url: "https://n2" }] },
+      {
+        dna_hash: v02,
+        version: "alliance-v0.2.0",
+        upgrades_from: v01,
+        release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+        notaries: [{ url: "https://n2" }],
+      },
       { dna_hash: v03, version: "alliance-v0.3.0", upgrades_from: v02, notaries: [{ url: "https://n3" }] },
     ],
   };
@@ -65,6 +71,44 @@ describe("migrationOptions", () => {
     const resp = migrationOptions(registry(), null);
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("unknown_to_dna");
+  });
+});
+
+describe("updateCheck", () => {
+  it("returns the successor + release_url for the current DNA", async () => {
+    const b = await body(updateCheck(registry(), v01));
+    expect(b).toEqual({
+      current_dna_hash: v01,
+      has_upgrade: true,
+      successor: {
+        to_dna_hash: v02,
+        to_version: "alliance-v0.2.0",
+        release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+      },
+    });
+  });
+
+  it("omits release_url when the successor has none", async () => {
+    const b = await body(updateCheck(registry(), v02)); // v03 successor has no release_url
+    expect(b.has_upgrade).toBe(true);
+    expect(b.successor.to_dna_hash).toBe(v03);
+    expect("release_url" in b.successor).toBe(false);
+  });
+
+  it("chain tip has no upgrade", async () => {
+    const b = await body(updateCheck(registry(), v03));
+    expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
+  });
+
+  it("unknown current DNA has no upgrade", async () => {
+    const b = await body(updateCheck(registry(), "uhC0k_unknown"));
+    expect(b).toEqual({ current_dna_hash: "uhC0k_unknown", has_upgrade: false });
+  });
+
+  it("missing current_dna_hash errors", async () => {
+    const resp = updateCheck(registry(), null);
+    expect(resp.status).toBe(400);
+    expect((await body(resp)).error.code).toBe("unknown_current_dna");
   });
 });
 

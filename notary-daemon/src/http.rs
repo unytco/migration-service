@@ -21,6 +21,19 @@ use crate::conductor::Conductor;
 pub const API_VERSIONS: &[&str] = &["v1"];
 pub const PROTOCOL_VERSIONS: &[&str] = &["v0_1"];
 
+/// Machine-readable error codes — the daemon half of the cross-service contract.
+/// These MUST stay in sync with the router's `ErrorCode` union in
+/// `router/src/errors.ts`, which switches on these exact strings. Defined once
+/// here rather than as scattered literals so a code can't silently drift.
+mod codes {
+    pub const AUTH_FAILED: &str = "auth_failed";
+    pub const WARRANTED: &str = "warranted";
+    pub const NO_CLOSE_FOUND: &str = "no_close_found";
+    pub const TOO_NEW: &str = "too_new";
+    pub const UNABLE_TO_VERIFY: &str = "unable_to_verify";
+    pub const INTERNAL: &str = "internal";
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub conductor: Arc<dyn Conductor>,
@@ -66,13 +79,21 @@ async fn healthz(State(state): State<AppState>) -> Response {
             })),
         )
             .into_response(),
-        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, "internal", format!("conductor unreachable: {e}")),
+        Err(e) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::INTERNAL,
+            format!("conductor unreachable: {e}"),
+        ),
     }
 }
 
 #[derive(Deserialize)]
 struct NotarizeBody {
-    agent_pubkey: AgentPubKeyB64,
+    // Parsed as a plain string then via AgentPubKeyB64's FromStr: holo_hash's
+    // serde Deserialize for the B64 newtype does NOT round-trip its own string
+    // form (it reads the chars as raw bytes → BadSize), whereas FromStr decodes
+    // the base64 correctly. The router sends the standard "uhCAk…" b64 string.
+    agent_pubkey: String,
 }
 
 fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
@@ -85,14 +106,33 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
 
 async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     if !check_bearer(&headers, &state.bearer_token) {
-        return error(StatusCode::UNAUTHORIZED, "auth_failed", "missing or invalid bearer token");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            codes::AUTH_FAILED,
+            "missing or invalid bearer token",
+        );
     }
 
     let parsed: NotarizeBody = match serde_json::from_str(&body) {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, "internal", format!("invalid request body: {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                codes::INTERNAL,
+                format!("invalid request body: {e}"),
+            )
+        }
     };
-    let agent_pubkey: AgentPubKey = parsed.agent_pubkey.into();
+    let agent_pubkey: AgentPubKey = match parsed.agent_pubkey.parse::<AgentPubKeyB64>() {
+        Ok(k) => k.into(),
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                codes::INTERNAL,
+                format!("invalid agent_pubkey: {e}"),
+            )
+        }
+    };
 
     let result = state
         .conductor
@@ -100,34 +140,42 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
         .await;
 
     match result {
-        Ok(NotaryReadResponse::Verified { payload, signature }) => {
-            (StatusCode::OK, Json(json!({ "payload": payload, "signature": signature }))).into_response()
-        }
+        Ok(NotaryReadResponse::Verified { payload, signature }) => (
+            StatusCode::OK,
+            Json(json!({ "payload": payload, "signature": signature })),
+        )
+            .into_response(),
         Ok(NotaryReadResponse::Warranted(warrants)) => error_with_details(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "warranted",
+            codes::WARRANTED,
             "the agent's chain carries warrants",
             json!({ "warrants": warrants }),
         ),
         Ok(NotaryReadResponse::NoCloseFound) => error(
             StatusCode::NOT_FOUND,
-            "no_close_found",
+            codes::NO_CLOSE_FOUND,
             "no ClosingStateSummary on the agent's chain (close on the from-DNA first)",
         ),
-        Ok(NotaryReadResponse::TooNew { earliest_acceptable }) => error_with_details(
+        Ok(NotaryReadResponse::TooNew {
+            earliest_acceptable,
+        }) => error_with_details(
             StatusCode::CONFLICT,
-            "too_new",
+            codes::TOO_NEW,
             "close action is younger than the freshness window",
             json!({ "earliest_acceptable": earliest_acceptable }),
         ),
         Ok(NotaryReadResponse::UnableToVerify) => error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "unable_to_verify",
+            codes::UNABLE_TO_VERIFY,
             "notary could not read/verify the agent's chain",
         ),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "notary_read_predecessor_close failed");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::INTERNAL,
+                "internal error",
+            )
         }
     }
 }
