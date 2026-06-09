@@ -40,14 +40,8 @@ holo_hash = { version = "0.6.1", features = ["encoding"] }
 hdi = "0.7.1"
 
 # Shared migration protocol types (NotaryReadRequest / NotaryReadResponse /
-# SummaryStatePayload / SummaryState / Signature). Git dep so this repo builds
-# and runs CI standalone, pinned to `develop` (the migration types merged there;
-# the old feat/migration-upgrade branch is being deleted). Using the real types
-# (not a hand mirror) keeps the msgpack-in / JSON-out re-emission faithful.
-# TODO: replace with the published `rave_engine` crate (cf. bridge-orchestrator's
-# `rave_engine = "0.3.3"`) once a version carrying these migration types ships —
-# drops the private git fetch (no token) and shortens CI builds.
-rave_engine = { git = "https://github.com/unytco/unyt.git", branch = "develop", package = "rave_engine" }
+# SummaryStatePayload / SummaryState / Signature). 
+rave_engine = "0.3.5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
