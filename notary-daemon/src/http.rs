@@ -2,6 +2,7 @@
 //! the bearer-auth gate. Handlers are generic over `Conductor` so tests inject a
 //! mock.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::{
@@ -32,6 +33,9 @@ mod codes {
     pub const TOO_NEW: &str = "too_new";
     pub const UNABLE_TO_VERIFY: &str = "unable_to_verify";
     pub const INTERNAL: &str = "internal";
+    // B5/B6: client-side input errors get a distinct 4xx code so the router
+    // hard-stops instead of retrying the same malformed request across notaries.
+    pub const BAD_REQUEST: &str = "bad_request";
 }
 
 #[derive(Clone)]
@@ -113,22 +117,25 @@ async fn notarize(State(state): State<AppState>, headers: HeaderMap, body: Strin
         );
     }
 
+    // B5: client-side input errors get a distinct `bad_request` code (not the
+    // 5xx-classed `internal`) so the router hard-stops instead of retrying the
+    // same malformed request across every notary. Two such errors:
     let parsed: NotarizeBody = match serde_json::from_str(&body) {
         Ok(b) => b,
         Err(e) => {
             return error(
                 StatusCode::BAD_REQUEST,
-                codes::INTERNAL,
+                codes::BAD_REQUEST,
                 format!("invalid request body: {e}"),
             )
         }
     };
-    let agent_pubkey: AgentPubKey = match parsed.agent_pubkey.parse::<AgentPubKeyB64>() {
-        Ok(k) => k.into(),
+    let agent_pubkey: AgentPubKey = match AgentPubKeyB64::from_str(&parsed.agent_pubkey) {
+        Ok(b64) => b64.into(),
         Err(e) => {
             return error(
                 StatusCode::BAD_REQUEST,
-                codes::INTERNAL,
+                codes::BAD_REQUEST,
                 format!("invalid agent_pubkey: {e}"),
             )
         }

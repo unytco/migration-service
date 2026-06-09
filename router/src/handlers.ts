@@ -62,7 +62,9 @@ export async function migrate(
 ): Promise<Response> {
   const { from_dna_hash, to_dna_hash, agent_pubkey } = body;
   if (!from_dna_hash || !to_dna_hash || !agent_pubkey) {
-    return errorJson(400, "internal", "from_dna_hash, to_dna_hash and agent_pubkey are required");
+    // B6: missing required fields is a client error — a 4xx-classed `bad_request`,
+    // not the 5xx-classed `internal` (which the envelope reserves for our faults).
+    return errorJson(400, "bad_request", "from_dna_hash, to_dna_hash and agent_pubkey are required");
   }
 
   // 1. Validate the pair against the upgrades_from chain.
@@ -93,7 +95,7 @@ export async function migrate(
   // 3. Try each in order; hard stops propagate immediately, transient → next.
   const transientCodes: string[] = [];
   for (const notaryEntry of candidates) {
-    const outcome = await notarize(notaryEntry.url, agent_pubkey, env, fetchImpl);
+    const outcome = await notarize(notaryEntry.url, agent_pubkey, from_dna_hash, env, fetchImpl);
     if (outcome.kind === "verified") {
       // 4. Forward { payload, signature } verbatim.
       return ok({ payload: outcome.payload, signature: outcome.signature });

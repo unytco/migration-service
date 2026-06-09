@@ -208,4 +208,89 @@ describe("migrate — notary dispatch + failover", () => {
     expect((await body(resp)).error.code).toBe("no_close_found");
     expect(n1bCalled).toBe(false);
   });
+
+  // C2 — failover aggregation: a config/auth/rate-limit fault is surfaced
+  // distinctly (auth_failed → 502, rate_limited → 503) rather than collapsed
+  // into a generic outage, and a single unable_to_verify wins the aggregate.
+  it("all notaries auth_failed → 502 auth_failed (distinct, not unable_to_verify)", async () => {
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+      "https://n1b": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(502);
+    expect((await body(resp)).error.code).toBe("auth_failed");
+  });
+
+  it("all notaries rate_limited → 503 rate_limited (distinct, not unable_to_verify)", async () => {
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
+      "https://n1b": () => jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(503);
+    expect((await body(resp)).error.code).toBe("rate_limited");
+  });
+
+  it("auth_failed then unable_to_verify aggregates to 503 unable_to_verify", async () => {
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+      "https://n1b": () => jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }),
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(503);
+    expect((await body(resp)).error.code).toBe("unable_to_verify");
+  });
+
+  // B5 — a daemon bad_request is a client-side error every notary rejects the
+  // same way: hard-stop the loop (4xx) instead of fanning out as unhealthy.
+  it("daemon bad_request hard-stops without trying the next notary", async () => {
+    let n1bCalled = false;
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(400, { error: { code: "bad_request", message: "bad pubkey" } }),
+      "https://n1b": () => {
+        n1bCalled = true;
+        return jsonResp(200, { payload: { dna_hash: v01 }, signature: "should-not-be-used" });
+      },
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(400);
+    expect((await body(resp)).error.code).toBe("bad_request");
+    expect(n1bCalled).toBe(false);
+  });
+
+  // B2 — a notary that returns a payload for the wrong DNA is misconfigured;
+  // reject as internal rather than handing a wrong-DNA payload to the app.
+  it("wrong-DNA payload (dna_hash mismatch) → 500 internal", async () => {
+    const f = mockFetch({
+      "https://n1a": () =>
+        jsonResp(200, { payload: { dna_hash: v02, closing_state: {} }, signature: "sig" }),
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    const b = await body(resp);
+    expect(resp.status).toBe(500);
+    expect(b.error.code).toBe("internal");
+    expect(b.error.details.expected_dna_hash).toBe(v01);
+    expect(b.error.details.got_dna_hash).toBe(v02);
+  });
+
+  // B3 — a healthy-status notary with a malformed (non-JSON) success body must
+  // not throw out of the loop; it fails over to the next candidate.
+  it("malformed 200 body fails over to the next notary", async () => {
+    const f = mockFetch({
+      "https://n1a": () =>
+        new Response("not json{", { status: 200, headers: { "content-type": "application/json" } }),
+      "https://n1b": () => jsonResp(200, { payload: { dna_hash: v01 }, signature: "sig2" }),
+    });
+    const b = await body(await migrate(registry(), goodPair, ENV, f));
+    expect(b.signature).toBe("sig2");
+  });
+});
+
+describe("migrate — request validation (B6)", () => {
+  it("missing required fields → 400 bad_request", async () => {
+    const resp = await migrate(registry(), { from_dna_hash: v01 }, ENV, mockFetch({}));
+    expect(resp.status).toBe(400);
+    expect((await body(resp)).error.code).toBe("bad_request");
+  });
 });

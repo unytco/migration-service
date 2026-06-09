@@ -14,6 +14,7 @@ export type ErrorCode =
   | "not_registered_predecessor"
   | "auth_failed"
   | "rate_limited"
+  | "bad_request"
   | "warranted"
   | "no_close_found"
   | "too_new"

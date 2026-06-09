@@ -22,7 +22,7 @@ export interface VerifiedResult {
 export interface HardStop {
   kind: "hard_stop";
   status: number;
-  code: ErrorCode; // warranted | no_close_found | too_new
+  code: ErrorCode; // warranted | no_close_found | too_new | internal (dna_hash mismatch)
   message: string;
   details?: unknown;
 }
@@ -40,12 +40,30 @@ export interface Transient {
 
 export type NotarizeOutcome = VerifiedResult | HardStop | Transient;
 
-const HARD_STOP_CODES: ReadonlySet<string> = new Set(["warranted", "no_close_found", "too_new"]);
+// Codes the router must not retry across notaries: a content/contract verdict
+// every notary reading the same chain returns identically (`warranted` /
+// `no_close_found` / `too_new`), or a client-side input error the daemon
+// rejected (`bad_request`) that the next notary would reject the same way.
+const HARD_STOP_CODES: ReadonlySet<string> = new Set([
+  "warranted",
+  "no_close_found",
+  "too_new",
+  "bad_request",
+]);
 
-/** Call one daemon's /v1/notarize. Never throws — transport failures map to `transient`. */
+/** Connect + read budget for a single daemon call. A daemon that accepts the
+ * socket but never responds is mapped to `transient` after this, so the
+ * candidate loop advances instead of stalling the whole `/v1/migrate`. */
+const NOTARIZE_TIMEOUT_MS = 10_000;
+
+/** Call one daemon's /v1/notarize. Never throws — transport failures, timeouts,
+ * and malformed success bodies all map to `transient`. `expectedDnaHash` is the
+ * registry `from_dna_hash`; a success payload whose `dna_hash` differs is a
+ * misconfigured notary → `internal` hard stop (B2). */
 export async function notarize(
   daemonUrl: string,
   agentPubkey: string,
+  expectedDnaHash: string,
   env: Env,
   fetchImpl: FetchLike,
 ): Promise<NotarizeOutcome> {
@@ -64,14 +82,37 @@ export async function notarize(
       method: "POST",
       headers,
       body: JSON.stringify({ agent_pubkey: agentPubkey }),
+      signal: AbortSignal.timeout(NOTARIZE_TIMEOUT_MS),
     });
   } catch {
-    // transport failure: daemon unreachable / unhealthy
+    // transport failure / timeout: daemon unreachable, unhealthy, or hung
     return { kind: "transient", code: "all_orgs_unhealthy" };
   }
 
   if (resp.status === 200) {
-    const body = (await resp.json()) as { payload: unknown; signature: unknown };
+    // B3: a healthy-status daemon can still return a truncated/non-JSON body.
+    // Guard the parse so a malformed success doesn't escape the candidate loop
+    // (preserve the "Never throws" contract) — fail over to the next notary.
+    let body: { payload?: unknown; signature?: unknown; dna_hash?: unknown };
+    try {
+      body = (await resp.json()) as typeof body;
+    } catch {
+      return { kind: "transient", code: "unable_to_verify" };
+    }
+    // B2: sanity-check the notary serves the from-DNA we asked for. The daemon
+    // serves exactly one DNA, so a wrong `dna_hash` is a misconfigured notary
+    // (registry URL ↔ daemon mismatch); reject as `internal` per the spec
+    // rather than handing a wrong-DNA payload to the app.
+    const payloadDnaHash = (body.payload as { dna_hash?: unknown } | undefined)?.dna_hash;
+    if (typeof payloadDnaHash === "string" && payloadDnaHash !== expectedDnaHash) {
+      return {
+        kind: "hard_stop",
+        status: 500,
+        code: "internal",
+        message: "notary returned a payload for a different DNA",
+        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadDnaHash },
+      };
+    }
     return { kind: "verified", payload: body.payload, signature: body.signature };
   }
 
