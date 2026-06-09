@@ -32,7 +32,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 
 # Holochain bridge — same stack as pricing_oracle / watchtower-observer.
-ham = "0.1.0"
+# Git dep, NOT crates.io: the `ham` name there is an unrelated packet-radio
+# crate, so unytco's ham can't publish under it. unytco/ham is a PUBLIC repo,
+# so this git fetch needs no token (only the private unyt.git did — now avoided
+# via the published rave_engine crate below).
+ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
 holochain_client = "0.8.1"
 holo_hash = { version = "0.6.1", features = ["encoding"] }
 # Same hdi the unyt workspace pins (rave_engine uses hdi 0.7.1) so Signature /
