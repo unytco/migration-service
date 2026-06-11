@@ -10,11 +10,10 @@ jobs:
   daemon:
     name: notary-daemon (Rust)
     runs-on: ubuntu-latest
-    # The daemon git-deps `rave_engine` from the PRIVATE unytco/unyt repo, so the
-    # build needs read access to it. CI uses a read-only token secret
-    # (UNYT_REPO_TOKEN) + git-fetch-with-cli; local devs use their own SSH/HTTPS
-    # creds. The dep branch (feat/migration-upgrade today, develop after merge)
-    # must be pushed for the build to resolve.
+    # The daemon git-deps `ham` from the unytco/ham repo, so the build needs
+    # read access to it. CI uses a read-only token secret (UNYT_REPO_TOKEN) +
+    # git-fetch-with-cli; local devs use their own SSH/HTTPS creds.
+    # (`rave_engine` is a published crates.io release — no git access needed.)
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     defaults:

@@ -4,7 +4,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use rave_engine::types::entries::migration::v0_1::{NotaryReadRequest, NotaryReadResponse};
+use holo_hash::AgentPubKey;
+use rave_engine::types::entries::migration::v0_1::ReadCloseResponse;
 
 use crate::config::Config;
 
@@ -13,12 +14,15 @@ pub trait Conductor: Send + Sync {
     /// Lightweight liveness probe against the conductor.
     async fn ping(&self) -> Result<()>;
 
-    /// Call the alliance `notary_read_predecessor_close` zome fn on the
-    /// from-DNA cell (read + validate + sign in one call).
-    async fn notary_read_predecessor_close(
-        &self,
-        req: NotaryReadRequest,
-    ) -> Result<NotaryReadResponse>;
+    /// `transactor::read_predecessor_close` on the from-DNA cell — fetch the
+    /// agent's committed close (payload + notary signatures + close action).
+    /// A pure read; this daemon has NO signing capability of any kind.
+    async fn read_predecessor_close(&self, agent: AgentPubKey) -> Result<ReadCloseResponse>;
+
+    /// Trivial read-only zome call proving the app cell answers
+    /// (`transactor::whoami`) — the second half of the health check, distinct
+    /// from `ping` (a conductor can be reachable while the cell is wedged).
+    async fn whoami(&self) -> Result<AgentPubKey>;
 }
 
 /// Real conductor connection via `ham`.
@@ -50,18 +54,22 @@ impl Conductor for HamConductor {
         self.ham.ping().await
     }
 
-    async fn notary_read_predecessor_close(
-        &self,
-        req: NotaryReadRequest,
-    ) -> Result<NotaryReadResponse> {
+    async fn read_predecessor_close(&self, agent: AgentPubKey) -> Result<ReadCloseResponse> {
         self.ham
             .call_zome(
                 &self.role_name,
                 "transactor",
-                "notary_read_predecessor_close",
-                req,
+                "read_predecessor_close",
+                agent,
             )
             .await
-            .context("notary_read_predecessor_close zome call failed")
+            .context("read_predecessor_close zome call failed")
+    }
+
+    async fn whoami(&self) -> Result<AgentPubKey> {
+        self.ham
+            .call_zome(&self.role_name, "transactor", "whoami", ())
+            .await
+            .context("whoami zome call failed")
     }
 }

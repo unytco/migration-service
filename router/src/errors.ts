@@ -17,7 +17,6 @@ export type ErrorCode =
   | "bad_request"
   | "warranted"
   | "no_close_found"
-  | "too_new"
   | "all_orgs_unhealthy"
   | "unable_to_verify"
   | "internal";

@@ -2,7 +2,7 @@
 name = "migration-notary"
 version = "0.1.0"
 edition = "2021"
-description = "Notary daemon for unyt DNA migration — reads + validates + signs a predecessor close state on the old DNA"
+description = "Notary daemon for unyt DNA migration — serves an agent's committed closing summary from the notary's own conductor so the migration-service can hand it to that agent for opening on the successor DNA; read-only, no signing capability"
 license = "CAL-1.0"
 
 [lib]
@@ -39,10 +39,12 @@ holo_hash = { version = "0.6.1", features = ["encoding"] }
 # Timestamp / hash types are identical to the ones in the zome-call payloads.
 hdi = "0.7.1"
 
-# Shared migration protocol types (NotaryReadRequest / NotaryReadResponse /
-# SummaryStatePayload / SummaryState / Signature). 
-rave_engine = "0.3.5"
+# Shared migration protocol types (ReadCloseResponse / NotarySignature /
+# SummaryStatePayload / SummaryState).
+rave_engine = "0.4.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Real-HTTP client for the gated live round-trip test only.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -3,7 +3,7 @@
 //
 // Rate limiting for POST /v1/migrate is enforced at the Cloudflare zone level
 // (a rate-limiting rule on the route), not in Worker code — so no Durable Object
-// is needed. See service-migration-service.md § Auth/rate-limit.
+// is needed. See the workshop spec migration-router.md § Auth / rate-limit.
 
 import registryJson from "../registry.json";
 import { Registry, type RawRegistry } from "./registry";
@@ -28,14 +28,14 @@ function withCors(resp: Response): Response {
 const registry = Registry.load(registryJson as RawRegistry);
 
 // B7: the shipped registry still carries the placeholder DNA hash + stub notary
-// URL (real provisioning is plan 07). Log an un-provisioned line at startup so a
-// mis-deploy of the placeholder to a real environment is obvious in the logs.
+// URL. Log an un-provisioned line at startup so a mis-deploy of the placeholder
+// to a real environment is obvious in the logs.
 const REGISTRY_PLACEHOLDER = "uhC0kREPLACE_WITH_v0_1_DNA_HASH";
 if ((registryJson as RawRegistry).dnas.some((d) => d.dna_hash === REGISTRY_PLACEHOLDER)) {
   console.warn(
     "migration-router: registry.json is UN-PROVISIONED — still contains the " +
       `placeholder DNA hash "${REGISTRY_PLACEHOLDER}". /v1/migrate will not work ` +
-      "until registry.json is populated with live DNA hashes + notary URLs (plan 07).",
+      "until registry.json is provisioned with live DNA hashes + notary entries.",
   );
 }
 
