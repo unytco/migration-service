@@ -5,7 +5,13 @@
 export interface NotaryEntry {
   /** Cloudflare-Tunnel URL of a notary daemon serving this DNA, e.g. https://notary-1-v01.unyt.dev */
   url: string;
+  /** Daemon HTTP API version the router speaks to this daemon (e.g. "v1"). */
+  api: string;
 }
+
+/** Daemon HTTP API versions this router build knows how to speak. A registry
+ * pinning anything else fails at startup, never at request time. */
+export const SUPPORTED_DAEMON_APIS: ReadonlySet<string> = new Set(["v1"]);
 
 export interface DnaEntry {
   dna_hash: string;
@@ -53,6 +59,16 @@ export class Registry {
       seen.add(d.dna_hash);
       if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
       if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
+      // The router must know where to reach each daemon and which API to speak
+      // from the registry alone — a deficient entry fails here at startup.
+      for (const n of d.notaries) {
+        if (!n.url?.startsWith("https://")) {
+          throw new Error(`registry entry ${d.dna_hash}: notary url must be https`);
+        }
+        if (!SUPPORTED_DAEMON_APIS.has(n.api)) {
+          throw new Error(`registry entry ${d.dna_hash}: unsupported notary api ${n.api}`);
+        }
+      }
     }
     // upgrades_from resolves, and each predecessor has at most one successor
     // (the chain is linear — forward lookup must be unambiguous).

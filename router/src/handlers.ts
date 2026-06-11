@@ -3,7 +3,7 @@
 
 import { errorJson, ok } from "./errors";
 import { Registry } from "./registry";
-import { notarize, type Env, type FetchLike } from "./notary";
+import { fetchClose, type Env, type FetchLike } from "./notary";
 
 export const API_VERSIONS = ["v1"] as const;
 export const PROTOCOL_VERSIONS = ["v0_1"] as const;
@@ -53,12 +53,24 @@ export interface MigrateBody {
   agent_pubkey?: string;
 }
 
+/** Fisher–Yates on a copy. `rand` is injectable so tests can seed the order;
+ * production uses `Math.random`. */
+export function shuffled<T>(xs: readonly T[], rand: () => number = Math.random): T[] {
+  const out = xs.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
 /** POST /v1/migrate */
 export async function migrate(
   registry: Registry,
   body: MigrateBody,
   env: Env,
   fetchImpl: FetchLike,
+  rand: () => number = Math.random,
 ): Promise<Response> {
   const { from_dna_hash, to_dna_hash, agent_pubkey } = body;
   if (!from_dna_hash || !to_dna_hash || !agent_pubkey) {
@@ -92,13 +104,26 @@ export async function migrate(
     return errorJson(500, "all_orgs_unhealthy", `no notaries registered for ${from_dna_hash}`);
   }
 
-  // 3. Try each in order; hard stops propagate immediately, transient → next.
+  // 3. Try candidates in per-request RANDOM order — stateless load-spreading
+  //    (migrations arrive ~one at a time; a fixed order hammers the first
+  //    daemon). Hard stops propagate immediately, transient → next.
   const transientCodes: string[] = [];
-  for (const notaryEntry of candidates) {
-    const outcome = await notarize(notaryEntry.url, agent_pubkey, from_dna_hash, env, fetchImpl);
-    if (outcome.kind === "verified") {
-      // 4. Forward { payload, signature } verbatim.
-      return ok({ payload: outcome.payload, signature: outcome.signature });
+  for (const notaryEntry of shuffled(candidates, rand)) {
+    const outcome = await fetchClose(
+      notaryEntry.url,
+      notaryEntry.api,
+      agent_pubkey,
+      from_dna_hash,
+      env,
+      fetchImpl,
+    );
+    if (outcome.kind === "package") {
+      // 4. Forward the closing-summary package verbatim.
+      return ok({
+        payload: outcome.payload,
+        notary_signatures: outcome.notary_signatures,
+        close_action: outcome.close_action,
+      });
     }
     if (outcome.kind === "hard_stop") {
       return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);

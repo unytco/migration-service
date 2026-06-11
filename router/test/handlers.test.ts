@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
-import { migrate, migrationOptions, updateCheck, type MigrateBody } from "../src/handlers";
+import { migrate, migrationOptions, shuffled, updateCheck, type MigrateBody } from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
 
 const v01 = "uhC0k_v01";
@@ -10,19 +10,37 @@ const AGENT = "uhCAk_agent";
 
 const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
 
+// Seeded `rand` values for the two-candidate dispatch ([n1a, n1b]): Fisher–Yates
+// with i=1 swaps when floor(rand()*2) === 0, so a high value keeps the registry
+// order and a low value reverses it.
+const KEEP_ORDER = () => 0.99; // [n1a, n1b]
+const REVERSE = () => 0.0; // [n1b, n1a]
+
 function registry(): Registry {
   const raw: RawRegistry = {
     version: 1,
     dnas: [
-      { dna_hash: v01, version: "alliance-v0.1.0", notaries: [{ url: "https://n1a" }, { url: "https://n1b" }] },
+      {
+        dna_hash: v01,
+        version: "alliance-v0.1.0",
+        notaries: [
+          { url: "https://n1a", api: "v1" },
+          { url: "https://n1b", api: "v1" },
+        ],
+      },
       {
         dna_hash: v02,
         version: "alliance-v0.2.0",
         upgrades_from: v01,
         release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
-        notaries: [{ url: "https://n2" }],
+        notaries: [{ url: "https://n2", api: "v1" }],
       },
-      { dna_hash: v03, version: "alliance-v0.3.0", upgrades_from: v02, notaries: [{ url: "https://n3" }] },
+      {
+        dna_hash: v03,
+        version: "alliance-v0.3.0",
+        upgrades_from: v02,
+        notaries: [{ url: "https://n3", api: "v1" }],
+      },
     ],
   };
   return Registry.load(raw);
@@ -39,12 +57,42 @@ function mockFetch(byOrigin: Record<string, () => Response>): FetchLike {
   }) as FetchLike;
 }
 
+/** A canned daemon 200: the three-field closing-summary package. */
+const packageResp = (dnaHash: string, marker: string) =>
+  jsonResp(200, {
+    payload: { dna_hash: dnaHash, closing_state: {} },
+    notary_signatures: [{ notary: "uhCAk_notary", signature: marker }],
+    close_action: `close-${marker}`,
+  });
+
 const jsonResp = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 async function body(resp: Response): Promise<any> {
   return resp.json();
 }
+
+describe("shuffled", () => {
+  it("is deterministic under a seeded rand and permutes the input", () => {
+    const xs = ["a", "b", "c", "d"];
+    // A fixed sequence drives a fixed permutation.
+    const seq = [0.1, 0.9, 0.4];
+    let i = 0;
+    const rand = () => seq[i++ % seq.length];
+    const once = shuffled(xs, rand);
+    i = 0;
+    const twice = shuffled(xs, rand);
+    expect(once).toEqual(twice);
+    expect([...once].sort()).toEqual([...xs].sort());
+    expect(xs).toEqual(["a", "b", "c", "d"]); // input untouched
+  });
+
+  it("different seeds produce different orders (the load spread)", () => {
+    const xs = ["a", "b"];
+    expect(shuffled(xs, KEEP_ORDER)).toEqual(["a", "b"]);
+    expect(shuffled(xs, REVERSE)).toEqual(["b", "a"]);
+  });
+});
 
 describe("migrationOptions", () => {
   it("returns the immediate predecessor mid-chain", () => {
@@ -158,23 +206,51 @@ describe("migrate — pair validation", () => {
 describe("migrate — notary dispatch + failover", () => {
   const goodPair = { from_dna_hash: v01, to_dna_hash: v02, agent_pubkey: AGENT };
 
-  it("returns payload + signature from the first healthy notary", async () => {
+  it("returns the three-field package verbatim from a healthy notary", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(200, { payload: { dna_hash: v01, closing_state: {} }, signature: "sig" }),
+      "https://n1a": () => packageResp(v01, "sig-a"),
     });
+    // n1a is the only mock: whichever order the shuffle picks, the unmocked
+    // candidate fails transiently and the loop lands on n1a.
     const resp = await migrate(registry(), goodPair, ENV, f);
     const b = await body(resp);
     expect(resp.status).toBe(200);
-    expect(b.signature).toBe("sig");
+    expect(b).toEqual({
+      payload: { dna_hash: v01, closing_state: {} },
+      notary_signatures: [{ notary: "uhCAk_notary", signature: "sig-a" }],
+      close_action: "close-sig-a",
+    });
   });
 
-  it("fails over to the second notary when the first errors transiently", async () => {
+  it("calls the daemon at /{api}/fetch-close", async () => {
+    const urls: string[] = [];
+    const f = (async (input: RequestInfo | URL) => {
+      urls.push(typeof input === "string" ? input : input.toString());
+      return packageResp(v01, "sig");
+    }) as FetchLike;
+    await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
+    expect(urls[0]).toBe("https://n1a/v1/fetch-close");
+  });
+
+  it("spreads load: different seeds hit different first daemons", async () => {
+    const first: string[] = [];
+    const f = (async (input: RequestInfo | URL) => {
+      first.push(typeof input === "string" ? input : input.toString());
+      return packageResp(v01, "sig");
+    }) as FetchLike;
+    await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
+    await migrate(registry(), goodPair, ENV, f, REVERSE);
+    expect(first[0].startsWith("https://n1a")).toBe(true);
+    expect(first[1].startsWith("https://n1b")).toBe(true);
+  });
+
+  it("fails over to the next notary when the first errors transiently", async () => {
     const f = mockFetch({
       "https://n1a": () => jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
-      "https://n1b": () => jsonResp(200, { payload: { dna_hash: v01 }, signature: "sig2" }),
+      "https://n1b": () => packageResp(v01, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f));
-    expect(b.signature).toBe("sig2");
+    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 
   it("all notaries unable_to_verify → 503 unable_to_verify", async () => {
@@ -200,12 +276,27 @@ describe("migrate — notary dispatch + failover", () => {
       "https://n1a": () => jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
       "https://n1b": () => {
         n1bCalled = true;
-        return jsonResp(200, { payload: {}, signature: "should-not-be-used" });
+        return packageResp(v01, "should-not-be-used");
       },
     });
-    const resp = await migrate(registry(), goodPair, ENV, f);
+    const resp = await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
     expect(resp.status).toBe(404);
     expect((await body(resp)).error.code).toBe("no_close_found");
+    expect(n1bCalled).toBe(false);
+  });
+
+  it("hard stop (warranted) propagates immediately without trying the next", async () => {
+    let n1bCalled = false;
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(422, { error: { code: "warranted", message: "x" } }),
+      "https://n1b": () => {
+        n1bCalled = true;
+        return packageResp(v01, "should-not-be-used");
+      },
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
+    expect(resp.status).toBe(422);
+    expect((await body(resp)).error.code).toBe("warranted");
     expect(n1bCalled).toBe(false);
   });
 
@@ -250,21 +341,21 @@ describe("migrate — notary dispatch + failover", () => {
       "https://n1a": () => jsonResp(400, { error: { code: "bad_request", message: "bad pubkey" } }),
       "https://n1b": () => {
         n1bCalled = true;
-        return jsonResp(200, { payload: { dna_hash: v01 }, signature: "should-not-be-used" });
+        return packageResp(v01, "should-not-be-used");
       },
     });
-    const resp = await migrate(registry(), goodPair, ENV, f);
+    const resp = await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("bad_request");
     expect(n1bCalled).toBe(false);
   });
 
   // B2 — a notary that returns a payload for the wrong DNA is misconfigured;
-  // reject as internal rather than handing a wrong-DNA payload to the app.
+  // reject as internal rather than handing a wrong-DNA package to the app.
   it("wrong-DNA payload (dna_hash mismatch) → 500 internal", async () => {
     const f = mockFetch({
-      "https://n1a": () =>
-        jsonResp(200, { payload: { dna_hash: v02, closing_state: {} }, signature: "sig" }),
+      "https://n1a": () => packageResp(v02, "sig"),
+      "https://n1b": () => packageResp(v02, "sig"),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     const b = await body(resp);
@@ -280,10 +371,32 @@ describe("migrate — notary dispatch + failover", () => {
     const f = mockFetch({
       "https://n1a": () =>
         new Response("not json{", { status: 200, headers: { "content-type": "application/json" } }),
-      "https://n1b": () => jsonResp(200, { payload: { dna_hash: v01 }, signature: "sig2" }),
+      "https://n1b": () => packageResp(v01, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f));
-    expect(b.signature).toBe("sig2");
+    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    expect(b.notary_signatures[0].signature).toBe("sig-b");
+  });
+
+  // A 200 missing a package field (truncated proxy response, buggy daemon) is
+  // as malformed as non-JSON: fail over instead of forwarding an incomplete
+  // package to the app.
+  it("200 body missing a package field fails over to the next notary", async () => {
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(200, { payload: { dna_hash: v01 } }), // no signatures/close_action
+      "https://n1b": () => packageResp(v01, "sig-b"),
+    });
+    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    expect(b.notary_signatures[0].signature).toBe("sig-b");
+  });
+
+  it("200 body with null package fields fails over to the next notary", async () => {
+    const f = mockFetch({
+      "https://n1a": () =>
+        jsonResp(200, { payload: null, notary_signatures: null, close_action: null }),
+      "https://n1b": () => packageResp(v01, "sig-b"),
+    });
+    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 });
 

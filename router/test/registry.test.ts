@@ -9,9 +9,19 @@ function chain(): RawRegistry {
   return {
     version: 1,
     dnas: [
-      { dna_hash: v01, version: "alliance-v0.1.0", notaries: [{ url: "https://n1" }] },
-      { dna_hash: v02, version: "alliance-v0.2.0", upgrades_from: v01, notaries: [{ url: "https://n2" }] },
-      { dna_hash: v03, version: "alliance-v0.3.0", upgrades_from: v02, notaries: [{ url: "https://n3" }] },
+      { dna_hash: v01, version: "alliance-v0.1.0", notaries: [{ url: "https://n1", api: "v1" }] },
+      {
+        dna_hash: v02,
+        version: "alliance-v0.2.0",
+        upgrades_from: v01,
+        notaries: [{ url: "https://n2", api: "v1" }],
+      },
+      {
+        dna_hash: v03,
+        version: "alliance-v0.3.0",
+        upgrades_from: v02,
+        notaries: [{ url: "https://n3", api: "v1" }],
+      },
     ],
   };
 }
@@ -43,6 +53,36 @@ describe("Registry.load", () => {
     const raw = chain();
     raw.dnas[1].upgrades_from = "uhC0k_missing";
     expect(() => Registry.load(raw)).toThrow(/does not resolve/);
+  });
+
+  // The router must know where to reach each daemon and which API to speak
+  // from the registry alone — a deficient notary entry fails at startup,
+  // never at request time.
+
+  it("rejects a notary entry with a non-https url", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "http://n1";
+    expect(() => Registry.load(raw)).toThrow(/notary url must be https/);
+  });
+
+  it("rejects a notary entry with a missing url", () => {
+    const raw = chain();
+    // @ts-expect-error intentionally omit url
+    raw.dnas[0].notaries[0].url = undefined;
+    expect(() => Registry.load(raw)).toThrow(/notary url must be https/);
+  });
+
+  it("rejects a notary entry with a missing api", () => {
+    const raw = chain();
+    // @ts-expect-error intentionally omit api
+    raw.dnas[0].notaries[0].api = undefined;
+    expect(() => Registry.load(raw)).toThrow(/unsupported notary api/);
+  });
+
+  it("rejects a notary entry with an unsupported api", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].api = "v9";
+    expect(() => Registry.load(raw)).toThrow(/unsupported notary api v9/);
   });
 
   it("rejects a cycle", () => {

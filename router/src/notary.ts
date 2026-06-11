@@ -1,4 +1,6 @@
-// Client for calling a notary daemon's /v1/notarize over its Cloudflare Tunnel.
+// Client for calling a notary daemon's /{api}/fetch-close over its Cloudflare
+// Tunnel: the daemon serves the agent's committed closing summary from its own
+// conductor, and the router hands it back to the app verbatim.
 
 import type { ErrorCode } from "./errors";
 
@@ -13,16 +15,17 @@ export interface Env {
 /** Injectable fetch so tests can mock daemon responses. */
 export type FetchLike = typeof fetch;
 
-export interface VerifiedResult {
-  kind: "verified";
-  payload: unknown; // opaque SummaryStatePayload — forwarded verbatim
-  signature: unknown; // opaque Signature — forwarded verbatim
+export interface PackageResult {
+  kind: "package"; // opaque closing-summary package — forwarded verbatim
+  payload: unknown;
+  notary_signatures: unknown;
+  close_action: unknown;
 }
 
 export interface HardStop {
   kind: "hard_stop";
   status: number;
-  code: ErrorCode; // warranted | no_close_found | too_new | internal (dna_hash mismatch)
+  code: ErrorCode; // warranted | no_close_found | bad_request | internal (dna_hash mismatch)
   message: string;
   details?: unknown;
 }
@@ -38,35 +41,36 @@ export interface Transient {
   code: string;
 }
 
-export type NotarizeOutcome = VerifiedResult | HardStop | Transient;
+export type FetchCloseOutcome = PackageResult | HardStop | Transient;
 
-// Codes the router must not retry across notaries: a content/contract verdict
-// every notary reading the same chain returns identically (`warranted` /
-// `no_close_found` / `too_new`), or a client-side input error the daemon
-// rejected (`bad_request`) that the next notary would reject the same way.
+// Codes the router must not retry across notaries: a content verdict every
+// notary reading the same chain returns identically (`warranted` /
+// `no_close_found`), or a client-side input error the daemon rejected
+// (`bad_request`) that the next notary would reject the same way.
 const HARD_STOP_CODES: ReadonlySet<string> = new Set([
   "warranted",
   "no_close_found",
-  "too_new",
   "bad_request",
 ]);
 
 /** Connect + read budget for a single daemon call. A daemon that accepts the
  * socket but never responds is mapped to `transient` after this, so the
  * candidate loop advances instead of stalling the whole `/v1/migrate`. */
-const NOTARIZE_TIMEOUT_MS = 10_000;
+const FETCH_CLOSE_TIMEOUT_MS = 10_000;
 
-/** Call one daemon's /v1/notarize. Never throws — transport failures, timeouts,
- * and malformed success bodies all map to `transient`. `expectedDnaHash` is the
- * registry `from_dna_hash`; a success payload whose `dna_hash` differs is a
- * misconfigured notary → `internal` hard stop (B2). */
-export async function notarize(
+/** Call one daemon's /{api}/fetch-close. Never throws — transport failures,
+ * timeouts, and malformed success bodies all map to `transient`. `api` is the
+ * daemon HTTP API version pinned in the registry for this notary.
+ * `expectedDnaHash` is the registry `from_dna_hash`; a success payload whose
+ * `dna_hash` differs is a misconfigured notary → `internal` hard stop (B2). */
+export async function fetchClose(
   daemonUrl: string,
+  api: string,
   agentPubkey: string,
   expectedDnaHash: string,
   env: Env,
   fetchImpl: FetchLike,
-): Promise<NotarizeOutcome> {
+): Promise<FetchCloseOutcome> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${env.MIGRATION_NOTARY_BEARER_TOKEN}`,
@@ -78,11 +82,11 @@ export async function notarize(
 
   let resp: Response;
   try {
-    resp = await fetchImpl(`${daemonUrl.replace(/\/$/, "")}/v1/notarize`, {
+    resp = await fetchImpl(`${daemonUrl.replace(/\/$/, "")}/${api}/fetch-close`, {
       method: "POST",
       headers,
       body: JSON.stringify({ agent_pubkey: agentPubkey }),
-      signal: AbortSignal.timeout(NOTARIZE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(FETCH_CLOSE_TIMEOUT_MS),
     });
   } catch {
     // transport failure / timeout: daemon unreachable, unhealthy, or hung
@@ -93,16 +97,26 @@ export async function notarize(
     // B3: a healthy-status daemon can still return a truncated/non-JSON body.
     // Guard the parse so a malformed success doesn't escape the candidate loop
     // (preserve the "Never throws" contract) — fail over to the next notary.
-    let body: { payload?: unknown; signature?: unknown; dna_hash?: unknown };
+    let body: {
+      payload?: unknown;
+      notary_signatures?: unknown;
+      close_action?: unknown;
+    };
     try {
       body = (await resp.json()) as typeof body;
     } catch {
       return { kind: "transient", code: "unable_to_verify" };
     }
+    // A 200 missing any package field (or carrying it as null) is as malformed
+    // as a non-JSON body (a truncated proxy response, a buggy daemon build):
+    // fail over rather than hand the app an incomplete package.
+    if (body.payload == null || body.notary_signatures == null || body.close_action == null) {
+      return { kind: "transient", code: "unable_to_verify" };
+    }
     // B2: sanity-check the notary serves the from-DNA we asked for. The daemon
     // serves exactly one DNA, so a wrong `dna_hash` is a misconfigured notary
     // (registry URL ↔ daemon mismatch); reject as `internal` per the spec
-    // rather than handing a wrong-DNA payload to the app.
+    // rather than handing a wrong-DNA package to the app.
     const payloadDnaHash = (body.payload as { dna_hash?: unknown } | undefined)?.dna_hash;
     if (typeof payloadDnaHash === "string" && payloadDnaHash !== expectedDnaHash) {
       return {
@@ -113,7 +127,12 @@ export async function notarize(
         details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadDnaHash },
       };
     }
-    return { kind: "verified", payload: body.payload, signature: body.signature };
+    return {
+      kind: "package",
+      payload: body.payload,
+      notary_signatures: body.notary_signatures,
+      close_action: body.close_action,
+    };
   }
 
   let code = "internal";
