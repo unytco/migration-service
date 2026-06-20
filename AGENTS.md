@@ -9,13 +9,15 @@
 ## Stack
 
 - **`router/`** — Cloudflare Worker, TypeScript. `wrangler` + `vitest` + `tsc`. Payload-opaque, no `rave_engine` dependency. Self-contained, no private deps.
-- **`notary-daemon/`** — Rust crate, `axum` + [`ham`](../ham/). Depends on the **published** `rave_engine` release for the migration wire types (no git pins — see the spec's § Versioning). No `flake.nix` — uses the ambient `cargo` toolchain.
+- **`notary-daemon/`** — Rust crate, `axum` + [`ham`](../ham/). Depends on the **published** `rave_engine` release for the migration wire types (no git pins — see the spec's § Versioning). Ships a build-only `flake.nix` providing the musl cross-toolchain for the static deploy binary (`automation/setup-migration-notary.sh` builds the daemon inside it); CI's `cargo build` / `cargo test` use the ambient toolchain.
 
 ## Build
 
 ```bash
 cd router && npm ci
 cd notary-daemon && cargo build --release
+# Static deploy binary (what automation/ ships to the non-Nix notary droplets):
+nix develop -c bash -c 'cd notary-daemon && cargo build --release --target x86_64-unknown-linux-musl'
 ```
 
 ## Format
