@@ -3,7 +3,7 @@ name: Deploy router
 # Deploys the Cloudflare Worker router AFTER the CI workflow succeeds on main.
 # Gated on CI's success (workflow_run) rather than re-running typecheck/test here,
 # so the checks run once. The notary daemon is NOT deployed here — it ships to
-# HEART droplets via the workshop automation hub.
+# HEART droplets via unyt's automation hub.
 
 on:
   workflow_run:

@@ -10,20 +10,13 @@ jobs:
   daemon:
     name: notary-daemon (Rust)
     runs-on: ubuntu-latest
-    # The daemon git-deps `ham` from the unytco/ham repo, so the build needs
-    # read access to it. CI uses a read-only token secret (UNYT_REPO_TOKEN) +
-    # git-fetch-with-cli; local devs use their own SSH/HTTPS creds.
-    # (`rave_engine` is a published crates.io release — no git access needed.)
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    # `ham` (git dep) and `rave_engine` (crates.io) are both public — cargo fetches
+    # them anonymously, no token or git-auth config needed.
     defaults:
       run:
         working-directory: notary-daemon
     steps:
       - uses: actions/checkout@v4
-      - name: configure cargo git auth for private unyt repo
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.UNYT_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

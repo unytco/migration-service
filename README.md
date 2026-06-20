@@ -10,7 +10,7 @@ Two components:
 
 The app completes the flow itself with a single `migration_init` zome call on its new-DNA conductor — no service can do that (it opens the agent's own chain).
 
-Design + protocol contracts: `workshop/documentation/specs/version-migration/migration-router.md` and `.../notary-daemon.md`.
+Full design + protocol contracts are maintained in unyt's internal version-migration specs.
 
 ## Layout
 
@@ -23,11 +23,11 @@ notary-daemon/  Rust crate — axum + ham
 ## Build / test
 
 - **router/** — `npm ci && npm run typecheck && npm test`. Self-contained, no private deps.
-- **notary-daemon/** — `cd notary-daemon && cargo test`. The migration wire types come from the **published `rave_engine`** release (crates.io — no unyt-repo access needed); `ham` is a git dep (read access via SSH locally, `UNYT_REPO_TOKEN` in CI). The HTTP↔zome mapping tests mock the conductor, so they need no Holochain conductor.
+- **notary-daemon/** — `cd notary-daemon && cargo test`. The migration wire types come from the **published `rave_engine`** release (crates.io — no unyt-repo access needed); `ham` is a public git dep ([`unytco/ham`](https://github.com/unytco/ham) — fetched anonymously, no token). The HTTP↔zome mapping tests mock the conductor, so they need no Holochain conductor.
 - **Real-conductor round-trip (gated):** `cd notary-daemon && cargo test --test live_roundtrip -- --ignored` against a live conductor with a closed agent — locks the package ⇄ `MigrationInitRequest` serde round-trip the mocks can't prove. Env vars + fixture notes in the test's file header.
 
 ## Branching / CI
 
 - Integrate on `develop`; release by merging `develop → main`.
 - CI runs `cargo test` (daemon) + `vitest` (router) on push/PR.
-- The **router Worker auto-deploys to Cloudflare on push to `main`**. The daemon is CI-tested but ships to HEART droplets via the workshop `automation/` hub (not auto-deployed).
+- The **router Worker auto-deploys to Cloudflare on push to `main`**. The daemon is CI-tested but ships to HEART droplets via unyt's deployment-automation hub (not auto-deployed).
