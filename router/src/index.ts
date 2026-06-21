@@ -3,7 +3,7 @@
 //
 // Rate limiting for POST /v1/migrate is enforced at the Cloudflare zone level
 // (a rate-limiting rule on the route), not in Worker code — so no Durable Object
-// is needed. See the workshop spec migration-router.md § Auth / rate-limit.
+// is needed. See unyt's internal migration-router.md spec § Auth / rate-limit.
 
 import registryJson from "../registry.json";
 import { Registry, type RawRegistry } from "./registry";

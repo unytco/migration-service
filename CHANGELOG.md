@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- notary-daemon: build-only `flake.nix` providing the musl cross-toolchain for the static deploy binary.
 - router: `GET /v1/update-check?current_dna_hash=` — forward successor lookup so an app can detect a newer network and get its download link
 - router: optional `release_url` field on registry DNA entries (surfaced by `/v1/update-check`)
 - notary-daemon: gated live round-trip test (`tests/live_roundtrip.rs`, `cargo test --test live_roundtrip -- --ignored`) — the real daemon + real `ham` against a live conductor with a closed agent; locks the served package decoding with the same `rave_engine` types the app consumes (run command in the file header)
