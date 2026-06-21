@@ -1,0 +1,68 @@
+[package]
+name = "migration-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Headless server-agent migration driver for unyt DNA upgrades — supervised close/open services that carry a stateful server agent's economic identity (ledger, carry-forward, agreement state, agent key) from an old alliance DNA to its successor: close the old chain with M-of-N notary signatures, then fetch the committed close and re-open it on the new DNA with migration_init first"
+license = "CAL-1.0"
+
+[lib]
+name = "migration_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migration-agent"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async trait (Conductor abstraction for mockable zome / admin calls)
+async-trait = "0.1"
+
+# HTTP client for the target release's joining service (fresh membrane proof).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Random M-of-N notary selection — seedable so the policy state machine is
+# deterministic under test (mirrors the router's injectable `rand`).
+rand = "0.8"
+
+# Base64 decode of the joining service's membrane proof string.
+base64 = "0.22"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+# Holochain bridge — same stack + pins as notary-daemon (one wire-type pin for
+# the whole migration-service repo).
+ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+holochain_client = "0.8.1"
+holo_hash = { version = "0.6.1", features = ["encoding"] }
+# App-install payloads for the open service (install / uninstall / enable for
+# the carried key). The conductor API version `ham`'s `holochain_client` pulls.
+holochain_types = "0.6.1"
+# Same hdi the unyt workspace pins (rave_engine uses hdi 0.7.1) so Signature /
+# Timestamp / hash types are identical to the ones in the zome-call payloads.
+hdi = "0.7.1"
+
+# Shared migration protocol + ledger types (SummaryStatePayload / NotarySignature /
+# SignClosingResponse / CommittedClose / MigrationInitRequest / Ledger). The same
+# published release notary-daemon pins — no git pins (see the spec's § Versioning).
+rave_engine = "0.4.0"
+# ZFuel — the ledger's `fees_owed` unit, for the close service's fee-owed probe
+# (same version rave_engine 0.4.0 resolves, so `ZFuel` is the identical type).
+zfuel = "0.6.2"
+
+[dev-dependencies]
+# Deterministic seeded RNG for the policy unit tests.
+rand_chacha = "0.3"
