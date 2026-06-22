@@ -336,5 +336,54 @@ pub fn assert_happ_path(path: &Path) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("happ bundle not found at {}", path.display());
     }
+    // A directory or special path can't be a `.happ` bundle — reject it up front
+    // rather than letting `install_app` fail obscurely deep in the install.
+    if !path.is_file() {
+        anyhow::bail!("happ bundle path is not a regular file: {}", path.display());
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch path under the temp dir (no `tempfile` dev-dep, matching
+    /// the integration tests' convention).
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "migration-agent-conductor-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn assert_happ_path_accepts_a_regular_file() {
+        let f = scratch("regular-file");
+        std::fs::write(&f, b"not a real happ, but a file").unwrap();
+        assert!(assert_happ_path(&f).is_ok());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn assert_happ_path_rejects_a_missing_path() {
+        let missing = scratch("missing");
+        let err = assert_happ_path(&missing).unwrap_err().to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn assert_happ_path_rejects_a_directory() {
+        // A directory exists() but is not a `.happ` bundle — fail fast.
+        let dir = scratch("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = assert_happ_path(&dir).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -95,8 +95,11 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         lair_passphrase: "x".into(),
     };
 
-    // Fire shutdown shortly after the first pass so `run` returns Ok from the
-    // backoff sleep (the loop is probe→admin-connect-fails→Transient→backoff).
+    // Fire shutdown shortly after the first pass so `run` returns from the
+    // backoff sleep (the loop is probe→admin-connect-fails→Transient→backoff). A
+    // shutdown before the open completes exits nonzero (the chain isn't verified
+    // yet — a supervised one-shot exits 0 only on success); the point of THIS
+    // test is the orthogonal latch invariant below, which must hold regardless.
     let (tx, rx) = tokio::sync::watch::channel(false);
     let mut shutdown = rx;
     tokio::spawn(async move {
@@ -104,9 +107,11 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         let _ = tx.send(true);
     });
 
-    open::run(&cfg, &open_cfg, &params, &mut shutdown)
-        .await
-        .expect("open run returns Ok on shutdown");
+    let result = open::run(&cfg, &open_cfg, &params, &mut shutdown).await;
+    assert!(
+        result.is_err(),
+        "an incomplete open interrupted by shutdown exits nonzero (not Ok)"
+    );
 
     // The crux: the fresh run's persists did NOT lower the latch.
     assert!(

@@ -6,7 +6,7 @@
 
 mod support;
 
-use migration_agent::fetch::{self, is_hard_stop, FetchOutcome};
+use migration_agent::fetch::{self, is_hard_stop, is_retryable, FetchOutcome};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -14,14 +14,20 @@ use tokio::net::TcpListener;
 fn no_close_found_is_not_a_hard_stop() {
     // The crux: a headless restoring agent must keep waiting on no_close_found.
     assert!(!is_hard_stop("no_close_found"));
-    // The genuinely transient codes are also keep-waiting.
+    assert!(is_retryable("no_close_found"));
+    // The genuinely transient codes are also keep-waiting (recognized retryable).
     for code in [
         "unable_to_verify",
         "all_orgs_unhealthy",
         "internal",
         "auth_failed",
+        "rate_limited",
     ] {
         assert!(!is_hard_stop(code), "{code} should be keep-waiting");
+        assert!(
+            is_retryable(code),
+            "{code} should be a recognized retryable"
+        );
     }
 }
 
@@ -32,11 +38,23 @@ fn contract_faults_are_hard_stops() {
         "bad_request",
         "unknown_to_dna",
         "unknown_from_dna",
+        "unknown_current_dna",
         "to_is_chain_root",
         "not_registered_predecessor",
     ] {
         assert!(is_hard_stop(code), "{code} should be a hard stop");
+        assert!(!is_retryable(code), "{code} is not retryable");
     }
+}
+
+#[test]
+fn unknown_code_is_neither_retryable_nor_a_known_hard_stop() {
+    // A code this agent has never seen (wire-contract drift) is NOT retryable —
+    // the caller treats it as a hard stop rather than retrying forever. The two
+    // sets are an explicit allowlist each, so an unknown code falls through both.
+    let code = "some_future_code_we_have_never_seen";
+    assert!(!is_hard_stop(code));
+    assert!(!is_retryable(code));
 }
 
 /// Serve exactly one HTTP request with the given status + JSON body, then close.
@@ -99,6 +117,27 @@ async fn warranted_response_hard_stops() {
         "warranted must hard stop, got {}",
         describe(&outcome)
     );
+}
+
+#[tokio::test]
+async fn unrecognized_error_code_response_hard_stops() {
+    // A non-2xx carrying a code outside both allowlists (wire drift) must hard
+    // stop, not spin forever as a keep-waiting.
+    let base = one_shot_server(
+        "418 I'm a teapot",
+        r#"{"error":{"code":"brand_new_unforeseen_code","message":"the contract drifted"}}"#,
+    )
+    .await;
+    let client = fetch::http_client_for_status().unwrap();
+    let outcome =
+        fetch::fetch_package(&client, &base, &dna_b64(1), &dna_b64(2), &agent_b64()).await;
+    match outcome {
+        FetchOutcome::HardStop(why) => assert!(why.contains("unrecognized error code")),
+        other => panic!(
+            "an unrecognized code must hard stop, got {}",
+            describe(&other)
+        ),
+    }
 }
 
 #[tokio::test]

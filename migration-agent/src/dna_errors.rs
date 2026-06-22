@@ -145,12 +145,12 @@ pub fn is_recognized_close_state_response(rendered: &str) -> bool {
         || rendered.contains("no CloseChain action found")
 }
 
-/// Whether a router error `code` is a genuine hard stop for the migration. The
-/// rest — crucially including `no_close_found` (which, after a known close, can
-/// only be propagation lag for a headless restoring agent) — are "keep
-/// waiting". Mirrors the router's wire codes (a different namespace from the
-/// DNA validator strings above, but the same fragile string contract, so it
-/// shares this home).
+/// Whether a router error `code` is a genuine hard stop for the migration —
+/// a fault no amount of retrying will fix. Mirrors the router's wire codes (the
+/// `ErrorCode` union in `migration-service/router/src/errors.ts`; a different
+/// namespace from the DNA validator strings above, but the same fragile string
+/// contract, so it shares this home). Keep this set + [`router_code_is_retryable`]
+/// in sync with that union: every code is exactly one of the two.
 pub fn router_code_is_hard_stop(code: &str) -> bool {
     matches!(
         code,
@@ -161,7 +161,34 @@ pub fn router_code_is_hard_stop(code: &str) -> bool {
         | "bad_request"
         | "unknown_to_dna"
         | "unknown_from_dna"
+        | "unknown_current_dna"
         | "to_is_chain_root"
         | "not_registered_predecessor"
+    )
+}
+
+/// Whether a router error `code` is a *recognized, genuinely transient* fault —
+/// propagation lag, a momentary outage, or a rate limit — for which the headless
+/// restoring agent should keep waiting and re-fetch. The crux is `no_close_found`:
+/// AFTER a known close it can only be propagation lag, never a fresh-agent fallback.
+///
+/// This is an explicit ALLOWLIST, not the complement of [`router_code_is_hard_stop`]:
+/// a code the router adds that this agent has never seen is, by default, NOT
+/// retryable — it is surfaced as a hard stop by the caller rather than silently
+/// retried forever, so a drifted/extended wire contract fails loud instead of
+/// hanging. Mirrors the router's `ErrorCode` union; keep the two sets in sync.
+pub fn router_code_is_retryable(code: &str) -> bool {
+    matches!(
+        code,
+        // Propagation lag for a headless restoring agent after a known close.
+        "no_close_found"
+        // Notaries momentarily unreachable / unable to attest — re-fetch later.
+        | "all_orgs_unhealthy"
+        | "unable_to_verify"
+        // The router's own internal/transport error — our fault, retry.
+        | "internal"
+        // Auth / rate limiting — momentary; back off and retry.
+        | "auth_failed"
+        | "rate_limited"
     )
 }

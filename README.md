@@ -16,7 +16,7 @@ Full design + protocol contracts are maintained in unyt's internal version-migra
 
 ## Layout
 
-```
+```text
 router/          Cloudflare Worker (TS) — wrangler + vitest
 notary-daemon/   Rust crate — axum + ham
 migration-agent/ Rust crate — clap + ham (headless server-agent close/open services)

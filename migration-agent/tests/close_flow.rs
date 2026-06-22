@@ -11,7 +11,7 @@ use std::time::Duration;
 use migration_agent::close;
 use migration_agent::config::Config;
 use migration_agent::policy::PolicyOpts;
-use migration_agent::state_file::{State, Step};
+use migration_agent::state_file::{Phase, State, Step};
 use rave_engine::types::entries::migration::v0_1::SignClosingResponse;
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
@@ -278,6 +278,56 @@ async fn closed_state_retains_agent_and_signature_progress() {
         Some(2),
         "the collected count persists into the final closed state"
     );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn shutdown_before_close_exits_nonzero_and_preserves_prior_report() {
+    // A supervised one-shot exits 0 only on success: a shutdown fired before the
+    // chain is closed must return `Err` (nonzero exit), so systemd's
+    // `Restart=on-failure` resumes the loop rather than treating the interrupted
+    // run as done. The shutdown is pre-fired, so the loop bails on its very first
+    // top-of-loop check before any probe — and must NOT clobber the richer report
+    // a prior pass wrote (agent + signature attribution), since a fresh process
+    // starts from an all-`None` in-memory `State`.
+    let tmp = tmp_state("shutdown-before-close");
+    let mock = MockConductor::default();
+
+    // A prior pass left a report with attribution on disk (mid-collection).
+    let mut prior = State::new(Phase::Close, Step::CollectingSignatures, "collecting");
+    prior.agent = Some("uhCAk-prior-agent".into());
+    prior.signatures_collected = Some(2);
+    prior.signatures_threshold = Some(3);
+    prior.write(&tmp).unwrap();
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tx.send(true).unwrap();
+    let mut sd = rx;
+
+    let result = close::run(&mock, &cfg(&tmp), &mut sd).await;
+    assert!(
+        result.is_err(),
+        "an incomplete close interrupted by shutdown exits nonzero (not Ok)"
+    );
+    assert!(
+        mock.calls().is_empty(),
+        "a pre-fired shutdown bails before probing: {:?}",
+        mock.calls()
+    );
+
+    // The prior report survives untouched: the bail does NOT write the bare
+    // in-memory `State` over the attribution a prior pass recorded. (Not `Failed`
+    // either — a shutdown is an interruption a restart resumes, not a hard stop.)
+    let state = State::read(&tmp).unwrap();
+    assert_eq!(
+        state.step,
+        Step::CollectingSignatures,
+        "prior step preserved"
+    );
+    assert_eq!(state.agent.as_deref(), Some("uhCAk-prior-agent"));
+    assert_eq!(state.signatures_collected, Some(2));
+    assert_ne!(state.step, Step::Failed);
+    assert!(!state.old_chain_closed);
     let _ = std::fs::remove_file(&tmp);
 }
 

@@ -3,9 +3,11 @@
 //! close_action }` verbatim, or the shared error envelope. For a headless
 //! restoring agent, a `no_close_found` AFTER a known close can only be
 //! propagation lag — so it (and the genuinely transient codes) maps to
-//! `KeepWaiting`, NEVER a hard stop and NEVER a fresh-agent fallback. Only a
-//! true client/contract fault (`warranted`, `bad_request`, an unregistered DNA
-//! pair) is a hard stop.
+//! `KeepWaiting`, NEVER a hard stop and NEVER a fresh-agent fallback. A true
+//! client/contract fault (`warranted`, `bad_request`, an unregistered DNA pair)
+//! is a hard stop — and so is an UNRECOGNIZED code: the retryable set is an
+//! explicit allowlist (see [`crate::dna_errors`]), so a drifted wire contract
+//! fails loud rather than retrying a possibly-permanent fault forever.
 
 use std::time::Duration;
 
@@ -56,6 +58,7 @@ pub fn http_client_for_status() -> Result<reqwest::Client> {
 /// for every fragile error-string contract); this re-export keeps the call site
 /// and the unit test (`fetch::is_hard_stop`) ergonomic.
 pub use crate::dna_errors::router_code_is_hard_stop as is_hard_stop;
+pub use crate::dna_errors::router_code_is_retryable as is_retryable;
 
 /// Fetch the package for `agent_b64` migrating `from_dna` → `to_dna` via the
 /// router at `router_url`.
@@ -109,10 +112,17 @@ pub async fn fetch_package(
             };
             if is_hard_stop(&code) {
                 FetchOutcome::HardStop(format!("router {code}: {msg}"))
-            } else {
+            } else if is_retryable(&code) {
                 // no_close_found / unable_to_verify / all_orgs_unhealthy /
-                // internal / auth_failed / rate-limited → keep waiting.
+                // internal / auth_failed / rate_limited → keep waiting.
                 FetchOutcome::KeepWaiting(format!("router {code}: {msg}"))
+            } else {
+                // An UNRECOGNIZED code — the wire contract drifted (a code added
+                // router-side this agent has never seen). Surface it as a hard
+                // stop rather than retrying a possibly-permanent fault forever;
+                // `error.code` is a fixed enum whose distinctions are load-bearing,
+                // so an unknown one is treated as non-recoverable, not transient.
+                FetchOutcome::HardStop(format!("router unrecognized error code {code}: {msg}"))
             }
         }
         // An unparseable error body — treat as transient.

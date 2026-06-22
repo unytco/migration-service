@@ -66,8 +66,7 @@ pub async fn run(
     let mut attempts: u32 = 0;
     loop {
         if *shutdown.borrow() {
-            tracing::info!("shutdown before close completed");
-            return Ok(());
+            return shutdown_before_complete();
         }
         match attempt(conductor, cfg, &mut state).await {
             CloseOutcome::Closed => {
@@ -96,7 +95,7 @@ pub async fn run(
                     s.message = format!("transient failure, retrying: {e:#}");
                 });
                 if sleep_or_shutdown(delay, shutdown).await {
-                    return Ok(());
+                    return shutdown_before_complete();
                 }
                 attempts = attempts.saturating_add(1);
             }
@@ -289,6 +288,20 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
         _ = tokio::time::sleep(dur) => false,
         _ = shutdown.changed() => true,
     }
+}
+
+/// Shutdown fired before the chain was closed: the migration is INCOMPLETE, so
+/// the service must exit nonzero (not `Ok`). A supervised one-shot exits 0 only
+/// on success — exiting 0 here would let systemd's `Restart=on-failure` treat an
+/// interrupted (e.g. reboot mid-close) run as done and never resume it. The
+/// in-progress step is the operator-must-intervene `Step::Failed`'s opposite —
+/// a restart re-probes and resumes — so we deliberately do NOT touch the state
+/// file here: leaving the last meaningful record (agent + signature attribution
+/// a prior pass wrote) intact rather than clobbering it with this pass's
+/// possibly-bare in-memory `State` (the top-of-loop bail can fire before any
+/// `attempt` has populated it). The next restart's first probe rewrites it.
+fn shutdown_before_complete() -> Result<()> {
+    anyhow::bail!("shutdown before close completed (chain still open)")
 }
 
 /// Apply `f` to the carried `state` and persist it, swallowing (logging) a

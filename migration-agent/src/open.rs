@@ -95,8 +95,7 @@ pub async fn run(
     let mut attempts: u32 = 0;
     loop {
         if *shutdown.borrow() {
-            tracing::info!("shutdown before open completed");
-            return Ok(());
+            return shutdown_before_complete();
         }
         match attempt(cfg, open_cfg, params, &http, &signer, shutdown, &mut state).await {
             OpenOutcome::Done => {
@@ -129,7 +128,7 @@ pub async fn run(
                 });
                 // A short, fixed pause before the immediate re-probe.
                 if sleep_or_shutdown(cfg.retry_initial, shutdown).await {
-                    return Ok(());
+                    return shutdown_before_complete();
                 }
                 attempts = 0;
             }
@@ -143,7 +142,7 @@ pub async fn run(
                     s.message = format!("transient failure, retrying: {e:#}");
                 });
                 if sleep_or_shutdown(delay, shutdown).await {
-                    return Ok(());
+                    return shutdown_before_complete();
                 }
                 attempts = attempts.saturating_add(1);
             }
@@ -456,6 +455,21 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
         _ = tokio::time::sleep(dur) => false,
         _ = shutdown.changed() => true,
     }
+}
+
+/// Shutdown fired before the new chain was open + verified: the migration is
+/// INCOMPLETE, so the service must exit nonzero (not `Ok`). A supervised
+/// one-shot exits 0 only on success — exiting 0 here would let systemd's
+/// `Restart=on-failure` treat an interrupted (e.g. reboot mid-open) run as done
+/// and never resume it. The already-verified idempotent restart short-circuits
+/// to `Done` (Ok) BEFORE this is reached (it checks the seeded latch up top), so
+/// this only fires on a genuinely incomplete run. We deliberately do NOT write
+/// the state file here — leaving the last meaningful record (the seeded
+/// `safe_to_teardown` latch + verify detail, plus this run's probe progress)
+/// intact rather than re-stamping a message over it; the next restart's first
+/// probe rewrites it, and the monotonic latch is untouched either way.
+fn shutdown_before_complete() -> Result<()> {
+    bail!("shutdown before open completed (new chain not yet verified)")
 }
 
 /// Apply `f` to the carried `state` and persist it (logging a write error —
