@@ -1,4 +1,4 @@
-//! Gated live round-trip + restart drills: the REAL migration-agent services
+//! Gated live round-trip + restart drills: the REAL headless-migrator services
 //! against locally running conductors (an old-DNA conductor with a stateful
 //! agent + notary cells, and a new-DNA conductor), plus a `wrangler dev` router.
 //! Proves the close → key-carry → open → verify arc end-to-end, and that a kill
@@ -20,7 +20,7 @@
 //!     its lair (the shell's `migrate-carry-key.sh` step) + `lair-sign` on PATH;
 //!   * the target release's joining service reachable for a fresh membrane proof.
 //!
-//! Then, from `migration-agent/`:
+//! Then, from `headless-migrator/`:
 //!
 //! ```bash
 //! # ── close service (old conductor) ──
@@ -45,11 +45,11 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
 
-use migration_agent::conductor::HamConductor;
-use migration_agent::config::{Config, OpenConfig};
-use migration_agent::open::{self, OpenParams};
-use migration_agent::verify::VerifyParams;
-use migration_agent::{close, verify};
+use headless_migrator::conductor::HamConductor;
+use headless_migrator::config::{Config, OpenConfig};
+use headless_migrator::open::{self, OpenParams};
+use headless_migrator::verify::VerifyParams;
+use headless_migrator::{close, verify};
 
 /// Read all the live env vars into the agent's config + params, or skip with a
 /// clear message if the fixture isn't present.
@@ -76,7 +76,7 @@ fn load_live_env() -> Result<LiveEnv> {
 
     let base = |state: &str| -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("migration-agent-live-{state}.json"));
+        p.push(format!("headless-migrator-live-{state}.json"));
         p
     };
 

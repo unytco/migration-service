@@ -8,10 +8,10 @@ mod support;
 
 use std::time::Duration;
 
-use migration_agent::config::Config;
-use migration_agent::policy::PolicyOpts;
-use migration_agent::state_file::{Phase, State, Step, VerifyReport};
-use migration_agent::verify::{build_verify_state, verify_against_ledger};
+use headless_migrator::config::Config;
+use headless_migrator::policy::PolicyOpts;
+use headless_migrator::state_file::{Phase, State, Step, VerifyReport};
+use headless_migrator::verify::{build_verify_state, verify_against_ledger};
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
 use zfuel::fuel::ZFuel;
@@ -19,7 +19,7 @@ use zfuel::fuel::ZFuel;
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "migration-agent-verify-test-{}-{}.json",
+        "headless-migrator-verify-test-{}-{}.json",
         name,
         std::process::id()
     ));
@@ -125,13 +125,13 @@ async fn passing_verify_then_status_reports_safe_to_teardown() {
 
     // A later status with everything down still reports the monotonic true.
     let cfg = down_cfg(path.clone());
-    let params = migration_agent::status::StatusParams {
+    let params = headless_migrator::status::StatusParams {
         router_url: "http://127.0.0.1:1".into(),
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_b64: agent_b64(),
     };
-    let reported = migration_agent::status::run(&cfg, Some(&params))
+    let reported = headless_migrator::status::run(&cfg, Some(&params))
         .await
         .expect("status run Ok with everything down");
     assert!(

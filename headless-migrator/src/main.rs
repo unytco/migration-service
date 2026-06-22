@@ -1,4 +1,4 @@
-//! `migration-agent` — the headless server-agent migration driver. The command
+//! `headless-migrator` — the headless server-agent migration driver. The command
 //! surface is the spec's `MigrateCommand`: `status` · `close-service` ·
 //! `open-service` · `verify`. Each supervised service exits 0 only on success
 //! and is probe-first + idempotent, so systemd `Restart=on-failure` drives the
@@ -13,15 +13,15 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
 
-use migration_agent::config::{Config, OpenConfig};
-use migration_agent::open::OpenParams;
-use migration_agent::status::StatusParams;
-use migration_agent::verify::VerifyParams;
-use migration_agent::{close, open, status, verify};
+use headless_migrator::config::{Config, OpenConfig};
+use headless_migrator::open::OpenParams;
+use headless_migrator::status::StatusParams;
+use headless_migrator::verify::VerifyParams;
+use headless_migrator::{close, open, status, verify};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "migration-agent",
+    name = "headless-migrator",
     about = "Headless server-agent migration: close the old chain (M-of-N) and \
              re-open it on the successor DNA with the carried key",
     long_about = None,
@@ -112,7 +112,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "migration-agent failed");
+            tracing::error!(error = %format!("{e:#}"), "headless-migrator failed");
             ExitCode::FAILURE
         }
     }
@@ -185,8 +185,8 @@ async fn run() -> Result<()> {
 async fn connect(
     cfg: &Config,
     shutdown: &mut ham::ShutdownRx,
-) -> Result<migration_agent::conductor::HamConductor> {
-    migration_agent::conductor::HamConductor::connect(cfg, shutdown)
+) -> Result<headless_migrator::conductor::HamConductor> {
+    headless_migrator::conductor::HamConductor::connect(cfg, shutdown)
         .await
         .context("conductor unreachable before shutdown")
 }

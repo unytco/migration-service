@@ -1,12 +1,12 @@
 //! The machine-readable progress file the report collector reads: it persists
 //! atomically and round-trips its fields.
 
-use migration_agent::state_file::{Phase, State, Step, VerifyReport};
+use headless_migrator::state_file::{Phase, State, Step, VerifyReport};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "migration-agent-state-{}-{}.json",
+        "headless-migrator-state-{}-{}.json",
         name,
         std::process::id()
     ));

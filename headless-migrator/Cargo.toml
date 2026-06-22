@@ -1,16 +1,16 @@
 [package]
-name = "migration-agent"
+name = "headless-migrator"
 version = "0.1.0"
 edition = "2021"
 description = "Headless server-agent migration driver for unyt DNA upgrades — supervised close/open services that carry a stateful server agent's economic identity (ledger, carry-forward, agreement state, agent key) from an old alliance DNA to its successor: close the old chain with M-of-N notary signatures, then fetch the committed close and re-open it on the new DNA with migration_init first"
 license = "CAL-1.0"
 
 [lib]
-name = "migration_agent"
+name = "headless_migrator"
 path = "src/lib.rs"
 
 [[bin]]
-name = "migration-agent"
+name = "headless-migrator"
 path = "src/main.rs"
 
 [dependencies]

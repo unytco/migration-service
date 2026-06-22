@@ -169,7 +169,7 @@ impl HamConductor {
         AdminWebsocket::connect_with_config(
             (Ipv4Addr::LOCALHOST, cfg.admin_port),
             Arc::new(ws_config),
-            Some("migration-agent".into()),
+            Some("headless-migrator".into()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("admin connect: {e}"))
@@ -353,7 +353,7 @@ mod tests {
     fn scratch(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "migration-agent-conductor-test-{}-{}",
+            "headless-migrator-conductor-test-{}-{}",
             name,
             std::process::id()
         ));

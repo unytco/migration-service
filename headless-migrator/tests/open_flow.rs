@@ -10,16 +10,16 @@
 //! The substrings asserted here are copied from the alliance integrity
 //! validators and the coordinator guard — see `src/dna_errors.rs`.
 
-use migration_agent::open::{classify_migration_init_error, InitErrorClass};
+use headless_migrator::open::{classify_migration_init_error, InitErrorClass};
 
 mod support;
 
 use std::time::Duration;
 
-use migration_agent::config::{Config, OpenConfig};
-use migration_agent::open::{self, OpenParams};
-use migration_agent::policy::PolicyOpts;
-use migration_agent::state_file::{Phase, State, Step};
+use headless_migrator::config::{Config, OpenConfig};
+use headless_migrator::open::{self, OpenParams};
+use headless_migrator::policy::PolicyOpts;
+use headless_migrator::state_file::{Phase, State, Step};
 
 /// A `Config` whose conductor ports point nowhere, with a unique temp state file
 /// and snappy retries.
@@ -45,7 +45,7 @@ fn down_cfg(state_file: std::path::PathBuf) -> Config {
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "migration-agent-open-test-{}-{}.json",
+        "headless-migrator-open-test-{}-{}.json",
         name,
         std::process::id()
     ));

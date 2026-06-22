@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use holo_hash::AgentPubKey;
-use migration_agent::policy::{
+use headless_migrator::policy::{
     collect_signatures, PolicyError, PolicyOpts, SignOutcome, Signer, Sleeper,
 };
+use holo_hash::AgentPubKey;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rave_engine::types::entries::migration::v0_1::NotarySignature;

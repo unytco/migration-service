@@ -14,15 +14,15 @@ mod support;
 
 use std::time::Duration;
 
-use migration_agent::config::Config;
-use migration_agent::policy::PolicyOpts;
-use migration_agent::probe::ClosedStatus;
-use migration_agent::state_file::{Phase, State, Step, VerifyReport};
-use migration_agent::status::{
+use headless_migrator::config::Config;
+use headless_migrator::policy::PolicyOpts;
+use headless_migrator::probe::ClosedStatus;
+use headless_migrator::state_file::{Phase, State, Step, VerifyReport};
+use headless_migrator::status::{
     apply_closed_status, derive_old_chain_closed_if_new_server,
     reconcile_old_chain_closed_with_teardown, safe_to_teardown, StatusParams,
 };
-use migration_agent::verify::fetch_and_compare;
+use headless_migrator::verify::fetch_and_compare;
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,7 +55,7 @@ fn down_cfg(tmp: &std::path::Path) -> Config {
 fn tmp_state(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "migration-agent-status-test-{}-{}.json",
+        "headless-migrator-status-test-{}-{}.json",
         name,
         std::process::id()
     ));
@@ -179,7 +179,7 @@ async fn close_side_status_run_reports_unknown_when_conductor_down() {
     let tmp = tmp_state("close-side-unknown");
     // Unroutable ports + tiny budget; NO router params → the close-side path.
     let cfg = down_cfg(&tmp);
-    let state = migration_agent::status::run(&cfg, None)
+    let state = headless_migrator::status::run(&cfg, None)
         .await
         .expect("close-side status run is Ok even with the conductor down");
     assert!(
@@ -263,7 +263,7 @@ async fn close_side_status_with_latched_teardown_renders_no_contradictory_row() 
     let cfg = down_cfg(&tmp); // unroutable conductor → close-side probe reads UNKNOWN
 
     // Close side: no router params.
-    let state = migration_agent::status::run(&cfg, None)
+    let state = headless_migrator::status::run(&cfg, None)
         .await
         .expect("close-side status run is Ok even with the conductor down");
 
@@ -335,7 +335,7 @@ async fn verify_gate_fails_when_opened_chain_ledger_mismatches() {
         ZFuel::zero(),
     ));
 
-    let client = migration_agent::fetch::http_client_for_status().unwrap();
+    let client = headless_migrator::fetch::http_client_for_status().unwrap();
     let report = fetch_and_compare(&mock, &client, &base, &dna_b64(1), &dna_b64(2), "uhCAk")
         .await
         .expect("router reachable, ledger read ok")
@@ -371,7 +371,7 @@ async fn status_reports_persisted_safe_to_teardown_after_teardown() {
 
     let cfg = down_cfg(&tmp);
     let params = status_params();
-    let state = migration_agent::status::run(&cfg, Some(&params))
+    let state = headless_migrator::status::run(&cfg, Some(&params))
         .await
         .expect("status run is Ok even with everything down");
 
@@ -399,7 +399,7 @@ async fn status_without_persisted_verify_is_not_safe_to_teardown() {
     // No seed: the state file does not exist yet.
     let cfg = down_cfg(&tmp);
     let params = status_params();
-    let state = migration_agent::status::run(&cfg, Some(&params))
+    let state = headless_migrator::status::run(&cfg, Some(&params))
         .await
         .expect("status run is Ok");
 
@@ -420,7 +420,7 @@ async fn status_connect_is_bounded_on_a_down_conductor() {
     let params = status_params();
 
     let started = std::time::Instant::now();
-    let _ = migration_agent::status::run(&cfg, Some(&params))
+    let _ = headless_migrator::status::run(&cfg, Some(&params))
         .await
         .expect("status run is Ok");
     let elapsed = started.elapsed();

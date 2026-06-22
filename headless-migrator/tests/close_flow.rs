@@ -8,10 +8,10 @@ mod support;
 
 use std::time::Duration;
 
-use migration_agent::close;
-use migration_agent::config::Config;
-use migration_agent::policy::PolicyOpts;
-use migration_agent::state_file::{Phase, State, Step};
+use headless_migrator::close;
+use headless_migrator::config::Config;
+use headless_migrator::policy::PolicyOpts;
+use headless_migrator::state_file::{Phase, State, Step};
 use rave_engine::types::entries::migration::v0_1::SignClosingResponse;
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
@@ -41,7 +41,7 @@ fn cfg(tmp: &std::path::Path) -> Config {
 fn tmp_state(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "migration-agent-test-{}-{}.json",
+        "headless-migrator-test-{}-{}.json",
         name,
         std::process::id()
     ));

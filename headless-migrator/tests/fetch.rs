@@ -6,7 +6,7 @@
 
 mod support;
 
-use migration_agent::fetch::{self, is_hard_stop, is_retryable, FetchOutcome};
+use headless_migrator::fetch::{self, is_hard_stop, is_retryable, FetchOutcome};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

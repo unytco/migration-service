@@ -3,8 +3,8 @@
 
 mod support;
 
-use migration_agent::conductor::AppPresence;
-use migration_agent::probe::{
+use headless_migrator::conductor::AppPresence;
+use headless_migrator::probe::{
     classify_close_error, probe_close_state, probe_closed_status, probe_open_state, CloseNext,
     CloseState, ClosedStatus, OpenNext, OpenState,
 };

@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
-use migration_agent::conductor::{AppPresence, Conductor, InstallSpec};
 use rave_engine::types::entries::migration::v0_1::{
     AgreementCarryForward, CommittedClose, MigrationInitRequest, NotarySignature,
     PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryState, SummaryStatePayload,
