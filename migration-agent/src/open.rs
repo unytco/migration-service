@@ -281,7 +281,7 @@ async fn fetch_or_outcome(
                 s.package_fetchable = true;
                 s.message = "migration package fetched".into();
             });
-            Ok(p)
+            Ok(*p)
         }
         FetchOutcome::KeepWaiting(why) => Err(OpenOutcome::Transient(anyhow::anyhow!(
             "package not yet fetchable ({why}); waiting out gossip"

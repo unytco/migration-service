@@ -16,8 +16,10 @@ use serde::Deserialize;
 
 /// The outcome of one package fetch.
 pub enum FetchOutcome {
-    /// The package — ready to install + `migration_init`.
-    Package(MigrationInitRequest),
+    /// The package — ready to install + `migration_init`. Boxed so the large
+    /// `MigrationInitRequest` doesn't bloat every `FetchOutcome` (the other
+    /// variants hold only a `String`) — clears `clippy::large_enum_variant`.
+    Package(Box<MigrationInitRequest>),
     /// Not yet available; the supervised loop should back off and retry. Holds
     /// a short reason for the log/state file.
     KeepWaiting(String),
@@ -89,7 +91,7 @@ pub async fn fetch_package(
 
     if status.is_success() {
         return match serde_json::from_str::<MigrationInitRequest>(&text) {
-            Ok(pkg) => FetchOutcome::Package(pkg),
+            Ok(pkg) => FetchOutcome::Package(Box::new(pkg)),
             // A 200 that won't decode is our-side drift — surface it, but as a
             // transient so a flaky body doesn't kill the migration outright.
             Err(e) => FetchOutcome::KeepWaiting(format!("router 200 did not decode: {e}")),

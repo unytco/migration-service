@@ -103,7 +103,7 @@ pub async fn fetch_and_compare(
 ) -> Result<Option<VerifyReport>> {
     let package = match fetch::fetch_package(client, router_url, from_dna, to_dna, agent_b64).await
     {
-        FetchOutcome::Package(p) => p,
+        FetchOutcome::Package(p) => *p,
         FetchOutcome::KeepWaiting(_) => return Ok(None),
         FetchOutcome::HardStop(why) => bail!("close package fetch hard stop: {why}"),
     };
