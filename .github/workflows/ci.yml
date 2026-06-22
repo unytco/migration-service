@@ -30,6 +30,29 @@ jobs:
       - name: test
         run: cargo test
 
+  agent:
+    name: headless-migrator (Rust)
+    runs-on: ubuntu-latest
+    # Same public deps as the daemon (`ham` git + `rave_engine` crates.io) —
+    # fetched anonymously, no token needed.
+    defaults:
+      run:
+        working-directory: headless-migrator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: headless-migrator
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
   router:
     name: router (Cloudflare Worker, TS)
     runs-on: ubuntu-latest
