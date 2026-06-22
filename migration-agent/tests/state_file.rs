@@ -185,6 +185,57 @@ fn seed_from_persisted_carries_the_monotonic_latch_and_verify() {
 }
 
 #[test]
+fn write_fails_closed_on_a_present_but_corrupt_state_file() {
+    // B45: the latch read must tell a genuinely-ABSENT file from a PRESENT-but-
+    // corrupt one. A corrupt file may hold a latched `true` that can't be parsed,
+    // so a fresh `false` written over it would silently DROP that latch. Fail
+    // closed: refuse the lowering write, leave the corrupt bytes intact, surface
+    // the read error.
+    let path = tmp("corrupt-fail-closed");
+    // A present-but-unparseable state file (it held a latched `true` no reader can
+    // now recover — exactly the bytes the latch must not let a fresh `false` drop).
+    let corrupt = b"{ \"safe_to_teardown\": true, this is not valid json";
+    std::fs::write(&path, corrupt).unwrap();
+
+    // A fresh `status`-style record (default `safe_to_teardown = false`) tries to
+    // overwrite the corrupt file. It MUST be refused, not silently clobber it.
+    let fresh = State::new(Phase::Status, Step::Probing, "fresh process, default false");
+    assert!(!fresh.safe_to_teardown);
+    let err = fresh
+        .write(&path)
+        .expect_err("a lowering write over a corrupt file must fail closed, not succeed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("refusing to lower safe_to_teardown") && msg.contains("unreadable"),
+        "the read error is surfaced (fail closed): {msg}"
+    );
+
+    // The corrupt file is left EXACTLY as it was — no fresh `false` clobbered the
+    // (unrecoverable but undropped) latch, and no temp file was left behind.
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        corrupt,
+        "the corrupt file must be untouched — its latch was not dropped"
+    );
+    assert!(
+        !path.with_extension("json.tmp").exists(),
+        "no temp file is left behind by the refused write"
+    );
+
+    // RAISING the latch (`true`) over the same corrupt file IS allowed — a raise
+    // can't lower anything and it repairs the corruption with a valid record.
+    let mut done = State::new(Phase::Open, Step::Done, "verified — raises the latch");
+    done.safe_to_teardown = true;
+    done.write(&path)
+        .expect("a `true` write repairs a corrupt file (raising can't drop a latch)");
+    assert!(
+        State::persisted_safe_to_teardown(&path),
+        "the repaired file now carries the latched true"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn verify_report_passed_requires_all_fields() {
     let mut r = VerifyReport {
         balance_match: true,

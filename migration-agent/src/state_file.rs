@@ -46,6 +46,20 @@ pub enum Step {
     Failed,
 }
 
+/// The prior on-disk `safe_to_teardown` latch as the write guard sees it — the
+/// three-way distinction the monotonic latch needs but the reporting read
+/// ([`State::persisted_safe_to_teardown`]) collapses. Only the write path cares
+/// that a corrupt file is NOT an absent one.
+enum PriorLatch {
+    /// No state file yet — a genuinely first write; persist the caller's value.
+    Absent,
+    /// The file read + parsed; carries its persisted `safe_to_teardown`.
+    Known(bool),
+    /// The file is present but could not be read / parsed — the prior latch is
+    /// UNKNOWN. Carries the read error so the caller can surface it.
+    Unreadable(anyhow::Error),
+}
+
 /// The full progress record. `safe_to_teardown` is set once close + open +
 /// verify are all green for this agent — the only teardown signal (the operator
 /// destroys droplets manually).
@@ -141,11 +155,39 @@ impl State {
     /// with its default `false`. Callers should also seed from the prior value
     /// ([`seed_from_persisted`]) so the in-memory record matches; this guard is the
     /// defensive backstop that holds even if a caller forgets to.
+    ///
+    /// **Read-error fail-safe.** The guard reads the prior on-disk record to learn
+    /// the latch, so it must tell a genuinely-ABSENT file (a first write — fine to
+    /// persist whatever the caller passed) from a file that is PRESENT but
+    /// unreadable / corrupt (an UNKNOWN prior latch). A corrupt file might hold a
+    /// latched `true` we cannot read, so a fresh `false` written over it would
+    /// silently drop that latch. So when the prior file is present-but-unreadable
+    /// **and** this write would lower the latch (`safe_to_teardown == false`), the
+    /// write **fails closed**: it refuses to overwrite the corrupt record, leaves
+    /// it intact for inspection, and returns the read error rather than treating
+    /// the unknown prior as a fresh `false`. Raising the latch (`true`) over a
+    /// corrupt file is always allowed — it cannot lower anything and replaces the
+    /// corruption with a valid record.
     pub fn write(&self, path: &Path) -> Result<()> {
         let mut record = self.clone();
-        // Never lower a persisted `safe_to_teardown = true` (monotonic latch).
-        if Self::persisted_safe_to_teardown(path) {
-            record.safe_to_teardown = true;
+        match Self::read_prior_latch(path) {
+            // Known prior latch is up → hold it up (monotonic latch).
+            PriorLatch::Known(true) => record.safe_to_teardown = true,
+            // Known prior latch is down, or a genuinely new file → persist the
+            // caller's value as-is (this may legitimately raise false→true).
+            PriorLatch::Known(false) | PriorLatch::Absent => {}
+            // Present but unreadable → UNKNOWN prior latch. Refuse to lower it:
+            // fail closed on a `false` write so a corrupt `true` can't be dropped.
+            PriorLatch::Unreadable(err) => {
+                if !record.safe_to_teardown {
+                    return Err(err.context(format!(
+                        "refusing to lower safe_to_teardown: prior state file {} is present \
+                         but unreadable, so its latch is unknown (fail closed)",
+                        path.display()
+                    )));
+                }
+                // A `true` write is a raise — safe to proceed and repair the file.
+            }
         }
         record.updated_at_us = now_us();
         let json = serde_json::to_string_pretty(&record).context("serializing state file")?;
@@ -181,10 +223,37 @@ impl State {
     /// only run *during* the migration and would (incorrectly) flip the signal
     /// false on a later restart once the operator has torn down the old side.
     /// Once true, it stays true. The one home for "has this agent verified?".
+    ///
+    /// This is the **reporting** read — a known `true` is the only "yes"; an
+    /// absent *or* unreadable file reads `false`, the conservative default
+    /// (report not-safe rather than guess). The *write*-side latch guard does NOT
+    /// reuse this collapse — it must distinguish absent from corrupt to avoid
+    /// dropping a latch it cannot read (see [`read_prior_latch`](Self::read_prior_latch)).
     pub fn persisted_safe_to_teardown(path: &Path) -> bool {
         Self::read(path)
             .map(|s| s.safe_to_teardown)
             .unwrap_or(false)
+    }
+
+    /// Classify the prior on-disk latch for the write-side fail-safe, telling a
+    /// genuinely-ABSENT file apart from a PRESENT-but-corrupt one. Unlike
+    /// [`persisted_safe_to_teardown`](Self::persisted_safe_to_teardown) — which
+    /// collapses both to `false` for *reporting* — the write guard must not, since
+    /// a corrupt file may hold a latched `true` it cannot read and a fresh `false`
+    /// written over it would silently drop that latch.
+    fn read_prior_latch(path: &Path) -> PriorLatch {
+        match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorLatch::Absent,
+            Err(e) => PriorLatch::Unreadable(
+                anyhow::Error::new(e).context(format!("reading {}", path.display())),
+            ),
+            Ok(raw) => match serde_json::from_str::<State>(&raw) {
+                Ok(s) => PriorLatch::Known(s.safe_to_teardown),
+                Err(e) => PriorLatch::Unreadable(
+                    anyhow::Error::new(e).context(format!("parsing {}", path.display())),
+                ),
+            },
+        }
     }
 
     /// Seed this (fresh) in-memory record from the prior persisted state at

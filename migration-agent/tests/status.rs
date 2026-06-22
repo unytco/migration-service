@@ -19,7 +19,8 @@ use migration_agent::policy::PolicyOpts;
 use migration_agent::probe::ClosedStatus;
 use migration_agent::state_file::{Phase, State, Step, VerifyReport};
 use migration_agent::status::{
-    apply_closed_status, derive_old_chain_closed_if_new_server, safe_to_teardown, StatusParams,
+    apply_closed_status, derive_old_chain_closed_if_new_server,
+    reconcile_old_chain_closed_with_teardown, safe_to_teardown, StatusParams,
 };
 use migration_agent::verify::fetch_and_compare;
 use rave_engine::types::ledger::CarryForwardUnits;
@@ -194,6 +195,97 @@ async fn close_side_status_run_reports_unknown_when_conductor_down() {
         "the new-side open probe never runs on the close side"
     );
     assert!(state.message.contains("old_chain_closed=unknown"));
+    // With no persisted latch the `unknown` stands — and that is still a
+    // consistent row (`safe_to_teardown=false`), never the B46 contradiction.
+    assert!(!state.safe_to_teardown);
+    assert_no_contradictory_row(&state.message);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ── No self-contradictory status row (B46) ───────────────────────────────
+
+/// Assert the rendered status line never shows the impossible pair
+/// `safe_to_teardown=true` alongside `old_chain_closed=unknown`. The single home
+/// for "the row is internally consistent", reused by the unit + end-to-end tests.
+fn assert_no_contradictory_row(message: &str) {
+    let contradictory =
+        message.contains("safe_to_teardown=true") && message.contains("old_chain_closed=unknown");
+    assert!(
+        !contradictory,
+        "status row contradicts itself (teardown-safe implies the old chain closed): {message:?}"
+    );
+}
+
+/// B46 (the reconciliation predicate): a latched `safe_to_teardown` resolves the
+/// old-chain question to a definitive closed — teardown-safe REQUIRES the old
+/// chain to have closed — so the `unknown` flag is cleared and the row can't
+/// contradict itself. A no-op when the latch is down (the probe's answer stands).
+#[test]
+fn reconcile_clears_unknown_when_teardown_is_latched() {
+    // Latched true + an UNKNOWN old-chain probe (close-side conductor down) — the
+    // exact pair the renderer must not emit.
+    let mut latched = State::new(Phase::Status, Step::Probing, "");
+    latched.safe_to_teardown = true;
+    latched.old_chain_closed = false;
+    latched.old_chain_closed_unknown = true;
+    reconcile_old_chain_closed_with_teardown(&mut latched);
+    assert!(
+        latched.old_chain_closed,
+        "a latched teardown-safe implies the old chain closed"
+    );
+    assert!(
+        !latched.old_chain_closed_unknown,
+        "the impossible `unknown` companion is cleared once the latch is up"
+    );
+
+    // Latch down → the probe's UNKNOWN answer is left exactly as-is (no over-reach).
+    let mut not_latched = State::new(Phase::Status, Step::Probing, "");
+    not_latched.safe_to_teardown = false;
+    not_latched.old_chain_closed = false;
+    not_latched.old_chain_closed_unknown = true;
+    reconcile_old_chain_closed_with_teardown(&mut not_latched);
+    assert!(
+        not_latched.old_chain_closed_unknown,
+        "with the latch down the probe's UNKNOWN must stand — reconciliation is a no-op"
+    );
+}
+
+/// B46 end-to-end: a CLOSE-side `status::run` (no router params) against a DOWN
+/// conductor whose state file already carries a verified-open latch is exactly
+/// the case that used to render `old_chain_closed=unknown safe_to_teardown=true`
+/// — the probe reads UNKNOWN (conductor unreachable) while the persisted latch is
+/// `true`. The reconciled run must report a consistent row: `safe_to_teardown=true`
+/// with `old_chain_closed=true`, never the contradictory pair.
+#[tokio::test]
+async fn close_side_status_with_latched_teardown_renders_no_contradictory_row() {
+    let tmp = tmp_state("latched-teardown-down-conductor");
+    seed_verified_open(&tmp); // persists safe_to_teardown = true
+    let cfg = down_cfg(&tmp); // unroutable conductor → close-side probe reads UNKNOWN
+
+    // Close side: no router params.
+    let state = migration_agent::status::run(&cfg, None)
+        .await
+        .expect("close-side status run is Ok even with the conductor down");
+
+    assert!(
+        state.safe_to_teardown,
+        "the persisted monotonic latch is reported back (conductor down can't lower it)"
+    );
+    assert!(
+        state.old_chain_closed,
+        "teardown-safe implies the old chain closed — reconciled to a definitive closed"
+    );
+    assert!(
+        !state.old_chain_closed_unknown,
+        "the `unknown` probe result is reconciled away once the latch is up"
+    );
+    assert!(
+        state.message.contains("old_chain_closed=true")
+            && state.message.contains("safe_to_teardown=true"),
+        "the row reads consistently: {:?}",
+        state.message
+    );
+    assert_no_contradictory_row(&state.message);
     let _ = std::fs::remove_file(&tmp);
 }
 

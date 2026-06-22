@@ -98,6 +98,25 @@ pub fn derive_old_chain_closed_if_new_server(state: &mut State, new_server: bool
     }
 }
 
+/// Reconcile `old_chain_closed` with the (already-resolved) `safe_to_teardown`
+/// latch so the report can never render a self-contradictory row. The two are
+/// derived independently — `safe_to_teardown` from the persisted monotonic latch,
+/// `old_chain_closed[_unknown]` from a live probe — so a close-side `status` run
+/// whose conductor is down (probe ⇒ UNKNOWN) but whose latch was persisted `true`
+/// by an earlier verified open would otherwise print
+/// `old_chain_closed=unknown safe_to_teardown=true`, which is impossible:
+/// teardown-safe REQUIRES the old chain to have closed (the open service only
+/// latches `true` once close + open + verify are all green). So a latched
+/// `safe_to_teardown` resolves the old-chain question to a definitive closed,
+/// clearing the `unknown` flag. Pure + presentation-only — it tightens the
+/// rendered facts, not the latch/decision logic. A no-op unless the latch is up.
+pub fn reconcile_old_chain_closed_with_teardown(state: &mut State) {
+    if state.safe_to_teardown {
+        state.old_chain_closed = true;
+        state.old_chain_closed_unknown = false;
+    }
+}
+
 /// Probe and report. Returns the assembled [`State`] (also written + logged).
 pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
     // Read the prior persisted record ONCE, BEFORE we overwrite the state file
@@ -220,6 +239,10 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
     } else {
         Step::Probing
     };
+    // Reconcile the independently-derived fields BEFORE rendering: a latched
+    // `safe_to_teardown` implies the old chain closed, so the row can never show
+    // `old_chain_closed=unknown` alongside `safe_to_teardown=true` (B46).
+    reconcile_old_chain_closed_with_teardown(&mut state);
     // Render `old_chain_closed` as the human-readable tri-state — `unknown` when
     // the close-side probe couldn't reach the conductor, not a misleading `false`.
     let old_chain_closed_str = if state.old_chain_closed_unknown {
