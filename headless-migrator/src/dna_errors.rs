@@ -104,6 +104,27 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
         || r_lower.contains("carry-forward section")
         // An update to the opening summary is never allowed.
         || r_lower.contains("opening state summary update is not allowed")
+        // Single-landing reject (M13): the close's target_dna_hash != the DNA
+        // being opened. Lowercase `dna` — the verdict is "...names a different
+        // target DNA" and the input is lowercased before matching.
+        || r_lower.contains("names a different target dna")
+        // The close's source_dna_hash has no entry in the target GD's
+        // opening_predecessors (M13).
+        || r_lower.contains("is not an accepted predecessor")
+}
+
+/// Whether a close-side error — from `prepare_closing_summary`'s pre-check or the
+/// close validator — is a terminal target-binding fault: the configured `to_dna`
+/// is not in the source GD's `upgrade_targets`, so no amount of retrying fixes it
+/// (unlike propagation lag / a transient blip, which the close loop retries
+/// forever). Mirrors M13's two strings; lowercased internally so the caller may
+/// pass the raw rendered error.
+pub fn is_close_target_hard_failure(rendered: &str) -> bool {
+    let r = rendered.to_lowercase();
+    // `prepare_closing_summary` pre-check: "target DNA {:?} is not in this network's upgrade_targets".
+    r.contains("is not in this network's upgrade_targets")
+        // close validator: "Close target is not in this DNA's upgrade_targets".
+        || r.contains("close target is not in this dna's upgrade_targets")
 }
 
 /// The non-closed close states the close-side probe must distinguish from a
@@ -163,7 +184,7 @@ pub fn router_code_is_hard_stop(code: &str) -> bool {
         | "unknown_from_dna"
         | "unknown_current_dna"
         | "to_is_chain_root"
-        | "not_registered_predecessor"
+        | "unreachable_target"
     )
 }
 
@@ -191,4 +212,47 @@ pub fn router_code_is_retryable(code: &str) -> bool {
         | "auth_failed"
         | "rate_limited"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_target_faults_are_hard_failures() {
+        // The prepare pre-check + close-validator verdicts, in their as-rendered
+        // (mixed-case) form — a misconfigured target must hard-stop, not loop.
+        assert!(is_close_target_hard_failure(
+            "target DNA DnaHash(uhC0k…) is not in this network's upgrade_targets"
+        ));
+        assert!(is_close_target_hard_failure(
+            "Close target is not in this DNA's upgrade_targets"
+        ));
+        // A transient blip is NOT a target fault.
+        assert!(!is_close_target_hard_failure(
+            "websocket closed; reconnecting"
+        ));
+    }
+
+    #[test]
+    fn skip_open_rejects_are_hard_failures() {
+        // M13 single-landing + unlisted-source verdicts must hard-stop the open
+        // service (the classifier lowercases its input before matching).
+        assert_eq!(
+            classify_migration_init_error("Opening state summary names a different target DNA"),
+            InitErrorClass::HardFailure
+        );
+        assert_eq!(
+            classify_migration_init_error(
+                "Source DNA DnaHash(uhC0k…) is not an accepted predecessor"
+            ),
+            InitErrorClass::HardFailure
+        );
+    }
+
+    #[test]
+    fn unreachable_target_is_a_router_hard_stop() {
+        assert!(router_code_is_hard_stop("unreachable_target"));
+        assert!(!router_code_is_retryable("unreachable_target"));
+    }
 }

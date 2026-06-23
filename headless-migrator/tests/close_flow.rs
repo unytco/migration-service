@@ -35,6 +35,7 @@ fn cfg(tmp: &std::path::Path) -> Config {
             retry_initial: Duration::from_millis(1),
             retry_max: Duration::from_millis(2),
         },
+        to_dna: Some(dna(2).into()),
     }
 }
 
@@ -78,13 +79,74 @@ async fn no_op_on_already_closed_chain() {
         "probes the close state"
     );
     assert!(
-        !calls.contains(&Call::PrepareClosingSummary),
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::PrepareClosingSummary { .. })),
         "never prepares on an already-closed chain: {calls:?}"
     );
     assert!(!calls.contains(&Call::CloseAgentChain), "never re-closes");
     let state = State::read(&tmp).unwrap();
     assert!(state.old_chain_closed);
     assert_eq!(state.step, Step::Done);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn missing_to_dna_fails_the_close_service() {
+    // The close binds to a configured successor; an unset MIGRATION_AGENT_TO_DNA
+    // (cfg.to_dna == None) fails the close service up front, before any probe.
+    let tmp = tmp_state("missing-to-dna");
+    let mock = MockConductor::default();
+    let mut c = cfg(&tmp);
+    c.to_dna = None;
+
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &c, &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("MIGRATION_AGENT_TO_DNA is required"), "{err}");
+    assert!(
+        mock.calls().is_empty(),
+        "fails before touching the conductor: {:?}",
+        mock.calls()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn bad_to_dna_hard_stops_instead_of_looping() {
+    // A target not in the source GD's upgrade_targets makes `prepare_closing_summary`
+    // error with the rejection string; the close service must HARD-STOP (exit
+    // nonzero), not classify it transient and loop forever.
+    let tmp = tmp_state("bad-to-dna");
+    let mock = MockConductor::default();
+    // Probe: open chain (no committed summary yet).
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    // Ledger: no fees owed.
+    *mock.ledger.lock().unwrap() = Some(ledger(
+        unit_map(0, 0),
+        CarryForwardUnits::new(),
+        ZFuel::zero(),
+    ));
+    // Prepare errors with the extern's target pre-check rejection.
+    *mock.prepare.lock().unwrap() = Some(Err(anyhow::anyhow!(
+        "prepare_closing_summary zome call failed: target DNA DnaHash(uhC0k) \
+         is not in this network's upgrade_targets"
+    )));
+
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hard-stopped") && err.contains("upgrade_targets"),
+        "a misconfigured target must hard-stop, not loop: {err}"
+    );
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -111,7 +173,12 @@ async fn already_closed_restart_retains_agent_attribution() {
 
     // Never re-prepares / re-closes on the already-closed path.
     let calls = mock.calls();
-    assert!(!calls.contains(&Call::PrepareClosingSummary), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::PrepareClosingSummary { .. })),
+        "{calls:?}"
+    );
     assert!(!calls.contains(&Call::CloseAgentChain), "{calls:?}");
 
     let state = State::read(&tmp).unwrap();
@@ -167,12 +234,19 @@ async fn fees_owed_drops_before_prepare() {
 
     let calls = mock.calls();
     let drop_idx = calls.iter().position(|c| *c == Call::DropOffFees);
-    let prep_idx = calls.iter().position(|c| *c == Call::PrepareClosingSummary);
+    let prep_idx = calls
+        .iter()
+        .position(|c| matches!(c, Call::PrepareClosingSummary { .. }));
     assert!(drop_idx.is_some(), "fees were dropped: {calls:?}");
     assert!(prep_idx.is_some(), "summary was prepared: {calls:?}");
     assert!(
         drop_idx < prep_idx,
         "drop_off_fees must precede prepare_closing_summary: {calls:?}"
+    );
+    // The close binds to the configured to_dna (cfg() sets dna(2)).
+    assert!(
+        matches!(&calls[prep_idx.unwrap()], Call::PrepareClosingSummary { target } if *target == dna(2)),
+        "prepare_closing_summary must bind to the configured to_dna dna(2): {calls:?}"
     );
     assert!(
         calls.contains(&Call::CloseAgentChain),

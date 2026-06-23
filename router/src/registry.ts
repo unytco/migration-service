@@ -19,6 +19,10 @@ export interface DnaEntry {
   version: string;
   /** dna_hash of the immediate predecessor; absent on chain roots. */
   upgrades_from?: string;
+  /** Proven forward destinations a close on this DNA may bind to (a mirror of the
+   * on-chain GD `upgrade_targets`). Each must resolve to a descendant along the
+   * `upgrades_from` chain — written by the release registry generator. */
+  upgrade_targets?: string[];
   /** Where to download the build for this DNA (e.g. a GitHub release page). Surfaced by /v1/update-check. */
   release_url?: string;
   /** 1..N notary daemons serving this DNA (redundancy / failover). */
@@ -35,12 +39,16 @@ export const SUPPORTED_REGISTRY_VERSION = 1;
 
 export class Registry {
   private byHash: Map<string, DnaEntry>;
+  /** predecessor dna_hash → its single successor's dna_hash (the chain is linear). */
+  private successorOfHash: Map<string, string>;
 
   private constructor(
     public readonly version: number,
     dnas: DnaEntry[],
+    successorOfHash: Map<string, string>,
   ) {
     this.byHash = new Map(dnas.map((d) => [d.dna_hash, d]));
+    this.successorOfHash = successorOfHash;
   }
 
   /** Parse + validate. Throws on any invariant violation (caller fails the Worker health). */
@@ -59,8 +67,6 @@ export class Registry {
       seen.add(d.dna_hash);
       if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
       if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
-      // The router must know where to reach each daemon and which API to speak
-      // from the registry alone — a deficient entry fails here at startup.
       for (const n of d.notaries) {
         if (!n.url?.startsWith("https://")) {
           throw new Error(`registry entry ${d.dna_hash}: notary url must be https`);
@@ -70,8 +76,7 @@ export class Registry {
         }
       }
     }
-    // upgrades_from resolves, and each predecessor has at most one successor
-    // (the chain is linear — forward lookup must be unambiguous).
+    // upgrades_from resolves, and each predecessor has at most one successor (linear chain).
     const successorOfHash = new Map<string, string>();
     for (const d of raw.dnas) {
       if (d.upgrades_from) {
@@ -100,26 +105,80 @@ export class Registry {
         cur = cur.upgrades_from ? byHash.get(cur.upgrades_from) : undefined;
       }
     }
-    return new Registry(raw.version, raw.dnas);
+    // Each upgrade_target must resolve to a known DNA that is a forward descendant, and be
+    // duplicate-free — a generator bug must fail at startup, never at request time.
+    for (const d of raw.dnas) {
+      if (!d.upgrade_targets) continue;
+      const descendants = new Set<string>();
+      let next = successorOfHash.get(d.dna_hash);
+      while (next) {
+        descendants.add(next);
+        next = successorOfHash.get(next);
+      }
+      const seenTargets = new Set<string>();
+      for (const t of d.upgrade_targets) {
+        if (seenTargets.has(t)) {
+          throw new Error(`registry entry ${d.dna_hash}: duplicate upgrade_target ${t}`);
+        }
+        seenTargets.add(t);
+        if (!byHash.has(t)) {
+          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} does not resolve`);
+        }
+        if (!descendants.has(t)) {
+          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} is not a forward descendant`);
+        }
+      }
+    }
+    return new Registry(raw.version, raw.dnas, successorOfHash);
   }
 
   get(dnaHash: string): DnaEntry | undefined {
     return this.byHash.get(dnaHash);
   }
 
-  /** The immediate predecessor of `toDnaHash`, if registered. */
-  predecessorOf(toDnaHash: string): DnaEntry | undefined {
-    const entry = this.byHash.get(toDnaHash);
-    if (!entry?.upgrades_from) return undefined;
-    return this.byHash.get(entry.upgrades_from);
+  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any. */
+  successorOf(fromDnaHash: string): DnaEntry | undefined {
+    const h = this.successorOfHash.get(fromDnaHash);
+    return h ? this.byHash.get(h) : undefined;
   }
 
-  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any.
-   * `load()` guarantees at most one, so this forward lookup is unambiguous. */
-  successorOf(fromDnaHash: string): DnaEntry | undefined {
-    for (const entry of this.byHash.values()) {
-      if (entry.upgrades_from === fromDnaHash) return entry;
+  /** The forward chain from `fromDnaHash`: [immediate successor, …, tip]. */
+  forwardChain(fromDnaHash: string): DnaEntry[] {
+    const out: DnaEntry[] = [];
+    let next = this.successorOf(fromDnaHash);
+    while (next) {
+      out.push(next);
+      next = this.successorOf(next.dna_hash);
+    }
+    return out;
+  }
+
+  /** The furthest proven target of `currentDnaHash`: the deepest entry in its
+   * forward chain that is also listed in its `upgrade_targets`. A multi-version
+   * skip lands here in one hop. `undefined` when there is no proven target. */
+  furthestTargetOf(currentDnaHash: string): DnaEntry | undefined {
+    const current = this.byHash.get(currentDnaHash);
+    if (!current?.upgrade_targets?.length) return undefined;
+    const targets = new Set(current.upgrade_targets);
+    const chain = this.forwardChain(currentDnaHash);
+    for (let i = chain.length - 1; i >= 0; i--) {
+      if (targets.has(chain[i].dna_hash)) return chain[i];
     }
     return undefined;
+  }
+
+  /** Entries whose `upgrade_targets` include `toDnaHash` — the candidate sources
+   * a chain could have closed toward `toDnaHash` from (registry insertion order). */
+  sourcesReaching(toDnaHash: string): DnaEntry[] {
+    const out: DnaEntry[] = [];
+    for (const entry of this.byHash.values()) {
+      if (entry.upgrade_targets?.includes(toDnaHash)) out.push(entry);
+    }
+    return out;
+  }
+
+  /** Is `toDnaHash` a proven upgrade target of `fromDnaHash`? */
+  reaches(fromDnaHash: string, toDnaHash: string): boolean {
+    return this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ?? false;
   }
 }

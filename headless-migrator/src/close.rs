@@ -24,8 +24,8 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use holo_hash::{AgentPubKey, AgentPubKeyB64};
+use anyhow::{Context, Result};
+use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash};
 use rave_engine::types::entries::migration::v0_1::{
     NotarySignature, PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryStatePayload,
 };
@@ -61,6 +61,15 @@ pub async fn run(
     // the report collector (`make migrate-status`) sees the agent + signature
     // progress even after a successful close — not the all-`None` a per-call
     // `State::new(...)` would re-stamp.
+    // The close binds to a configured successor (single-landing). Resolve it up
+    // front so a missing/garbled MIGRATION_AGENT_TO_DNA fails the close service
+    // immediately (not mid-loop); open/verify/status, which don't set it, are
+    // unaffected (validated only here, the way OpenConfig is only by `open`).
+    let target: DnaHash = cfg
+        .to_dna
+        .clone()
+        .context("MIGRATION_AGENT_TO_DNA is required for the close service")?
+        .into();
     let mut state = State::new(Phase::Close, Step::Probing, "");
     let backoff = cfg.loop_backoff();
     let mut attempts: u32 = 0;
@@ -68,7 +77,7 @@ pub async fn run(
         if *shutdown.borrow() {
             return shutdown_before_complete();
         }
-        match attempt(conductor, cfg, &mut state).await {
+        match attempt(conductor, cfg, &target, &mut state).await {
             CloseOutcome::Closed => {
                 persist(cfg, &mut state, |s| {
                     s.step = Step::Done;
@@ -104,7 +113,12 @@ pub async fn run(
 }
 
 /// One probe → act pass.
-async fn attempt(conductor: &dyn Conductor, cfg: &Config, state: &mut State) -> CloseOutcome {
+async fn attempt(
+    conductor: &dyn Conductor,
+    cfg: &Config,
+    target: &DnaHash,
+    state: &mut State,
+) -> CloseOutcome {
     persist(cfg, state, |s| {
         s.step = Step::Probing;
         s.message = "probing old-chain close state".into();
@@ -146,7 +160,7 @@ async fn attempt(conductor: &dyn Conductor, cfg: &Config, state: &mut State) -> 
         // Both an open chain and a partial close route through the same path —
         // see the module-level partial-close note for why.
         CloseNext::FinishCloseOnly | CloseNext::PrepareCollectClose => {
-            prepare_collect_close(conductor, cfg, state).await
+            prepare_collect_close(conductor, cfg, target, state).await
         }
     }
 }
@@ -155,6 +169,7 @@ async fn attempt(conductor: &dyn Conductor, cfg: &Config, state: &mut State) -> 
 async fn prepare_collect_close(
     conductor: &dyn Conductor,
     cfg: &Config,
+    target: &DnaHash,
     state: &mut State,
 ) -> CloseOutcome {
     // Fees owed? Drop them FIRST — a fee drop after signing voids the
@@ -178,10 +193,11 @@ async fn prepare_collect_close(
         s.step = Step::CollectingSignatures;
         s.message = "preparing closing summary".into();
     });
-    let prepared: PrepareCloseResponse = match conductor.prepare_closing_summary().await {
-        Ok(p) => p,
-        Err(e) => return CloseOutcome::Transient(e.context("prepare_closing_summary")),
-    };
+    let prepared: PrepareCloseResponse =
+        match conductor.prepare_closing_summary(target.clone()).await {
+            Ok(p) => p,
+            Err(e) => return classify_close_failure(e, "prepare_closing_summary"),
+        };
     let agent_b64 = AgentPubKeyB64::from(prepared.payload.agent_pubkey.clone()).to_string();
     persist(cfg, state, |s| {
         s.agent = Some(agent_b64.clone());
@@ -235,7 +251,20 @@ async fn prepare_collect_close(
         .await
     {
         Ok(_) => CloseOutcome::Closed,
-        Err(e) => CloseOutcome::Transient(e.context("close_agent_chain")),
+        Err(e) => classify_close_failure(e, "close_agent_chain"),
+    }
+}
+
+/// Classify a close-side zome-call failure. A target-binding fault (the configured
+/// `to_dna` is not in this DNA's `upgrade_targets`) is a HARD stop — retrying can
+/// never fix a misconfigured target, so the close service must exit nonzero rather
+/// than loop forever. Everything else (gossip lag, a websocket blip) stays
+/// transient and is retried.
+fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
+    if crate::dna_errors::is_close_target_hard_failure(&format!("{e:#}")) {
+        CloseOutcome::HardStop(format!("{ctx}: {e:#}"))
+    } else {
+        CloseOutcome::Transient(e.context(ctx))
     }
 }
 

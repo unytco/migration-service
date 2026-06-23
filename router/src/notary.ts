@@ -20,6 +20,10 @@ export interface PackageResult {
   payload: unknown;
   notary_signatures: unknown;
   close_action: unknown;
+  /** The successor this close is bound to, read from `payload.target_dna_hash`, so
+   * the handler can target-filter a discovered close (skipping a stale one bound
+   * to a different version). */
+  target_dna_hash: unknown;
 }
 
 export interface HardStop {
@@ -30,12 +34,9 @@ export interface HardStop {
   details?: unknown;
 }
 
-/** Transient: this notary failed, but another may succeed. `code` carries the
- * daemon's machine-readable cause (`unable_to_verify`, `auth_failed`,
- * `rate_limited`, `internal`, …) or `all_orgs_unhealthy` for an unreachable
- * daemon, so the router can aggregate and surface the most informative final error
- * — e.g. a fleet-wide `auth_failed` (shared-token misconfig) must not read as a
- * generic outage. */
+/** Transient: this notary failed, but another may succeed. `code` carries the daemon's
+ * cause (or `all_orgs_unhealthy` when unreachable) so the router can aggregate and
+ * surface the most informative final error. */
 export interface Transient {
   kind: "transient";
   code: string;
@@ -43,26 +44,24 @@ export interface Transient {
 
 export type FetchCloseOutcome = PackageResult | HardStop | Transient;
 
-// Codes the router must not retry across notaries: a content verdict every
-// notary reading the same chain returns identically (`warranted` /
-// `no_close_found`), or a client-side input error the daemon rejected
-// (`bad_request`) that the next notary would reject the same way.
+// Codes the router must not retry across notaries: a content verdict every notary
+// returns identically (`warranted` / `no_close_found`), or a client input error
+// (`bad_request`) the next notary would reject the same way.
 const HARD_STOP_CODES: ReadonlySet<string> = new Set([
   "warranted",
   "no_close_found",
   "bad_request",
 ]);
 
-/** Connect + read budget for a single daemon call. A daemon that accepts the
- * socket but never responds is mapped to `transient` after this, so the
- * candidate loop advances instead of stalling the whole `/v1/migrate`. */
+/** Per-call budget: a daemon that accepts the socket but never responds maps to
+ * `transient` after this, so the candidate loop advances instead of stalling /v1/migrate. */
 const FETCH_CLOSE_TIMEOUT_MS = 10_000;
 
-/** Call one daemon's /{api}/fetch-close. Never throws — transport failures,
- * timeouts, and malformed success bodies all map to `transient`. `api` is the
- * daemon HTTP API version pinned in the registry for this notary.
- * `expectedDnaHash` is the registry `from_dna_hash`; a success payload whose
- * `dna_hash` differs is a misconfigured notary → `internal` hard stop (B2). */
+/** Call one daemon's /{api}/fetch-close. Never throws — transport failures, timeouts,
+ * and malformed success bodies all map to `transient`. A success payload whose
+ * `source_dna_hash` differs from `expectedDnaHash` is a misconfigured notary →
+ * `internal` hard stop (B2). The package's `target_dna_hash` is surfaced for the
+ * handler's target-filter. */
 export async function fetchClose(
   daemonUrl: string,
   api: string,
@@ -89,14 +88,12 @@ export async function fetchClose(
       signal: AbortSignal.timeout(FETCH_CLOSE_TIMEOUT_MS),
     });
   } catch {
-    // transport failure / timeout: daemon unreachable, unhealthy, or hung
     return { kind: "transient", code: "all_orgs_unhealthy" };
   }
 
   if (resp.status === 200) {
-    // B3: a healthy-status daemon can still return a truncated/non-JSON body.
-    // Guard the parse so a malformed success doesn't escape the candidate loop
-    // (preserve the "Never throws" contract) — fail over to the next notary.
+    // B3: a 200 can still carry a truncated/non-JSON body — guard the parse (the
+    // "Never throws" contract) and fail over rather than escape the candidate loop.
     let body: {
       payload?: unknown;
       notary_signatures?: unknown;
@@ -107,24 +104,21 @@ export async function fetchClose(
     } catch {
       return { kind: "transient", code: "unable_to_verify" };
     }
-    // A 200 missing any package field (or carrying it as null) is as malformed
-    // as a non-JSON body (a truncated proxy response, a buggy daemon build):
-    // fail over rather than hand the app an incomplete package.
+    // A 200 missing any package field (or null) is as malformed as a non-JSON body — fail over.
     if (body.payload == null || body.notary_signatures == null || body.close_action == null) {
       return { kind: "transient", code: "unable_to_verify" };
     }
-    // B2: sanity-check the notary serves the from-DNA we asked for. The daemon
-    // serves exactly one DNA, so a wrong `dna_hash` is a misconfigured notary
-    // (registry URL ↔ daemon mismatch); reject as `internal` per the spec
-    // rather than handing a wrong-DNA package to the app.
-    const payloadDnaHash = (body.payload as { dna_hash?: unknown } | undefined)?.dna_hash;
-    if (typeof payloadDnaHash === "string" && payloadDnaHash !== expectedDnaHash) {
+    // B2: the daemon serves exactly one DNA, so a wrong `source_dna_hash` is a
+    // misconfigured notary (registry URL ↔ daemon mismatch) — reject as `internal`.
+    const payloadSourceDna = (body.payload as { source_dna_hash?: unknown } | undefined)
+      ?.source_dna_hash;
+    if (typeof payloadSourceDna === "string" && payloadSourceDna !== expectedDnaHash) {
       return {
         kind: "hard_stop",
         status: 500,
         code: "internal",
-        message: "notary returned a payload for a different DNA",
-        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadDnaHash },
+        message: "notary returned a payload for a different source DNA",
+        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadSourceDna },
       };
     }
     return {
@@ -132,6 +126,7 @@ export async function fetchClose(
       payload: body.payload,
       notary_signatures: body.notary_signatures,
       close_action: body.close_action,
+      target_dna_hash: (body.payload as { target_dna_hash?: unknown } | undefined)?.target_dna_hash,
     };
   }
 
@@ -150,8 +145,7 @@ export async function fetchClose(
   if (HARD_STOP_CODES.has(code)) {
     return { kind: "hard_stop", status: resp.status, code: code as ErrorCode, message, details };
   }
-  // Not a hard stop: this daemon failed but another candidate may succeed. Preserve
-  // the daemon's code (unable_to_verify, auth_failed, rate_limited, internal, …) so
-  // the router can surface the real cause if every candidate fails the same way.
+  // Not a hard stop: preserve the daemon's code so the router can surface the real
+  // cause if every candidate fails the same way.
   return { kind: "transient", code };
 }

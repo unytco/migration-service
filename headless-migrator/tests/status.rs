@@ -49,6 +49,7 @@ fn down_cfg(tmp: &std::path::Path) -> Config {
             retry_initial: Duration::from_millis(1),
             retry_max: Duration::from_millis(2),
         },
+        to_dna: None,
     }
 }
 

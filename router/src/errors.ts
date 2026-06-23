@@ -11,7 +11,7 @@ export type ErrorCode =
   | "unknown_from_dna"
   | "unknown_current_dna"
   | "to_is_chain_root"
-  | "not_registered_predecessor"
+  | "unreachable_target"
   | "auth_failed"
   | "rate_limited"
   | "bad_request"

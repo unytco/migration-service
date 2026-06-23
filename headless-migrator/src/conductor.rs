@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use holo_hash::AgentPubKey;
+use holo_hash::{AgentPubKey, DnaHash};
 use holochain_client::{AdminWebsocket, WebsocketConfig};
 use holochain_types::app::{AppBundleSource, InstallAppPayload, RoleSettings, RoleSettingsMap};
 use holochain_types::prelude::{
@@ -69,9 +69,11 @@ pub trait Conductor: Send + Sync {
     /// summary (post-signing chain activity voids the signatures).
     async fn drop_off_fees(&self) -> Result<String>;
 
-    /// `transactor::prepare_closing_summary` — the payload to collect
-    /// signatures over plus the GD's closing pair (N, M).
-    async fn prepare_closing_summary(&self) -> Result<PrepareCloseResponse>;
+    /// `transactor::prepare_closing_summary` — the payload to collect signatures
+    /// over plus the GD's closing pair (N, M). Takes the successor `target` the
+    /// close binds to; the extern pre-checks it against this DNA's
+    /// `upgrade_targets`.
+    async fn prepare_closing_summary(&self, target: DnaHash) -> Result<PrepareCloseResponse>;
 
     /// `transactor::request_closing_signature` — one `call_remote` to a notary's
     /// `notary_sign_closing_summary`, response verbatim.
@@ -204,9 +206,14 @@ impl Conductor for HamConductor {
             .context("drop_off_fees zome call failed")
     }
 
-    async fn prepare_closing_summary(&self) -> Result<PrepareCloseResponse> {
+    async fn prepare_closing_summary(&self, target: DnaHash) -> Result<PrepareCloseResponse> {
         self.ham()?
-            .call_zome(&self.role_name, "transactor", "prepare_closing_summary", ())
+            .call_zome(
+                &self.role_name,
+                "transactor",
+                "prepare_closing_summary",
+                target,
+            )
             .await
             .context("prepare_closing_summary zome call failed")
     }
