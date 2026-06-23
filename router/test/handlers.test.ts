@@ -456,6 +456,34 @@ describe("migrate — notary dispatch + failover", () => {
     expect((await body(resp)).error.code).toBe("internal");
   });
 
+  // A config FAULT must outrank a co-occurring transient — a captured wrong-cell internal
+  // is surfaced (with its details), never masked as the sibling source's 503.
+  it("a wrong-cell internal on one source is NOT masked by a transient on another (500 internal, details kept)", async () => {
+    const f = mockFetch({
+      "https://n1a": () => packageResp(v02, v03, "x"), // v01 queried → source mismatch → internal
+      "https://n1b": () => packageResp(v02, v03, "x"),
+      "https://n2": () => jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }), // v02 transient
+    });
+    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    expect(resp.status).toBe(500);
+    const b = await body(resp);
+    expect(b.error.code).toBe("internal");
+    expect(b.error.details.got_dna_hash).toBe(v02);
+  });
+
+  // One misconfigured daemon of a source must not abandon a healthy SIBLING daemon on the
+  // same source that holds the real close.
+  it("a wrong-cell daemon does not abandon its healthy sibling on the same source", async () => {
+    const f = mockFetch({
+      "https://n1a": () => packageResp(v02, v02, "wrong-cell"), // v01 queried → mismatch → internal
+      "https://n1b": () => packageResp(v01, v02, "real"), // healthy sibling holds the close
+    });
+    // KEEP_ORDER tries n1a (wrong-cell) first; it must fall through to n1b, not abort.
+    const resp = await migrate(registry(), goodPair, ENV, f, KEEP_ORDER);
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).notary_signatures[0].signature).toBe("real");
+  });
+
   // B3 — a healthy-status notary with a malformed (non-JSON) success body must
   // not throw out of the loop; it fails over to the next candidate.
   it("malformed 200 body fails over to the next notary", async () => {

@@ -149,12 +149,15 @@ export async function migrate(
           });
         }
         // A complete package carrying NO target_dna_hash is a malformed/old-shape package
-        // (every 0.5.0 daemon binds one) — a daemon fault, not a clean stale close: surface
-        // it rather than silently skip a close that might really be bound to `to`.
+        // (every 0.5.0 daemon binds one) — a daemon fault, not a clean stale close. A
+        // SIBLING daemon may serve a well-formed one, so try the rest of this source's
+        // notaries; surface it only if none succeeds (never silently "no close").
         if (typeof outcome.target_dna_hash !== "string" || outcome.target_dna_hash.length === 0) {
           sawMalformedPackage = true;
+          continue;
         }
-        break; // bound to a different successor (stale) OR malformed — next source
+        break; // a genuine stale close (bound elsewhere) — every daemon of this source
+        // serves the same chain, so only the next source can help.
       }
       if (outcome.kind === "hard_stop") {
         // Terminal regardless of which source we ask — no source fixes a warranted
@@ -162,19 +165,40 @@ export async function migrate(
         if (outcome.code === "warranted" || outcome.code === "bad_request") {
           return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
         }
-        // `no_close_found` (this source has no close) or a source-specific `internal`
-        // (a wrong-cell/registry misconfig on THIS source) — never abort the OTHER
-        // sources; capture the first internal (with its details) for the final surface.
-        if (outcome.code !== "no_close_found" && !internalFault) internalFault = outcome;
-        break; // next source
+        // `no_close_found` is a content verdict every daemon of this source returns
+        // identically — move on to the next source.
+        if (outcome.code === "no_close_found") break;
+        // A source-specific `internal` (this daemon's URL points at the wrong conductor) —
+        // a SIBLING daemon may serve the right cell, so try the rest of this source's
+        // notaries; capture the first internal (with its details) for the final surface.
+        if (!internalFault) internalFault = outcome;
+        continue;
       }
       transientCodes.push(outcome.code);
     }
   }
 
-  // No source yielded a package bound to `to`. A transient (a candidate was
-  // unreachable/unverifiable) wins over `no_close_found`: the close may be on that
-  // unreached source, so the caller should retry rather than conclude "no record".
+  // No source yielded a package bound to `to`. Config / daemon FAULTS (5xx) rank FIRST:
+  // they will not fix themselves by retrying, and the internal-vs-transient distinction is
+  // load-bearing — a definite fault must never read as a momentary outage (operator
+  // triage), even when a transient sibling co-occurs and would otherwise mask it.
+  if (internalFault) {
+    // The captured wrong-cell fault carries its diagnostic details verbatim.
+    return errorJson(internalFault.status, internalFault.code, internalFault.message, internalFault.details);
+  }
+  if (transientCodes.includes("internal") || sawMalformedPackage) {
+    return errorJson(500, "internal", "a notary daemon returned an internal error for a candidate source");
+  }
+  // A candidate source has NO registered notaries — a registry/provisioning fault on our
+  // side: surface as 5xx so it is fixed (not retried as a transient), and so a close that
+  // may live on that source is never reported "absent".
+  if (sawZeroNotary) {
+    return errorJson(500, "internal", "a candidate source has no registered notaries — registry misconfiguration");
+  }
+  // Then the retryable transients — the close may be on a momentarily-unreachable /
+  // not-yet-verifiable source, so the caller should retry rather than conclude "no
+  // record". unable_to_verify (the close likely exists but isn't verifiable yet) wins
+  // the group, ahead of `no_close_found`.
   if (transientCodes.includes("unable_to_verify")) {
     return errorJson(503, "unable_to_verify", "all notaries were unable to verify the close state");
   }
@@ -188,25 +212,8 @@ export async function migrate(
   if (transientCodes.includes("rate_limited")) {
     return errorJson(503, "rate_limited", "notaries are rate limiting requests; retry shortly");
   }
-  // A daemon returned an internal error (a 5xx, or a wrong-cell/registry mismatch) for a
-  // candidate source — surface AS `internal`, distinct from a momentary outage, so it is
-  // not mistaken for unavailability (operator triage) nor for a definitive "no record".
-  // The captured wrong-cell fault carries its diagnostic details verbatim.
-  if (internalFault) {
-    return errorJson(internalFault.status, internalFault.code, internalFault.message, internalFault.details);
-  }
-  if (transientCodes.includes("internal") || sawMalformedPackage) {
-    return errorJson(500, "internal", "a notary daemon returned an internal error for a candidate source");
-  }
-  // A candidate was reachable-but-unhealthy with no specific cause — a momentary outage.
   if (transientCodes.length > 0) {
     return errorJson(503, "all_orgs_unhealthy", "all candidate notaries are unavailable");
-  }
-  // A candidate source has NO registered notaries — a registry/provisioning fault on our
-  // side, not a momentary outage: surface as 5xx so it is fixed (not retried as transient),
-  // and so a close that may live on that source is never reported "absent".
-  if (sawZeroNotary) {
-    return errorJson(500, "internal", "a candidate source has no registered notaries — registry misconfiguration");
   }
   // Every candidate was reachable and definitively had no close bound to `to`.
   return errorJson(404, "no_close_found", "no committed close bound to the requested target was found");
