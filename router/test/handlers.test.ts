@@ -385,6 +385,77 @@ describe("migrate — notary dispatch + failover", () => {
     expect(b.error.details.got_dna_hash).toBe(v02);
   });
 
+  // A source-specific fault must NOT abort discovery of the OTHER candidate sources
+  // (a single misconfigured/erroring notary used to propagate and strand a real migrate).
+  it("discovery: a misconfigured source (internal) does NOT abort — a sibling source still yields the close", async () => {
+    // from OMITTED → discover sources reaching v03 = [v01, v02]. v01's daemons serve the
+    // wrong cell (source_dna_hash v02 != v01 → internal); v02's daemon holds the real close
+    // bound to v03. The bad source must not abort discovery before v02 is tried.
+    const f = mockFetch({
+      "https://n1a": () => packageResp(v02, v03, "wrong-cell"),
+      "https://n1b": () => packageResp(v02, v03, "wrong-cell"),
+      "https://n2": () => packageResp(v02, v03, "real"),
+    });
+    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).notary_signatures[0].signature).toBe("real");
+  });
+
+  // A captured wrong-cell `internal` keeps its diagnostic details when surfaced at the end.
+  it("wrong-source-DNA across ALL candidate sources → 500 internal, details preserved", async () => {
+    const f = mockFetch({
+      "https://n1a": () => packageResp(v02, v03, "x"), // queried as v01 → mismatch
+      "https://n1b": () => packageResp(v02, v03, "x"),
+      "https://n2": () => packageResp(v03, v03, "x"), // queried as v02 → mismatch
+    });
+    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    expect(resp.status).toBe(500);
+    const b = await body(resp);
+    expect(b.error.code).toBe("internal");
+    expect(b.error.details.got_dna_hash).toBe(v02); // the first captured fault's details
+  });
+
+  // A registered source with zero notaries is OUR registry misconfiguration — a 5xx
+  // config fault, never folded into a 503 transient the agent would retry forever.
+  it("a candidate source with zero registered notaries → 500 internal (config fault)", async () => {
+    const raw: RawRegistry = {
+      version: 1,
+      dnas: [
+        { dna_hash: v01, version: "v1", upgrade_targets: [v02], notaries: [] },
+        { dna_hash: v02, version: "v2", upgrades_from: v01, notaries: [{ url: "https://n2", api: "v1" }] },
+      ],
+    };
+    const resp = await migrate(Registry.load(raw), { to_dna_hash: v02, agent_pubkey: AGENT }, ENV, mockFetch({}));
+    expect(resp.status).toBe(500);
+    expect((await body(resp)).error.code).toBe("internal");
+  });
+
+  // A daemon internal error must surface AS `internal`, not be masked as an outage.
+  it("all notaries return a daemon internal error → 500 internal (not all_orgs_unhealthy)", async () => {
+    const f = mockFetch({
+      "https://n1a": () => jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
+      "https://n1b": () => jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
+    });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(500);
+    expect((await body(resp)).error.code).toBe("internal");
+  });
+
+  // A complete package carrying NO target_dna_hash is a malformed/old-shape package
+  // (a daemon fault) — surfaced, not silently skipped as "no close".
+  it("a complete package missing target_dna_hash → 500 internal (not a silent 404)", async () => {
+    const noTarget = () =>
+      jsonResp(200, {
+        payload: { source_dna_hash: v01, closing_state: {} }, // no target_dna_hash
+        notary_signatures: [{ notary: "x", signature: "s" }],
+        close_action: "c",
+      });
+    const f = mockFetch({ "https://n1a": noTarget, "https://n1b": noTarget });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(500);
+    expect((await body(resp)).error.code).toBe("internal");
+  });
+
   // B3 — a healthy-status notary with a malformed (non-JSON) success body must
   // not throw out of the loop; it fails over to the next candidate.
   it("malformed 200 body fails over to the next notary", async () => {

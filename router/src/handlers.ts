@@ -3,7 +3,7 @@
 
 import { errorJson, ok } from "./errors";
 import { Registry, type DnaEntry } from "./registry";
-import { fetchClose, type Env, type FetchLike } from "./notary";
+import { fetchClose, type Env, type FetchLike, type HardStop } from "./notary";
 
 export const API_VERSIONS = ["v1"] as const;
 export const PROTOCOL_VERSIONS = ["v0_1"] as const;
@@ -114,15 +114,21 @@ export async function migrate(
   // 2. Try each source's daemons in per-request RANDOM order — stateless load-
   //    spreading (migrations arrive ~one at a time; a fixed order hammers the
   //    first daemon) — advancing across sources during discovery. Accept the
-  //    first package actually bound to `to`; a real close bound elsewhere is a
-  //    stale historical close on that source (skip it). `warranted` / `bad_request`
-  //    / `internal` propagate immediately; `no_close_found` on one source just
-  //    moves to the next; a transient daemon → its sibling daemon.
+  //    first package actually bound to `to`. Only an AGENT-level / malformed fault
+  //    (`warranted`, `bad_request`) is terminal across all sources; a SOURCE-specific
+  //    fault (`no_close_found`, or a daemon `internal` — a wrong-cell/registry
+  //    mismatch) must NOT abort the OTHER candidate sources, so it skips to the next
+  //    source and is surfaced only if none succeeds; a transient daemon → its sibling.
   const transientCodes: string[] = [];
+  // The first source-specific daemon fault (a wrong-cell `internal`, with its details) —
+  // surfaced verbatim if NO source yields the package, so its diagnostic survives.
+  let internalFault: HardStop | undefined;
+  let sawMalformedPackage = false; // a package carried no target_dna_hash (daemon/shape fault)
+  let sawZeroNotary = false; // a candidate source has no registered notaries (config fault)
   for (const source of sources) {
     if (source.notaries.length === 0) {
-      transientCodes.push("all_orgs_unhealthy");
-      continue;
+      sawZeroNotary = true;
+      continue; // can't query this source — try the others
     }
     for (const notaryEntry of shuffled(source.notaries, rand)) {
       const outcome = await fetchClose(
@@ -142,13 +148,25 @@ export async function migrate(
             close_action: outcome.close_action,
           });
         }
-        break; // stale close (bound to a different successor) on this source — next source
+        // A complete package carrying NO target_dna_hash is a malformed/old-shape package
+        // (every 0.5.0 daemon binds one) — a daemon fault, not a clean stale close: surface
+        // it rather than silently skip a close that might really be bound to `to`.
+        if (typeof outcome.target_dna_hash !== "string" || outcome.target_dna_hash.length === 0) {
+          sawMalformedPackage = true;
+        }
+        break; // bound to a different successor (stale) OR malformed — next source
       }
       if (outcome.kind === "hard_stop") {
-        // `no_close_found` is not terminal during discovery — another source may
-        // hold the close; every other hard stop propagates immediately.
-        if (outcome.code === "no_close_found") break;
-        return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
+        // Terminal regardless of which source we ask — no source fixes a warranted
+        // chain or a bad request; propagate immediately.
+        if (outcome.code === "warranted" || outcome.code === "bad_request") {
+          return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
+        }
+        // `no_close_found` (this source has no close) or a source-specific `internal`
+        // (a wrong-cell/registry misconfig on THIS source) — never abort the OTHER
+        // sources; capture the first internal (with its details) for the final surface.
+        if (outcome.code !== "no_close_found" && !internalFault) internalFault = outcome;
+        break; // next source
       }
       transientCodes.push(outcome.code);
     }
@@ -170,8 +188,25 @@ export async function migrate(
   if (transientCodes.includes("rate_limited")) {
     return errorJson(503, "rate_limited", "notaries are rate limiting requests; retry shortly");
   }
+  // A daemon returned an internal error (a 5xx, or a wrong-cell/registry mismatch) for a
+  // candidate source — surface AS `internal`, distinct from a momentary outage, so it is
+  // not mistaken for unavailability (operator triage) nor for a definitive "no record".
+  // The captured wrong-cell fault carries its diagnostic details verbatim.
+  if (internalFault) {
+    return errorJson(internalFault.status, internalFault.code, internalFault.message, internalFault.details);
+  }
+  if (transientCodes.includes("internal") || sawMalformedPackage) {
+    return errorJson(500, "internal", "a notary daemon returned an internal error for a candidate source");
+  }
+  // A candidate was reachable-but-unhealthy with no specific cause — a momentary outage.
   if (transientCodes.length > 0) {
     return errorJson(503, "all_orgs_unhealthy", "all candidate notaries are unavailable");
+  }
+  // A candidate source has NO registered notaries — a registry/provisioning fault on our
+  // side, not a momentary outage: surface as 5xx so it is fixed (not retried as transient),
+  // and so a close that may live on that source is never reported "absent".
+  if (sawZeroNotary) {
+    return errorJson(500, "internal", "a candidate source has no registered notaries — registry misconfiguration");
   }
   // Every candidate was reachable and definitively had no close bound to `to`.
   return errorJson(404, "no_close_found", "no committed close bound to the requested target was found");

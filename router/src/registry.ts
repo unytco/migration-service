@@ -39,12 +39,18 @@ export const SUPPORTED_REGISTRY_VERSION = 1;
 
 export class Registry {
   private byHash: Map<string, DnaEntry>;
+  /** predecessor dna_hash → its single successor's dna_hash, built + validated in
+   * load() (the chain is linear). Reused by successorOf so the forward walk is O(1)
+   * per hop rather than an O(n) scan of every entry. */
+  private successorOfHash: Map<string, string>;
 
   private constructor(
     public readonly version: number,
     dnas: DnaEntry[],
+    successorOfHash: Map<string, string>,
   ) {
     this.byHash = new Map(dnas.map((d) => [d.dna_hash, d]));
+    this.successorOfHash = successorOfHash;
   }
 
   /** Parse + validate. Throws on any invariant violation (caller fails the Worker health). */
@@ -130,27 +136,19 @@ export class Registry {
         }
       }
     }
-    return new Registry(raw.version, raw.dnas);
+    return new Registry(raw.version, raw.dnas, successorOfHash);
   }
 
   get(dnaHash: string): DnaEntry | undefined {
     return this.byHash.get(dnaHash);
   }
 
-  /** The immediate predecessor of `toDnaHash`, if registered. */
-  predecessorOf(toDnaHash: string): DnaEntry | undefined {
-    const entry = this.byHash.get(toDnaHash);
-    if (!entry?.upgrades_from) return undefined;
-    return this.byHash.get(entry.upgrades_from);
-  }
-
   /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any.
-   * `load()` guarantees at most one, so this forward lookup is unambiguous. */
+   * Reads the predecessor→successor map load() already built + validated (at most one
+   * successor per predecessor), so the lookup is O(1). */
   successorOf(fromDnaHash: string): DnaEntry | undefined {
-    for (const entry of this.byHash.values()) {
-      if (entry.upgrades_from === fromDnaHash) return entry;
-    }
-    return undefined;
+    const h = this.successorOfHash.get(fromDnaHash);
+    return h ? this.byHash.get(h) : undefined;
   }
 
   /** The forward chain from `fromDnaHash`: [immediate successor, …, tip]. */

@@ -124,13 +124,6 @@ describe("Registry.load", () => {
     expect(() => Registry.load(raw)).toThrow(/cycle/);
   });
 
-  it("predecessorOf walks one step", () => {
-    const r = Registry.load(chain());
-    expect(r.predecessorOf(v03)?.dna_hash).toBe(v02); // not v01
-    expect(r.predecessorOf(v01)).toBeUndefined(); // chain root
-    expect(r.predecessorOf("unknown")).toBeUndefined();
-  });
-
   it("successorOf walks one step forward", () => {
     const r = Registry.load(chain());
     expect(r.successorOf(v01)?.dna_hash).toBe(v02); // not v03
