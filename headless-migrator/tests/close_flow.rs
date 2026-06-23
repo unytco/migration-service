@@ -79,7 +79,9 @@ async fn no_op_on_already_closed_chain() {
         "probes the close state"
     );
     assert!(
-        !calls.contains(&Call::PrepareClosingSummary),
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::PrepareClosingSummary { .. })),
         "never prepares on an already-closed chain: {calls:?}"
     );
     assert!(!calls.contains(&Call::CloseAgentChain), "never re-closes");
@@ -171,7 +173,12 @@ async fn already_closed_restart_retains_agent_attribution() {
 
     // Never re-prepares / re-closes on the already-closed path.
     let calls = mock.calls();
-    assert!(!calls.contains(&Call::PrepareClosingSummary), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::PrepareClosingSummary { .. })),
+        "{calls:?}"
+    );
     assert!(!calls.contains(&Call::CloseAgentChain), "{calls:?}");
 
     let state = State::read(&tmp).unwrap();
@@ -227,12 +234,19 @@ async fn fees_owed_drops_before_prepare() {
 
     let calls = mock.calls();
     let drop_idx = calls.iter().position(|c| *c == Call::DropOffFees);
-    let prep_idx = calls.iter().position(|c| *c == Call::PrepareClosingSummary);
+    let prep_idx = calls
+        .iter()
+        .position(|c| matches!(c, Call::PrepareClosingSummary { .. }));
     assert!(drop_idx.is_some(), "fees were dropped: {calls:?}");
     assert!(prep_idx.is_some(), "summary was prepared: {calls:?}");
     assert!(
         drop_idx < prep_idx,
         "drop_off_fees must precede prepare_closing_summary: {calls:?}"
+    );
+    // The close binds to the configured to_dna (cfg() sets dna(2)).
+    assert!(
+        matches!(&calls[prep_idx.unwrap()], Call::PrepareClosingSummary { target } if *target == dna(2)),
+        "prepare_closing_summary must bind to the configured to_dna dna(2): {calls:?}"
     );
     assert!(
         calls.contains(&Call::CloseAgentChain),

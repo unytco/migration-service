@@ -32,7 +32,11 @@ pub enum Call {
     Ping,
     GetLedger,
     DropOffFees,
-    PrepareClosingSummary,
+    /// `target` is the close-binding DNA passed in, so a test can assert the
+    /// configured `to_dna` reaches `prepare_closing_summary`.
+    PrepareClosingSummary {
+        target: holo_hash::DnaHash,
+    },
     RequestClosingSignature,
     CloseAgentChain,
     GetMigrationCloseState,
@@ -105,9 +109,9 @@ impl Conductor for MockConductor {
 
     async fn prepare_closing_summary(
         &self,
-        _target: holo_hash::DnaHash,
+        target: holo_hash::DnaHash,
     ) -> anyhow::Result<PrepareCloseResponse> {
-        self.record(Call::PrepareClosingSummary);
+        self.record(Call::PrepareClosingSummary { target });
         self.prepare
             .lock()
             .unwrap()
