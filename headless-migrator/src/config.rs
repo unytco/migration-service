@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use holo_hash::DnaHashB64;
 
 use crate::policy::PolicyOpts;
 
@@ -36,6 +37,10 @@ pub struct Config {
     pub retry_max: Duration,
     /// The signature-collection policy (open question knobs all live here).
     pub policy: PolicyOpts,
+    /// The successor DNA a close binds to (`prepare_closing_summary(to_dna)`).
+    /// Read from `MIGRATION_AGENT_TO_DNA`; `None` for the open / verify / status
+    /// commands (which take from/to as CLI args) — the close command requires it.
+    pub to_dna: Option<DnaHashB64>,
 }
 
 /// Open-service-only configuration, validated when the open command runs (so
@@ -121,6 +126,16 @@ impl Config {
             retry_initial: Duration::from_millis(retry_initial_ms),
             retry_max: Duration::from_millis(retry_max_ms),
             policy: PolicyOpts::from_env()?,
+            // Optional here: only the close command requires it (validated there),
+            // so open / verify / status — which also run `from_env` — don't fail
+            // without it.
+            to_dna: match var("MIGRATION_AGENT_TO_DNA") {
+                Some(s) => Some(
+                    s.parse()
+                        .map_err(|e| anyhow::anyhow!("MIGRATION_AGENT_TO_DNA: {e}"))?,
+                ),
+                None => None,
+            },
         })
     }
 }

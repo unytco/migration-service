@@ -40,7 +40,7 @@ fn contract_faults_are_hard_stops() {
         "unknown_from_dna",
         "unknown_current_dna",
         "to_is_chain_root",
-        "not_registered_predecessor",
+        "unreachable_target",
     ] {
         assert!(is_hard_stop(code), "{code} should be a hard stop");
         assert!(!is_retryable(code), "{code} is not retryable");

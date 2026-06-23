@@ -103,7 +103,10 @@ impl Conductor for MockConductor {
             .unwrap_or_else(|| Ok("No fees owed".into()))
     }
 
-    async fn prepare_closing_summary(&self) -> anyhow::Result<PrepareCloseResponse> {
+    async fn prepare_closing_summary(
+        &self,
+        _target: holo_hash::DnaHash,
+    ) -> anyhow::Result<PrepareCloseResponse> {
         self.record(Call::PrepareClosingSummary);
         self.prepare
             .lock()
@@ -227,7 +230,8 @@ pub fn summary_state(
 pub fn payload(agent_seed: u8, closing: SummaryState) -> SummaryStatePayload {
     SummaryStatePayload {
         agent_pubkey: agent(agent_seed),
-        dna_hash: dna(1),
+        source_dna_hash: dna(1),
+        target_dna_hash: dna(2),
         closing_state: closing,
         chain_top: action_hash(2),
     }

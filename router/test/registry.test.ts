@@ -26,6 +26,34 @@ function chain(): RawRegistry {
   };
 }
 
+/** A skip-enabled chain: v01 proves a path to both v02 and v03; v02 to v03. */
+function skipChain(): RawRegistry {
+  return {
+    version: 1,
+    dnas: [
+      {
+        dna_hash: v01,
+        version: "alliance-v0.1.0",
+        upgrade_targets: [v02, v03],
+        notaries: [{ url: "https://n1", api: "v1" }],
+      },
+      {
+        dna_hash: v02,
+        version: "alliance-v0.2.0",
+        upgrades_from: v01,
+        upgrade_targets: [v03],
+        notaries: [{ url: "https://n2", api: "v1" }],
+      },
+      {
+        dna_hash: v03,
+        version: "alliance-v0.3.0",
+        upgrades_from: v02,
+        notaries: [{ url: "https://n3", api: "v1" }],
+      },
+    ],
+  };
+}
+
 describe("Registry.load", () => {
   it("loads a valid linear chain", () => {
     const r = Registry.load(chain());
@@ -114,5 +142,59 @@ describe("Registry.load", () => {
     const raw = chain();
     raw.dnas.push({ dna_hash: "uhC0k_v02b", version: "alliance-v0.2.0b", upgrades_from: v01, notaries: [] });
     expect(() => Registry.load(raw)).toThrow(/multiple successors/);
+  });
+
+  it("accepts upgrade_targets that are forward descendants", () => {
+    const r = Registry.load(skipChain());
+    expect(r.get(v01)?.upgrade_targets).toEqual([v02, v03]);
+  });
+
+  it("rejects an upgrade_target that does not resolve", () => {
+    const raw = skipChain();
+    raw.dnas[0].upgrade_targets = [v02, "uhC0k_missing"];
+    expect(() => Registry.load(raw)).toThrow(/upgrade_target .* does not resolve/);
+  });
+
+  it("rejects an upgrade_target that is not a forward descendant", () => {
+    // v02 cannot target v01 (its predecessor) — only forward descendants are valid.
+    const raw = skipChain();
+    raw.dnas[1].upgrade_targets = [v01];
+    expect(() => Registry.load(raw)).toThrow(/not a forward descendant/);
+  });
+
+  it("rejects a duplicate upgrade_target", () => {
+    const raw = skipChain();
+    raw.dnas[0].upgrade_targets = [v02, v02];
+    expect(() => Registry.load(raw)).toThrow(/duplicate upgrade_target/);
+  });
+
+  it("furthestTargetOf returns the deepest proven descendant", () => {
+    const r = Registry.load(skipChain());
+    expect(r.furthestTargetOf(v01)?.dna_hash).toBe(v03); // [v02,v03] → furthest v03
+    expect(r.furthestTargetOf(v02)?.dna_hash).toBe(v03); // [v03] → v03
+    expect(r.furthestTargetOf(v03)).toBeUndefined(); // tip, no targets
+    expect(r.furthestTargetOf("unknown")).toBeUndefined();
+  });
+
+  it("furthestTargetOf honours a nearer-only target list", () => {
+    const raw = skipChain();
+    raw.dnas[0].upgrade_targets = [v02]; // v01 proven only to v02, not v03
+    const r = Registry.load(raw);
+    expect(r.furthestTargetOf(v01)?.dna_hash).toBe(v02);
+  });
+
+  it("sourcesReaching returns every source listing the target", () => {
+    const r = Registry.load(skipChain());
+    expect(r.sourcesReaching(v03).map((d) => d.dna_hash)).toEqual([v01, v02]);
+    expect(r.sourcesReaching(v02).map((d) => d.dna_hash)).toEqual([v01]);
+    expect(r.sourcesReaching(v01)).toEqual([]);
+  });
+
+  it("reaches reflects the upgrade_targets list", () => {
+    const r = Registry.load(skipChain());
+    expect(r.reaches(v01, v03)).toBe(true);
+    expect(r.reaches(v02, v03)).toBe(true);
+    expect(r.reaches(v02, v01)).toBe(false);
+    expect(r.reaches("unknown", v03)).toBe(false);
   });
 });

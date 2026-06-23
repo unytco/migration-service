@@ -20,6 +20,10 @@ export interface PackageResult {
   payload: unknown;
   notary_signatures: unknown;
   close_action: unknown;
+  /** The successor this close is bound to, read from `payload.target_dna_hash`, so
+   * the handler can target-filter a discovered close (skipping a stale one bound
+   * to a different version). */
+  target_dna_hash: unknown;
 }
 
 export interface HardStop {
@@ -61,8 +65,10 @@ const FETCH_CLOSE_TIMEOUT_MS = 10_000;
 /** Call one daemon's /{api}/fetch-close. Never throws — transport failures,
  * timeouts, and malformed success bodies all map to `transient`. `api` is the
  * daemon HTTP API version pinned in the registry for this notary.
- * `expectedDnaHash` is the registry `from_dna_hash`; a success payload whose
- * `dna_hash` differs is a misconfigured notary → `internal` hard stop (B2). */
+ * `expectedDnaHash` is the registry source `from_dna_hash`; a success payload
+ * whose `source_dna_hash` differs is a misconfigured notary → `internal` hard
+ * stop (B2). The package's `target_dna_hash` is surfaced for the handler's
+ * target-filter (discovery may turn up a close bound to a different successor). */
 export async function fetchClose(
   daemonUrl: string,
   api: string,
@@ -113,18 +119,19 @@ export async function fetchClose(
     if (body.payload == null || body.notary_signatures == null || body.close_action == null) {
       return { kind: "transient", code: "unable_to_verify" };
     }
-    // B2: sanity-check the notary serves the from-DNA we asked for. The daemon
-    // serves exactly one DNA, so a wrong `dna_hash` is a misconfigured notary
-    // (registry URL ↔ daemon mismatch); reject as `internal` per the spec
+    // B2: sanity-check the notary serves the source DNA we asked for. The daemon
+    // serves exactly one DNA, so a wrong `source_dna_hash` is a misconfigured
+    // notary (registry URL ↔ daemon mismatch); reject as `internal` per the spec
     // rather than handing a wrong-DNA package to the app.
-    const payloadDnaHash = (body.payload as { dna_hash?: unknown } | undefined)?.dna_hash;
-    if (typeof payloadDnaHash === "string" && payloadDnaHash !== expectedDnaHash) {
+    const payloadSourceDna = (body.payload as { source_dna_hash?: unknown } | undefined)
+      ?.source_dna_hash;
+    if (typeof payloadSourceDna === "string" && payloadSourceDna !== expectedDnaHash) {
       return {
         kind: "hard_stop",
         status: 500,
         code: "internal",
-        message: "notary returned a payload for a different DNA",
-        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadDnaHash },
+        message: "notary returned a payload for a different source DNA",
+        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadSourceDna },
       };
     }
     return {
@@ -132,6 +139,7 @@ export async function fetchClose(
       payload: body.payload,
       notary_signatures: body.notary_signatures,
       close_action: body.close_action,
+      target_dna_hash: (body.payload as { target_dna_hash?: unknown } | undefined)?.target_dna_hash,
     };
   }
 

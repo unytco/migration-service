@@ -174,7 +174,8 @@ fn dummy_summary_state() -> SummaryState {
 fn dummy_payload() -> SummaryStatePayload {
     SummaryStatePayload {
         agent_pubkey: holo_hash::AgentPubKey::from_raw_36(vec![3; 36]),
-        dna_hash: holo_hash::DnaHash::from_raw_36(vec![1; 36]),
+        source_dna_hash: holo_hash::DnaHash::from_raw_36(vec![1; 36]),
+        target_dna_hash: holo_hash::DnaHash::from_raw_36(vec![5; 36]),
         closing_state: dummy_summary_state(),
         chain_top: holo_hash::ActionHash::from_raw_36(vec![2; 36]),
     }

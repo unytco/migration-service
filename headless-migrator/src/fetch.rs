@@ -4,7 +4,7 @@
 //! restoring agent, a `no_close_found` AFTER a known close can only be
 //! propagation lag — so it (and the genuinely transient codes) maps to
 //! `KeepWaiting`, NEVER a hard stop and NEVER a fresh-agent fallback. A true
-//! client/contract fault (`warranted`, `bad_request`, an unregistered DNA pair)
+//! client/contract fault (`warranted`, `bad_request`, an unreachable target)
 //! is a hard stop — and so is an UNRECOGNIZED code: the retryable set is an
 //! explicit allowlist (see [`crate::dna_errors`]), so a drifted wire contract
 //! fails loud rather than retrying a possibly-permanent fault forever.
