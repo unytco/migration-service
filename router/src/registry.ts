@@ -39,9 +39,7 @@ export const SUPPORTED_REGISTRY_VERSION = 1;
 
 export class Registry {
   private byHash: Map<string, DnaEntry>;
-  /** predecessor dna_hash → its single successor's dna_hash, built + validated in
-   * load() (the chain is linear). Reused by successorOf so the forward walk is O(1)
-   * per hop rather than an O(n) scan of every entry. */
+  /** predecessor dna_hash → its single successor's dna_hash (the chain is linear). */
   private successorOfHash: Map<string, string>;
 
   private constructor(
@@ -69,8 +67,6 @@ export class Registry {
       seen.add(d.dna_hash);
       if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
       if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
-      // The router must know where to reach each daemon and which API to speak
-      // from the registry alone — a deficient entry fails here at startup.
       for (const n of d.notaries) {
         if (!n.url?.startsWith("https://")) {
           throw new Error(`registry entry ${d.dna_hash}: notary url must be https`);
@@ -80,8 +76,7 @@ export class Registry {
         }
       }
     }
-    // upgrades_from resolves, and each predecessor has at most one successor
-    // (the chain is linear — forward lookup must be unambiguous).
+    // upgrades_from resolves, and each predecessor has at most one successor (linear chain).
     const successorOfHash = new Map<string, string>();
     for (const d of raw.dnas) {
       if (d.upgrades_from) {
@@ -110,10 +105,8 @@ export class Registry {
         cur = cur.upgrades_from ? byHash.get(cur.upgrades_from) : undefined;
       }
     }
-    // upgrade_targets (the proven forward destinations a close may bind to) must
-    // each resolve to a known DNA that is a real descendant along the chain, and
-    // be duplicate-free — a target off the chain or a duplicate is a generator bug
-    // and must fail at startup, never at request time.
+    // Each upgrade_target must resolve to a known DNA that is a forward descendant, and be
+    // duplicate-free — a generator bug must fail at startup, never at request time.
     for (const d of raw.dnas) {
       if (!d.upgrade_targets) continue;
       const descendants = new Set<string>();
@@ -143,9 +136,7 @@ export class Registry {
     return this.byHash.get(dnaHash);
   }
 
-  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any.
-   * Reads the predecessor→successor map load() already built + validated (at most one
-   * successor per predecessor), so the lookup is O(1). */
+  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any. */
   successorOf(fromDnaHash: string): DnaEntry | undefined {
     const h = this.successorOfHash.get(fromDnaHash);
     return h ? this.byHash.get(h) : undefined;
