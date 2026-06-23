@@ -229,7 +229,9 @@ mod tests {
             "Close target is not in this DNA's upgrade_targets"
         ));
         // A transient blip is NOT a target fault.
-        assert!(!is_close_target_hard_failure("websocket closed; reconnecting"));
+        assert!(!is_close_target_hard_failure(
+            "websocket closed; reconnecting"
+        ));
     }
 
     #[test]
@@ -241,7 +243,9 @@ mod tests {
             InitErrorClass::HardFailure
         );
         assert_eq!(
-            classify_migration_init_error("Source DNA DnaHash(uhC0k…) is not an accepted predecessor"),
+            classify_migration_init_error(
+                "Source DNA DnaHash(uhC0k…) is not an accepted predecessor"
+            ),
             InitErrorClass::HardFailure
         );
     }

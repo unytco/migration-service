@@ -99,7 +99,10 @@ async fn missing_to_dna_fails_the_close_service() {
     c.to_dna = None;
 
     let mut sd = never_shutdown();
-    let err = close::run(&mock, &c, &mut sd).await.unwrap_err().to_string();
+    let err = close::run(&mock, &c, &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("MIGRATION_AGENT_TO_DNA is required"), "{err}");
     assert!(
         mock.calls().is_empty(),
