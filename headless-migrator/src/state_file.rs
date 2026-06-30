@@ -35,7 +35,8 @@ pub enum Step {
     WaitingForPackage,
     /// New server: installing the app for the carried key.
     Installing,
-    /// New server: running migration_init as the first zome call.
+    /// New server: driving `init` via the first zome call (the install carried
+    /// the package as `init_properties`, so `init` opens the chain).
     OpeningChain,
     /// Verifying the new-chain ledger against the close summary.
     Verifying,

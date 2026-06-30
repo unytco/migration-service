@@ -86,6 +86,7 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
+        gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
         router_url: "http://127.0.0.1:1".into(),

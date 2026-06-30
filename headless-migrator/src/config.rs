@@ -56,6 +56,12 @@ pub struct OpenConfig {
     /// Network seed for the new DNA's app install. The joining service may also
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
+    /// Bounded deadline for the too-early-install wait: if `init` keeps failing
+    /// because the successor `GlobalDefinition` is not yet in effect (not
+    /// gossiped in, or before its effective date) for longer than this, the open
+    /// service gives up (HardStop) rather than retrying forever — the classifier
+    /// can't tell "not yet" from "never".
+    pub gd_wait_timeout: Duration,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -142,6 +148,9 @@ impl Config {
 
 impl OpenConfig {
     pub fn from_env() -> Result<Self> {
+        // Default 30 min: generous for gossip + an effective-date wait, bounded so
+        // a misconfigured (never-arriving) GD fails the open instead of spinning.
+        let gd_wait_secs: u64 = parse_var("MIGRATION_AGENT_GD_WAIT_TIMEOUT_SECS", "1800")?;
         Ok(Self {
             happ_path: var("MIGRATION_AGENT_HAPP_PATH")
                 .context("MIGRATION_AGENT_HAPP_PATH is required for the open service")?
@@ -149,6 +158,7 @@ impl OpenConfig {
             joining_url: var("MIGRATION_AGENT_JOINING_URL")
                 .context("MIGRATION_AGENT_JOINING_URL is required for the open service")?,
             network_seed: var("MIGRATION_AGENT_NETWORK_SEED"),
+            gd_wait_timeout: Duration::from_secs(gd_wait_secs),
         })
     }
 }

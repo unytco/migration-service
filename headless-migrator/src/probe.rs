@@ -135,54 +135,32 @@ pub async fn probe_closed_status(conductor: &dyn Conductor) -> ClosedStatus {
     }
 }
 
-/// The open-side state of the new server, as the open service must resume from
-/// it.
+/// The open-side state of the new server — **presence only**. The open
+/// service's pre-install probe connects admin-only (there is no app cell for
+/// `ham` to attach to yet), so it can ask "is the app installed?" but not run
+/// the `verify_if_migrated` zome call. Whether an installed cell has *opened*
+/// (its `init` read the migration `init_properties` and committed the
+/// `OpeningStateSummary`) is decided by the ham-connected action — calling
+/// `verify_if_migrated` there both answers it and DRIVES `init` on a cell that
+/// hasn't been called yet. So there is no separate "installed-but-unmigrated"
+/// probe state: install + open are one step from the probe's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenState {
-    /// No app installed yet — fetch the package, install for the carried key,
-    /// then migration_init.
+    /// No app installed yet — fetch the package, install for the carried key
+    /// WITH it as the role's `init_properties`, then drive `init` + verify.
     NotInstalled,
-    /// App installed but `migration_init` not yet run (no `OpeningStateSummary`)
-    /// — run migration_init (as the first zome call).
-    InstalledNotMigrated,
-    /// App installed and chain already opened (an `OpeningStateSummary` exists)
-    /// — nothing to do; open is a no-op on an opened chain.
-    Migrated,
+    /// App installed — connect `ham`, drive `init` (`verify_if_migrated`, which
+    /// reads the carried `init_properties` and opens the chain on the first
+    /// call), then verify. Idempotent if the chain is already open.
+    Installed,
 }
 
-/// The next action the open service should take, from an [`OpenState`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OpenNext {
-    /// Fetch package → install for carried key → migration_init.
-    FetchInstallOpen,
-    /// App is installed; just run migration_init (first zome call).
-    OpenOnly,
-    /// Already migrated — exit 0.
-    AlreadyOpened,
-}
-
-impl OpenState {
-    pub fn next(&self) -> OpenNext {
-        match self {
-            OpenState::NotInstalled => OpenNext::FetchInstallOpen,
-            OpenState::InstalledNotMigrated => OpenNext::OpenOnly,
-            OpenState::Migrated => OpenNext::AlreadyOpened,
-        }
-    }
-}
-
-/// Probe the open-side state. When the app is present we ask the cell whether it
-/// has already migrated (`verify_if_migrated`), distinguishing
-/// installed-but-fresh from already-opened.
+/// Probe the open-side state — PRESENCE ONLY (admin-only safe). Whether an
+/// installed cell has opened is decided by the ham-connected action's
+/// `verify_if_migrated` (which drives `init`), not here.
 pub async fn probe_open_state(conductor: &dyn Conductor, app_id: &str) -> Result<OpenState> {
-    match conductor.app_presence(app_id).await? {
-        AppPresence::Absent => Ok(OpenState::NotInstalled),
-        AppPresence::Installed => {
-            if conductor.verify_if_migrated().await? {
-                Ok(OpenState::Migrated)
-            } else {
-                Ok(OpenState::InstalledNotMigrated)
-            }
-        }
-    }
+    Ok(match conductor.app_presence(app_id).await? {
+        AppPresence::Absent => OpenState::NotInstalled,
+        AppPresence::Installed => OpenState::Installed,
+    })
 }

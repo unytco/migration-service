@@ -39,6 +39,11 @@ pub enum InitErrorClass {
     /// the new GD's opening threshold (or don't verify, or aren't from listed
     /// notaries), or the carry-forward section is malformed. Fail loudly.
     HardFailure,
+    /// The successor `GlobalDefinition` `init` needs to open the chain is not yet
+    /// in effect (not gossiped in, or before its effective date). Recoverable —
+    /// the open service re-drives `init` once the GD syncs — but under a BOUNDED
+    /// deadline, since the classifier can't tell "not yet" from "never".
+    TooEarly,
     /// Anything else (a websocket blip, a transient host error) — back off and
     /// re-probe.
     Transient,
@@ -61,6 +66,8 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
         InitErrorClass::AlreadyMigrated
     } else if is_non_fresh_chain(&r) {
         InitErrorClass::NonFreshChain
+    } else if is_successor_gd_not_in_effect(&r) {
+        InitErrorClass::TooEarly
     } else {
         InitErrorClass::Transient
     }
@@ -75,6 +82,17 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
 /// phrasing as belt-and-braces.
 fn is_non_fresh_chain(r_lower: &str) -> bool {
     r_lower.contains("added to a fresh chain") || r_lower.contains("source chain not empty")
+}
+
+/// The DNA's `init` could not resolve a successor `GlobalDefinition` to open the
+/// chain against — it is not yet in effect (not gossiped in, or before its
+/// effective date): a too-early install. Distinct from a generic transient blip
+/// because the open service bounds the retry by a deadline (the GD might never
+/// come). Mirrors the wrapper `apply_migration_init_properties` puts on the GD
+/// lookup ("Could not resolve a successor GlobalDefinition at init") plus the
+/// underlying "No Global Definition found".
+fn is_successor_gd_not_in_effect(r_lower: &str) -> bool {
+    r_lower.contains("successor globaldefinition") || r_lower.contains("no global definition")
 }
 
 /// Terminal `Invalid` verdicts from the opening-summary validator + the notary
@@ -254,5 +272,27 @@ mod tests {
     fn unreachable_target_is_a_router_hard_stop() {
         assert!(router_code_is_hard_stop("unreachable_target"));
         assert!(!router_code_is_retryable("unreachable_target"));
+    }
+
+    #[test]
+    fn too_early_successor_gd_is_bounded_not_unbounded() {
+        // The DNA wraps the GD lookup as "Could not resolve a successor
+        // GlobalDefinition at init (...)"; that classifies as TooEarly (a bounded
+        // retry), NOT the unbounded Transient fallthrough.
+        assert_eq!(
+            classify_migration_init_error(
+                "Could not resolve a successor GlobalDefinition at init (NoGlobalDefinition)"
+            ),
+            InitErrorClass::TooEarly
+        );
+        assert_eq!(
+            classify_migration_init_error("wasm error: No Global Definition found"),
+            InitErrorClass::TooEarly
+        );
+        // A generic blip is still Transient (unbounded).
+        assert_eq!(
+            classify_migration_init_error("websocket closed; reconnecting"),
+            InitErrorClass::Transient
+        );
     }
 }

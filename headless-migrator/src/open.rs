@@ -1,10 +1,12 @@
 //! The open service: effectively the new server's install step. A supervised
 //! loop that waits out gossip until the migration package is fetchable, then
-//! installs the app for the carried key, runs `migration_init` as the FIRST
-//! zome call, and verifies — exiting 0 only once the new chain is open and
-//! verified. Probe-first and idempotent: a restart never double-opens, and a
-//! non-fresh chain (a stray zome call landed before `migration_init`) is
-//! recovered by uninstall → reinstall → retry.
+//! installs the app for the carried key WITH the package as the alliance role's
+//! `init_properties` (so the DNA's `init` opens the chain at genesis), drives
+//! `init` via the first zome call (`verify_if_migrated`), and verifies — exiting
+//! 0 only once the new chain is open and verified. Probe-first and idempotent: a
+//! restart never double-opens, and a too-early `init` (the successor GD not yet
+//! in effect) is re-driven under a bounded deadline. There is no post-install
+//! `migration_init` call and no first-zome-call ordering window to guard.
 
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use crate::config::{Config, OpenConfig};
 pub use crate::dna_errors::{classify_migration_init_error, InitErrorClass};
 use crate::fetch::{self, FetchOutcome};
 use crate::joining::{self, LairSigner, NonceSigner};
-use crate::probe::{probe_open_state, OpenNext};
+use crate::probe::{probe_open_state, OpenState};
 use crate::state_file::{Phase, State, Step, VerifyReport};
 use crate::verify::verify_against_ledger;
 
@@ -46,11 +48,11 @@ enum OpenOutcome {
     Done,
     /// A hard stop (verify mismatch, warranted close). Exit nonzero.
     HardStop(String),
-    /// Transient — back off and re-probe (gossip lag, conductor blip).
+    /// The successor GD `init` needs is not yet in effect — re-drive `init`, but
+    /// under a BOUNDED deadline (the run loop gives up if it never comes).
+    TooEarly(anyhow::Error),
+    /// Transient — back off and re-probe (gossip lag, a conductor blip).
     Transient(anyhow::Error),
-    /// A non-fresh chain was rejected: uninstall, then re-probe (which will
-    /// reinstall + retry migration_init).
-    NonFreshChain,
 }
 
 /// Run the open service to completion (or a hard stop). The `shutdown` receiver
@@ -93,6 +95,10 @@ pub async fn run(
     state.seed_from_persisted(&cfg.state_file);
     let backoff = cfg.loop_backoff();
     let mut attempts: u32 = 0;
+    // Bounded too-early-install deadline: set when `init` first fails because the
+    // successor GD isn't in effect; if it stays unresolved past
+    // `open_cfg.gd_wait_timeout`, give up rather than retry forever.
+    let mut gd_wait_since: Option<std::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             return shutdown_before_complete();
@@ -116,21 +122,35 @@ pub async fn run(
                 });
                 bail!("open hard-stopped: {why}");
             }
-            OpenOutcome::NonFreshChain => {
-                tracing::warn!("non-fresh new chain — uninstalling to retry a clean open");
+            OpenOutcome::TooEarly(e) => {
+                // Bounded retry: the successor GD `init` needs isn't in effect
+                // yet. Re-drive after a backoff, but give up once it has stayed
+                // unresolved longer than the deadline (it may never come).
+                let now = std::time::Instant::now();
+                let since = *gd_wait_since.get_or_insert(now);
+                if now.duration_since(since) > open_cfg.gd_wait_timeout {
+                    persist(cfg, &mut state, |s| {
+                        s.step = Step::Failed;
+                        s.message = format!(
+                            "successor GD never came into effect within {}s: {e:#}",
+                            open_cfg.gd_wait_timeout.as_secs()
+                        );
+                    });
+                    bail!(
+                        "gave up waiting for the successor GD to come into effect after {}s: {e:#}",
+                        open_cfg.gd_wait_timeout.as_secs()
+                    );
+                }
+                let delay = Duration::from_millis(ham::compute_delay_ms(attempts, &backoff));
+                tracing::warn!(error = %format!("{e:#}"), delay_ms = delay.as_millis() as u64,
+                    "successor GD not yet in effect; backing off (bounded)");
                 persist(cfg, &mut state, |s| {
-                    // The chain is being torn down for a clean retry — clear the
-                    // stale opened/verify progress so the report doesn't show a
-                    // half-open state for the cell we just uninstalled.
-                    s.new_chain_opened = false;
-                    s.verify = None;
-                    s.message = "non-fresh chain — uninstalling for a clean retry".into();
+                    s.message = format!("waiting for the successor GD to come into effect: {e:#}");
                 });
-                // A short, fixed pause before the immediate re-probe.
-                if sleep_or_shutdown(cfg.retry_initial, shutdown).await {
+                if sleep_or_shutdown(delay, shutdown).await {
                     return shutdown_before_complete();
                 }
-                attempts = 0;
+                attempts = attempts.saturating_add(1);
             }
             OpenOutcome::Transient(e) => {
                 // Jittered backoff via ham's shared curve (de-synchronizes many
@@ -151,9 +171,9 @@ pub async fn run(
 }
 
 /// One probe → act pass. Admin-only connect suffices to probe presence and to
-/// install; the `migration_init` / `get_ledger` zome calls need a `ham` attach,
-/// obtained by a fresh `connect` once the app cell exists (threading the single
-/// `shutdown`, never installing a new handler).
+/// install; the `verify_if_migrated` (which drives `init`) / `get_ledger` zome
+/// calls need a `ham` attach, obtained by a fresh `connect` once the app cell
+/// exists (threading the single `shutdown`, never installing a new handler).
 ///
 /// The package fetch is CONDITIONAL on the branch that needs it. Verify reads
 /// the OLD-side close via the router, so it can only run *during* the migration,
@@ -188,24 +208,27 @@ async fn attempt(
         Err(e) => return OpenOutcome::Transient(e.context("probing open state")),
     };
 
-    match open_state.next() {
-        OpenNext::AlreadyOpened => {
-            // Already migrated. If a prior pass already verified, this restart is
-            // idempotently Done — exit WITHOUT a router fetch, since verify needs
-            // the old side which the operator tears down after a verified
-            // migration. The teardown latch is read from the SEEDED in-memory
-            // `state` (carried from disk by `run`'s `seed_from_persisted`), NOT a
-            // fresh re-read of a file the first `persist` has already rewritten —
-            // that re-read is exactly what the round-2 clobber bug defeated. Only
-            // the not-yet-verified case fetches + verifies (the early-restart-
-            // before-teardown window, where a fetch failure is an acceptable
-            // KeepWaiting).
+    match open_state {
+        OpenState::Installed => {
+            // Idempotent restart after a verified migration: short-circuit to
+            // Done WITHOUT a router fetch, since verify needs the old side which
+            // the operator tears down after a verified migration. The teardown
+            // latch is read from the SEEDED in-memory `state` (carried from disk
+            // by `run`'s `seed_from_persisted`), NOT a fresh re-read of a file the
+            // first `persist` has already rewritten — that re-read is exactly what
+            // the round-2 clobber bug defeated.
             if state.safe_to_teardown {
                 tracing::info!(
                     "already migrated and previously verified (persisted) — no fetch needed"
                 );
                 return OpenOutcome::Done;
             }
+            // Installed but not yet verified — either the chain is already open (a
+            // restart mid-verify) or `init` hasn't been driven yet (a restart
+            // right after install). Fetch the package, connect ham, drive `init`
+            // (`verify_if_migrated` opens the chain on the first call, idempotent
+            // if already open), then verify. The fetch can be an acceptable
+            // KeepWaiting in the early-restart-before-teardown window.
             let package = match fetch_or_outcome(cfg, params, &agent_b64, http, state).await {
                 Ok(p) => p,
                 Err(outcome) => return outcome,
@@ -214,29 +237,19 @@ async fn attempt(
                 Ok(c) => c,
                 Err(o) => return o,
             };
-            verify_after_open_with(cfg, &conductor, &package, state).await
+            drive_open_and_verify(cfg, &conductor, &package, state).await
         }
-        OpenNext::OpenOnly => {
-            // Installed but not migrated — fetch the package, then run
-            // migration_init (first zome call) and verify.
-            let package = match fetch_or_outcome(cfg, params, &agent_b64, http, state).await {
-                Ok(p) => p,
-                Err(outcome) => return outcome,
-            };
-            let conductor = match connect_ham(cfg, shutdown).await {
-                Ok(c) => c,
-                Err(o) => return o,
-            };
-            run_migration_init(cfg, &conductor, &package, state).await
-        }
-        OpenNext::FetchInstallOpen => {
+        OpenState::NotInstalled => {
             // Fetch BEFORE installing (the spec's hard ordering rule), then
-            // install for the carried key, reconnect ham → migration_init.
+            // install for the carried key WITH the package as the role's
+            // `init_properties`, so the DNA's `init` opens the chain on the first
+            // zome call. Reconnect ham → drive `init` + verify.
             let package = match fetch_or_outcome(cfg, params, &agent_b64, http, state).await {
                 Ok(p) => p,
                 Err(outcome) => return outcome,
             };
-            if let Err(outcome) = install(cfg, open_cfg, params, http, signer, &admin, state).await
+            if let Err(outcome) =
+                install(cfg, open_cfg, params, http, signer, &admin, &package, state).await
             {
                 return outcome;
             }
@@ -244,7 +257,7 @@ async fn attempt(
                 Ok(c) => c,
                 Err(o) => return o,
             };
-            run_migration_init(cfg, &conductor, &package, state).await
+            drive_open_and_verify(cfg, &conductor, &package, state).await
         }
     }
 }
@@ -304,10 +317,11 @@ async fn connect_ham(
     }
 }
 
-/// Get a fresh membrane proof for the carried key and install + enable the app
-/// (the package has already been fetched by the caller, satisfying the
-/// fetch-before-install ordering rule). Returns the install outcome to
-/// propagate, or `Ok(())` on success.
+/// Get a fresh membrane proof for the carried key and install + enable the app,
+/// carrying the already-fetched `package` as the alliance role's
+/// `init_properties` so the DNA's `init` opens the chain on the first zome call
+/// (no post-install `migration_init`). Returns the install outcome to propagate,
+/// or `Ok(())` on success.
 async fn install(
     cfg: &Config,
     open_cfg: &OpenConfig,
@@ -315,6 +329,7 @@ async fn install(
     http: &reqwest::Client,
     signer: &dyn NonceSigner,
     admin: &HamConductor,
+    package: &MigrationInitRequest,
     state: &mut State,
 ) -> std::result::Result<(), OpenOutcome> {
     // Fresh membrane proof for the carried key from the TARGET joining service.
@@ -356,6 +371,7 @@ async fn install(
             .network_seed
             .or_else(|| open_cfg.network_seed.clone()),
         membrane_proof,
+        migration_package: Some(package.clone()),
     };
     if let Err(e) = admin.install_app(&spec).await {
         return Err(OpenOutcome::Transient(
@@ -365,12 +381,16 @@ async fn install(
     Ok(())
 }
 
-/// Run `migration_init` as the first zome call on the (now-attached) cell using
-/// the already-fetched `package`, then verify. A non-fresh-chain rejection is
-/// mapped to [`OpenOutcome::NonFreshChain`] after uninstalling; a hard-failure
-/// verdict (agent mismatch, insufficient/invalid signatures, malformed
-/// carry-forward) is a [`OpenOutcome::HardStop`] — never an infinite retry.
-async fn run_migration_init(
+/// Drive the new cell's `init` and verify. With the package installed as the
+/// role's `init_properties`, the FIRST zome call (`verify_if_migrated`) makes the
+/// DNA's `init` read it and commit the `OpeningStateSummary` + `open_chain` — so
+/// this both opens the chain and reports whether it opened. On `true` → verify.
+/// A too-early `init` (the successor GD not yet in effect) surfaces as the
+/// `Transient` fallthrough — the supervised loop re-drives it once the GD syncs.
+/// A terminal validator verdict (key mismatch, signatures below threshold,
+/// malformed carry-forward) is a [`OpenOutcome::HardStop`] — never an infinite
+/// retry.
+async fn drive_open_and_verify(
     cfg: &Config,
     conductor: &HamConductor,
     package: &MigrationInitRequest,
@@ -378,28 +398,21 @@ async fn run_migration_init(
 ) -> OpenOutcome {
     persist(cfg, state, |s| {
         s.step = Step::OpeningChain;
-        s.message = "running migration_init as the first zome call".into();
+        s.message = "driving init via the first zome call (opening the chain)".into();
     });
-    let request = MigrationInitRequest {
-        payload: package.payload.clone(),
-        notary_signatures: package.notary_signatures.clone(),
-        close_action: package.close_action.clone(),
-    };
-    match conductor.migration_init(request).await {
-        Ok(()) => verify_after_open_with(cfg, conductor, package, state).await,
+    match conductor.verify_if_migrated().await {
+        Ok(true) => verify_after_open_with(cfg, conductor, package, state).await,
+        // We installed WITH the package as init_properties, so a completed-but-
+        // un-opened init means the properties were not applied — a structural
+        // install fault retrying can't fix, not a fresh-agent path.
+        Ok(false) => OpenOutcome::HardStop(
+            "installed with a migration package but the chain did not open at init \
+             (init_properties were not applied)"
+                .to_string(),
+        ),
         Err(e) => {
             let rendered = format!("{e:#}");
             match classify_migration_init_error(&rendered) {
-                InitErrorClass::NonFreshChain => {
-                    tracing::warn!(error = %rendered,
-                        "migration_init rejected on a non-fresh chain");
-                    if let Err(ue) = conductor.uninstall_app(&cfg.app_id).await {
-                        return OpenOutcome::Transient(
-                            ue.context("uninstalling after non-fresh-chain rejection"),
-                        );
-                    }
-                    OpenOutcome::NonFreshChain
-                }
                 InitErrorClass::AlreadyMigrated => {
                     // A race: another pass already opened the chain — verify.
                     verify_after_open_with(cfg, conductor, package, state).await
@@ -409,9 +422,22 @@ async fn run_migration_init(
                 // signatures don't meet the new GD's opening threshold). No
                 // amount of retrying fixes that — fail loudly.
                 InitErrorClass::HardFailure => OpenOutcome::HardStop(format!(
-                    "migration_init rejected with an unrecoverable verdict: {rendered}"
+                    "init rejected the opening summary with an unrecoverable verdict: {rendered}"
                 )),
-                InitErrorClass::Transient => OpenOutcome::Transient(e.context("migration_init")),
+                // A non-fresh chain can no longer arise: `init` runs on the first
+                // zome call, so nothing precedes it. Treat the (now-unexpected)
+                // verdict defensively as a hard stop rather than the removed
+                // uninstall-retry.
+                InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
+                    "unexpected non-fresh chain at init (no call should precede it): {rendered}"
+                )),
+                // The successor GD is not yet in effect — re-drive `init` once it
+                // syncs, but bounded by the run loop's deadline.
+                InitErrorClass::TooEarly => {
+                    OpenOutcome::TooEarly(e.context("successor GD not yet in effect"))
+                }
+                // Any other blip: back off and re-probe.
+                InitErrorClass::Transient => OpenOutcome::Transient(e.context("driving init")),
             }
         }
     }
@@ -484,11 +510,18 @@ fn persist(cfg: &Config, state: &mut State, f: impl FnOnce(&mut State)) {
 }
 
 /// Probe whether the new chain is opened, for the `Status` command's report.
+/// `false` if the app isn't installed; otherwise `verify_if_migrated`
+/// (idempotent on an already-opened cell).
 pub async fn probe_for_status(conductor: &dyn Conductor, app_id: &str) -> Result<bool> {
-    Ok(matches!(
-        probe_open_state(conductor, app_id)
+    match conductor
+        .app_presence(app_id)
+        .await
+        .context("probing app presence for status")?
+    {
+        crate::conductor::AppPresence::Absent => Ok(false),
+        crate::conductor::AppPresence::Installed => conductor
+            .verify_if_migrated()
             .await
-            .context("probing open state for status")?,
-        crate::probe::OpenState::Migrated
-    ))
+            .context("probing migrated state for status"),
+    }
 }
