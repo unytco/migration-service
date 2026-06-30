@@ -33,15 +33,15 @@ dotenvy = "0.15"
 
 # Holochain bridge — same stack as pricing_oracle / watchtower-observer
 ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
-holochain_client = "0.8.1"
-holo_hash = { version = "0.6.1", features = ["encoding"] }
-# Same hdi the unyt workspace pins (rave_engine uses hdi 0.7.1) so Signature /
+holochain_client = "0.8.2-rc.0"
+holo_hash = { version = "0.6.2-rc.0", features = ["encoding"] }
+# Same hdi the unyt workspace pins (rave_engine uses hdi 0.7.2) so Signature /
 # Timestamp / hash types are identical to the ones in the zome-call payloads.
-hdi = "0.7.1"
+hdi = "0.7.2-rc.0"
 
 # Shared migration protocol types (ReadCloseResponse / NotarySignature /
 # SummaryStatePayload / SummaryState).
-rave_engine = "0.5.0"
+rave_engine = "0.6.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
