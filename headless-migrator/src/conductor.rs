@@ -59,6 +59,52 @@ pub struct InstallSpec {
     pub migration_package: Option<MigrationInitRequest>,
 }
 
+/// Build the `InstallAppPayload` for the carried key from an [`InstallSpec`].
+/// Pure (no conductor I/O), so the init_properties encode — the fetched
+/// migration package placed as the migrating role's `init_properties`, which the
+/// DNA's `init` reads to open the chain at genesis — is unit-testable without a
+/// live conductor. `HamConductor::install_app` is a thin wrapper: build + send.
+pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
+    let membrane_proof: Option<MembraneProof> = spec
+        .membrane_proof
+        .as_ref()
+        .map(|bytes| Arc::new(SerializedBytes::from(UnsafeBytes::from(bytes.clone()))));
+    let modifiers = spec
+        .network_seed
+        .clone()
+        .map(|seed| DnaModifiersOpt::<YamlProperties>::default().with_network_seed(seed));
+    // A migrating install carries the fetched package as the role's
+    // `init_properties`; the DNA's `init` reads it and opens the chain at genesis
+    // (driven by the open service's first zome call). A fresh, non-migrating
+    // install carries none.
+    let init_properties = spec
+        .migration_package
+        .as_ref()
+        .map(|pkg| {
+            SerializedBytes::try_from(pkg)
+                .map(InitProperties)
+                .map_err(|e| anyhow::anyhow!("encoding migration init_properties: {e:?}"))
+        })
+        .transpose()?;
+    let mut roles: RoleSettingsMap = RoleSettingsMap::new();
+    roles.insert(
+        spec.role_name.clone(),
+        RoleSettings::Provisioned {
+            membrane_proof,
+            modifiers,
+            init_properties,
+        },
+    );
+    Ok(InstallAppPayload {
+        source: AppBundleSource::Path(spec.happ_path.clone()),
+        agent_key: Some(spec.agent_key.clone()),
+        installed_app_id: Some(spec.app_id.clone()),
+        network_seed: spec.network_seed.clone(),
+        roles_settings: Some(roles),
+        ignore_genesis_failure: false,
+    })
+}
+
 #[async_trait]
 pub trait Conductor: Send + Sync {
     /// Lightweight liveness probe against the conductor's app cell.
@@ -114,10 +160,6 @@ pub trait Conductor: Send + Sync {
 
     /// Install the app for the carried key and enable it.
     async fn install_app(&self, spec: &InstallSpec) -> Result<()>;
-
-    /// Uninstall the app (the non-fresh-chain recovery path — nothing of value
-    /// is on that cell).
-    async fn uninstall_app(&self, app_id: &str) -> Result<()>;
 }
 
 /// Real conductor connection: `ham` for app-cell zome calls + a separate
@@ -281,44 +323,7 @@ impl Conductor for HamConductor {
     }
 
     async fn install_app(&self, spec: &InstallSpec) -> Result<()> {
-        let membrane_proof: Option<MembraneProof> = spec
-            .membrane_proof
-            .as_ref()
-            .map(|bytes| Arc::new(SerializedBytes::from(UnsafeBytes::from(bytes.clone()))));
-        let modifiers = spec
-            .network_seed
-            .clone()
-            .map(|seed| DnaModifiersOpt::<YamlProperties>::default().with_network_seed(seed));
-        // A migrating install carries the fetched package as the role's
-        // `init_properties`; the DNA's `init` reads it and opens the chain at
-        // genesis (driven by the open service's first zome call). A fresh,
-        // non-migrating install carries none.
-        let init_properties = spec
-            .migration_package
-            .as_ref()
-            .map(|pkg| {
-                SerializedBytes::try_from(pkg)
-                    .map(InitProperties)
-                    .map_err(|e| anyhow::anyhow!("encoding migration init_properties: {e:?}"))
-            })
-            .transpose()?;
-        let mut roles: RoleSettingsMap = RoleSettingsMap::new();
-        roles.insert(
-            spec.role_name.clone(),
-            RoleSettings::Provisioned {
-                membrane_proof,
-                modifiers,
-                init_properties,
-            },
-        );
-        let payload = InstallAppPayload {
-            source: AppBundleSource::Path(spec.happ_path.clone()),
-            agent_key: Some(spec.agent_key.clone()),
-            installed_app_id: Some(spec.app_id.clone()),
-            network_seed: spec.network_seed.clone(),
-            roles_settings: Some(roles),
-            ignore_genesis_failure: false,
-        };
+        let payload = build_install_payload(spec)?;
         self.admin
             .install_app(payload)
             .await
@@ -328,13 +333,6 @@ impl Conductor for HamConductor {
             .await
             .map_err(|e| anyhow::anyhow!("enable_app: {e}"))?;
         Ok(())
-    }
-
-    async fn uninstall_app(&self, app_id: &str) -> Result<()> {
-        self.admin
-            .uninstall_app(app_id.to_string(), true)
-            .await
-            .map_err(|e| anyhow::anyhow!("uninstall_app: {e}"))
     }
 }
 

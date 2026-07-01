@@ -43,7 +43,6 @@ pub enum Call {
     VerifyIfMigrated,
     AppPresence,
     InstallApp,
-    UninstallApp,
 }
 
 /// A fully scripted mock conductor. Each field is either a fixed value or a
@@ -60,7 +59,6 @@ pub struct MockConductor {
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
     pub install_result: Mutex<VecDeque<anyhow::Result<()>>>,
-    pub uninstall_result: Mutex<VecDeque<anyhow::Result<()>>>,
 }
 
 impl MockConductor {
@@ -156,11 +154,6 @@ impl Conductor for MockConductor {
     async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<()> {
         self.record(Call::InstallApp);
         Self::pop(&self.install_result, "install_app")
-    }
-
-    async fn uninstall_app(&self, _app_id: &str) -> anyhow::Result<()> {
-        self.record(Call::UninstallApp);
-        Self::pop(&self.uninstall_result, "uninstall_app")
     }
 }
 
