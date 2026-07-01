@@ -1,11 +1,10 @@
-//! Open-service recovery decisions: a `migration_init` rejection is classified
-//! into the right action — a non-fresh chain → uninstall → reinstall → retry;
-//! the double-migration guard → re-verify; a terminal `Invalid` verdict (wrong
+//! Open-service recovery decisions: an `init` rejection is classified into the
+//! right action — a non-fresh chain → a HARD stop (with the chain opened at
+//! genesis, pre-existing value is anomalous, not a recoverable reinstall); the
+//! double-migration guard → re-verify; a terminal `Invalid` verdict (wrong
 //! carried key, insufficient/invalid signatures, malformed carry-forward) → a
 //! HARD failure (NOT an infinite retry); anything else → transient back-off.
-//! (The uninstall→reinstall *sequencing* is the supervised loop re-probing into
-//! the `Absent` → reinstall path, covered by the probe tests; this proves the
-//! classification that drives it.)
+//! (This proves the classification that drives those decisions.)
 //!
 //! The substrings asserted here are copied from the alliance integrity
 //! validators and the coordinator guard — see `src/dna_errors.rs`.
@@ -131,7 +130,7 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
 }
 
 #[test]
-fn non_fresh_chain_rejection_is_recoverable_by_reinstall() {
+fn non_fresh_chain_messages_classify_as_non_fresh_chain() {
     // The open integrity validator asserts a fresh chain (zero balance / fees):
     // "The Summary can only be added to a fresh chain" — the exact two
     // `validate_opening_state_summary` verdicts, plus the older

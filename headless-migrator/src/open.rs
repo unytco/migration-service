@@ -182,9 +182,9 @@ pub async fn run(
 /// short-circuits to `Done` from the PERSISTED state (`safe_to_teardown` written
 /// authoritatively at verify success), with NO router fetch — otherwise an
 /// idempotent restart would hard-require a fetch and spin forever after teardown.
-/// The three remaining branches each fetch the package up front (install +
-/// migration_init commit it; the not-yet-verified opened path verifies against
-/// it), preserving the spec's fetch-before-install ordering rule.
+/// The remaining branches each fetch the package up front (the install applies
+/// it as `init_properties`, opening the chain at `init`; the not-yet-verified
+/// opened path verifies against it), preserving the fetch-before-install rule.
 async fn attempt(
     cfg: &Config,
     open_cfg: &OpenConfig,

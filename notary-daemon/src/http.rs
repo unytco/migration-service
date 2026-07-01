@@ -119,8 +119,9 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
 }
 
 /// Serve the agent's committed closing summary — the package the
-/// migration-service hands back to that agent for `migration_init` on the
-/// successor DNA. A pure read of what the agent committed (the signatures
+/// migration-service hands back to that agent to apply as install-time
+/// `init_properties` on the successor DNA. A pure read of what the agent
+/// committed (the signatures
 /// inside it already carry the trust); nothing is recomputed or signed here.
 async fn fetch_close(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     if !check_bearer(&headers, &state.bearer_token) {
