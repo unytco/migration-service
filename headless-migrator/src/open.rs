@@ -322,6 +322,11 @@ async fn connect_ham(
 /// `init_properties` so the DNA's `init` opens the chain on the first zome call
 /// (no post-install `migration_init`). Returns the install outcome to propagate,
 /// or `Ok(())` on success.
+// One install attempt genuinely threads config (+ open config), the router/join
+// params, the joining-service I/O (http + signer), the conductor, the fetched
+// package, and the run's state — grouping them into a struct would be artificial
+// indirection for a single call site.
+#[allow(clippy::too_many_arguments)]
 async fn install(
     cfg: &Config,
     open_cfg: &OpenConfig,
