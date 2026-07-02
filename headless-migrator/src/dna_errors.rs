@@ -94,7 +94,13 @@ fn is_non_fresh_chain(r_lower: &str) -> bool {
 /// lookup ("Could not resolve a successor GlobalDefinition at init") plus the
 /// underlying "No Global Definition found".
 fn is_successor_gd_not_in_effect(r_lower: &str) -> bool {
-    r_lower.contains("successor globaldefinition") || r_lower.contains("no global definition")
+    // Anchored to the two distinctive phrases (verified in the alliance DNA:
+    // `migration/open.rs` wrapper + `progenitor_calls/global_definition.rs` lookup)
+    // — NOT the bare `"successor globaldefinition"` token, which would also swallow
+    // a *malformed* / mis-configured successor GD (a hard failure) into the bounded
+    // TooEarly retry until the deadline expires.
+    r_lower.contains("could not resolve a successor globaldefinition")
+        || r_lower.contains("no global definition found")
 }
 
 /// Terminal `Invalid` verdicts from the opening-summary validator + the notary

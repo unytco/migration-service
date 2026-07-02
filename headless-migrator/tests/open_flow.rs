@@ -129,6 +129,36 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
     let _ = std::fs::remove_file(&happ);
 }
 
+/// The GD-wait deadline survives a supervised restart: a prior process that
+/// recorded its first too-early stamp writes it to the state file, and the
+/// restarted process's `seed_from_persisted` carries it back — so a
+/// never-arriving successor GD is bounded by the ORIGINAL budget, not a fresh one
+/// each restart. (The expiry decision itself is unit-tested in `open.rs`.)
+#[test]
+fn open_restart_carries_the_gd_wait_stamp() {
+    let state_file = tmp("open-restart-gd-wait");
+
+    // A prior process recorded its first too-early.
+    let mut prior = State::new(
+        Phase::Open,
+        Step::OpeningChain,
+        "waiting for the successor GD",
+    );
+    prior.gd_wait_started_us = Some(1_700_000_000_000_000);
+    prior.write(&state_file).unwrap();
+
+    // The restarted process seeds the stamp back from disk.
+    let mut restarted = State::new(Phase::Open, Step::Probing, "");
+    restarted.seed_from_persisted(&state_file);
+    assert_eq!(
+        restarted.gd_wait_started_us,
+        Some(1_700_000_000_000_000),
+        "the first-too-early stamp must survive the restart so the GD-wait budget is not reset"
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
 #[test]
 fn non_fresh_chain_messages_classify_as_non_fresh_chain() {
     // The open integrity validator asserts a fresh chain (zero balance / fees):

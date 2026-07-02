@@ -97,12 +97,20 @@ pub struct State {
     pub message: String,
     /// Wall-clock of this write (µs since epoch) so a stale file is detectable.
     pub updated_at_us: i64,
+    /// Wall-clock (µs since epoch) of the FIRST too-early `init` (successor GD not
+    /// yet in effect) in this migration. The open service is a supervised
+    /// `Restart=on-failure` unit, so the GD-wait deadline must survive a restart —
+    /// a monotonic `Instant` would reset each start, letting a never-arriving
+    /// successor GD retry forever. Seeded from the prior record so the budget is
+    /// measured from the first too-early across all restarts, not per-process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gd_wait_started_us: Option<i64>,
 }
 
 /// Per-field result of the close-summary ⇄ new-chain-ledger comparison. The two
 /// fields are the only values the new chain recomputes *independently* of the
 /// carried package (it opened with them as its opening state); the carried
-/// agreement-state section is verified on-chain by `migration_init`, not here
+/// agreement-state section is verified on-chain by the DNA's `init`, not here
 /// (see [`crate::verify`] module docs), so it has no field of its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerifyReport {
@@ -135,6 +143,7 @@ impl State {
             safe_to_teardown: false,
             message: message.into(),
             updated_at_us: now_us(),
+            gd_wait_started_us: None,
         }
     }
 
@@ -280,11 +289,17 @@ impl State {
             if self.verify.is_none() {
                 self.verify = prior.verify;
             }
+            // The GD-wait deadline is measured from the FIRST too-early across all
+            // supervised restarts, so carry the persisted stamp forward — else a
+            // never-arriving successor GD would reset the budget every restart.
+            if self.gd_wait_started_us.is_none() {
+                self.gd_wait_started_us = prior.gd_wait_started_us;
+            }
         }
     }
 }
 
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)

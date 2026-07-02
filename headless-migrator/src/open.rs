@@ -55,6 +55,14 @@ enum OpenOutcome {
     Transient(anyhow::Error),
 }
 
+/// True once the successor-GD wait has exceeded its budget, measured from the
+/// FIRST too-early (`started_us`, wall-clock µs). Pulled out so the restart-safe
+/// deadline (persisted, not a per-process `Instant`) is unit-testable without
+/// driving the full open loop.
+fn gd_wait_expired(started_us: i64, now_us: i64, timeout: Duration) -> bool {
+    Duration::from_micros(now_us.saturating_sub(started_us).max(0) as u64) >= timeout
+}
+
 /// Run the open service to completion (or a hard stop). The `shutdown` receiver
 /// is installed ONCE by the caller (`main.rs`) and threaded all the way down
 /// into every conductor (re)connect and sleep — the helpers never install their
@@ -95,10 +103,6 @@ pub async fn run(
     state.seed_from_persisted(&cfg.state_file);
     let backoff = cfg.loop_backoff();
     let mut attempts: u32 = 0;
-    // Bounded too-early-install deadline: set when `init` first fails because the
-    // successor GD isn't in effect; if it stays unresolved past
-    // `open_cfg.gd_wait_timeout`, give up rather than retry forever.
-    let mut gd_wait_since: Option<std::time::Instant> = None;
     loop {
         if *shutdown.borrow() {
             return shutdown_before_complete();
@@ -123,12 +127,15 @@ pub async fn run(
                 bail!("open hard-stopped: {why}");
             }
             OpenOutcome::TooEarly(e) => {
-                // Bounded retry: the successor GD `init` needs isn't in effect
-                // yet. Re-drive after a backoff, but give up once it has stayed
-                // unresolved longer than the deadline (it may never come).
-                let now = std::time::Instant::now();
-                let since = *gd_wait_since.get_or_insert(now);
-                if now.duration_since(since) > open_cfg.gd_wait_timeout {
+                // Bounded retry: the successor GD `init` needs isn't in effect yet.
+                // Re-drive after a backoff, but give up once it has stayed
+                // unresolved past the deadline (it may never come). The deadline is
+                // measured from the FIRST too-early and PERSISTED to the state file,
+                // so a supervised `Restart=on-failure` resumes the SAME budget
+                // rather than starting a fresh 30 minutes each restart.
+                let now = crate::state_file::now_us();
+                let started = *state.gd_wait_started_us.get_or_insert(now);
+                if gd_wait_expired(started, now, open_cfg.gd_wait_timeout) {
                     persist(cfg, &mut state, |s| {
                         s.step = Step::Failed;
                         s.message = format!(
@@ -141,9 +148,16 @@ pub async fn run(
                         open_cfg.gd_wait_timeout.as_secs()
                     );
                 }
-                let delay = Duration::from_millis(ham::compute_delay_ms(attempts, &backoff));
+                // Clamp the backoff to the remaining budget so the wait never
+                // overshoots the deadline by a full interval.
+                let elapsed = Duration::from_micros(now.saturating_sub(started).max(0) as u64);
+                let remaining = open_cfg.gd_wait_timeout.saturating_sub(elapsed);
+                let delay =
+                    Duration::from_millis(ham::compute_delay_ms(attempts, &backoff)).min(remaining);
                 tracing::warn!(error = %format!("{e:#}"), delay_ms = delay.as_millis() as u64,
                     "successor GD not yet in effect; backing off (bounded)");
+                // Persist carries the first-too-early stamp (set above) so the
+                // budget survives the restart.
                 persist(cfg, &mut state, |s| {
                     s.message = format!("waiting for the successor GD to come into effect: {e:#}");
                 });
@@ -528,5 +542,35 @@ pub async fn probe_for_status(conductor: &dyn Conductor, app_id: &str) -> Result
             .verify_if_migrated()
             .await
             .context("probing migrated state for status"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gd_wait_expired;
+    use crate::state_file::now_us;
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(1800);
+
+    #[test]
+    fn gd_wait_not_expired_within_budget() {
+        let now = now_us();
+        // First too-early "just now" — well within the budget.
+        assert!(!gd_wait_expired(now, now, BUDGET));
+        // Just under the budget is not yet expired.
+        assert!(!gd_wait_expired(0, 1799 * 1_000_000, BUDGET));
+    }
+
+    #[test]
+    fn gd_wait_expired_past_budget_across_a_restart() {
+        // A first too-early recorded 40 minutes ago — e.g. carried across a
+        // supervised restart via the persisted stamp — is past the 30-minute
+        // budget, so the restarted service hard-stops immediately instead of
+        // waiting another full budget.
+        let started = now_us() - 40 * 60 * 1_000_000;
+        assert!(gd_wait_expired(started, now_us(), BUDGET));
+        // Exactly at the budget is expired (`>=`), so it fails ON the boundary.
+        assert!(gd_wait_expired(0, 1800 * 1_000_000, BUDGET));
     }
 }

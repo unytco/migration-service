@@ -48,7 +48,10 @@ fn only_role_init_properties(spec: &InstallSpec) -> Option<SerializedBytes> {
 
 #[test]
 fn migrating_install_carries_the_package_as_role_init_properties() {
-    let pkg = migration_init_request(7, summary_state(unit_map(0, 10), CarryForwardUnits::new(), 1));
+    let pkg = migration_init_request(
+        7,
+        summary_state(unit_map(0, 10), CarryForwardUnits::new(), 1),
+    );
     let encoded = only_role_init_properties(&alliance_spec(Some(pkg.clone())));
     let expected = SerializedBytes::try_from(&pkg).expect("encode package");
     assert_eq!(
