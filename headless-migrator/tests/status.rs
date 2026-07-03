@@ -14,7 +14,9 @@ mod support;
 
 use std::time::Duration;
 
+use headless_migrator::conductor::AppPresence;
 use headless_migrator::config::Config;
+use headless_migrator::open::probe_for_status;
 use headless_migrator::policy::PolicyOpts;
 use headless_migrator::probe::ClosedStatus;
 use headless_migrator::state_file::{Phase, State, Step, VerifyReport};
@@ -290,6 +292,64 @@ async fn close_side_status_with_latched_teardown_renders_no_contradictory_row() 
     let _ = std::fs::remove_file(&tmp);
 }
 
+// ── Read-only new-chain probe (status must never drive `init`) ───────────
+
+/// The new-chain probe makes NO zome call. On a cell installed with migration
+/// `init_properties` the FIRST zome call drives `init` and opens the chain —
+/// only the supervised open service may do that — so a diagnostic `status` must
+/// answer from app presence + the open service's persisted signal alone. The
+/// mock panics on any unscripted zome call, and the recorded calls prove
+/// presence is the only conductor interaction.
+#[tokio::test]
+async fn new_chain_probe_is_read_only_and_reports_the_persisted_signal() {
+    // Installed but not yet opened (persisted signal false): reports false
+    // WITHOUT touching the chain — the exact cell a zome-call probe would have
+    // opened as a side effect.
+    let mock = MockConductor::default();
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    let opened = probe_for_status(&mock, "unyt", false).await.unwrap();
+    assert!(
+        !opened,
+        "installed-but-unopened reports false from the persisted signal"
+    );
+    assert_eq!(
+        mock.calls(),
+        vec![Call::AppPresence],
+        "presence is the ONLY conductor interaction — no zome call may run"
+    );
+
+    // Installed and the open service has stamped the open → true, still
+    // presence-only.
+    let mock = MockConductor::default();
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    let opened = probe_for_status(&mock, "unyt", true).await.unwrap();
+    assert!(opened);
+    assert_eq!(mock.calls(), vec![Call::AppPresence]);
+}
+
+/// Presence gates the persisted signal: a stale record (e.g. surviving an
+/// uninstall) must not report an open chain that is not there.
+#[tokio::test]
+async fn new_chain_probe_reports_false_when_app_absent_despite_persisted_open() {
+    let mock = MockConductor::default();
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Absent));
+    let opened = probe_for_status(&mock, "unyt", true).await.unwrap();
+    assert!(
+        !opened,
+        "no installed app ⇒ no open chain, whatever the record says"
+    );
+    assert_eq!(mock.calls(), vec![Call::AppPresence]);
+}
+
 /// Serve exactly one HTTP 200 with `body`, then close. Returns the base URL.
 async fn one_shot_ok(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -425,7 +485,8 @@ async fn status_connect_is_bounded_on_a_down_conductor() {
         .await
         .expect("status run is Ok");
     let elapsed = started.elapsed();
-    // Two bounded connects (ham + admin fallback) + a router probe, each capped
+    // One bounded admin-only connect (the new-server path makes no zome call,
+    // so it never attempts the full ham attach) + a router probe, each capped
     // near the 150ms budget — comfortably under the forever-loop this guards.
     assert!(
         elapsed < Duration::from_secs(5),

@@ -393,11 +393,37 @@ async fn install(
         migration_package: Some(package.clone()),
     };
     if let Err(e) = admin.install_app(&spec).await {
-        return Err(OpenOutcome::Transient(
-            e.context("install_app for the carried key"),
-        ));
+        return Err(install_error_outcome(e));
     }
     Ok(())
+}
+
+/// Map an `install_app` (install + enable) failure onto the open outcome. The
+/// install carries the package as the role's `init_properties` with
+/// `ignore_genesis_failure: false`, so a DNA-level verdict — the too-early
+/// successor GD included — may surface from the admin call itself rather than
+/// the later `verify_if_migrated`. Routing through the same
+/// [`classify_migration_init_error`] contract as [`drive_open_and_verify`] keeps
+/// that case on the BOUNDED [`OpenOutcome::TooEarly`] deadline (never an
+/// unbounded `Transient` retry) and keeps terminal verdicts a hard stop.
+/// `AlreadyMigrated` here means another pass raced this install — transient: the
+/// next probe finds the app installed and proceeds straight to verify.
+fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
+    let rendered = format!("{e:#}");
+    match classify_migration_init_error(&rendered) {
+        InitErrorClass::HardFailure => OpenOutcome::HardStop(format!(
+            "install rejected the opening summary with an unrecoverable verdict: {rendered}"
+        )),
+        InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
+            "unexpected non-fresh chain surfaced at install: {rendered}"
+        )),
+        InitErrorClass::TooEarly => {
+            OpenOutcome::TooEarly(e.context("successor GD not yet in effect (surfaced at install)"))
+        }
+        InitErrorClass::AlreadyMigrated | InitErrorClass::Transient => {
+            OpenOutcome::Transient(e.context("install_app for the carried key"))
+        }
+    }
 }
 
 /// Drive the new cell's `init` and verify. With the package installed as the
@@ -471,6 +497,12 @@ async fn verify_after_open_with(
 ) -> OpenOutcome {
     persist(cfg, state, |s| {
         s.step = Step::Verifying;
+        // The chain IS open by the time verify starts (`init` committed the
+        // opening summary) — stamp it now, not only at Done, so a read-only
+        // `status` (which reports this persisted signal rather than making a
+        // zome call that could itself drive `init`) sees the open as soon as
+        // it happens, not only after verify passes.
+        s.new_chain_opened = true;
         s.message = "verifying new-chain ledger against the close summary".into();
     });
     let ledger = match conductor.get_ledger().await {
@@ -528,26 +560,33 @@ fn persist(cfg: &Config, state: &mut State, f: impl FnOnce(&mut State)) {
     }
 }
 
-/// Probe whether the new chain is opened, for the `Status` command's report.
-/// `false` if the app isn't installed; otherwise `verify_if_migrated`
-/// (idempotent on an already-opened cell).
-pub async fn probe_for_status(conductor: &dyn Conductor, app_id: &str) -> Result<bool> {
+/// Report whether the new chain is opened, for the `Status` command — READ-ONLY.
+/// `status` must never mutate the chain, and on a cell installed with migration
+/// `init_properties` the FIRST zome call (`verify_if_migrated` included) drives
+/// `init` and opens the chain — the supervised open service's job, under its
+/// bounded/verified flow. So this probe makes NO zome call: it reports the open
+/// service's persisted `new_chain_opened` signal (stamped the moment `init` has
+/// driven the open — see [`verify_after_open_with`]), gated on the app actually
+/// being present. `false` if the app isn't installed, whatever the record says
+/// (e.g. a stale file surviving an uninstall); otherwise the persisted signal.
+pub async fn probe_for_status(
+    conductor: &dyn Conductor,
+    app_id: &str,
+    persisted_new_chain_opened: bool,
+) -> Result<bool> {
     match conductor
         .app_presence(app_id)
         .await
         .context("probing app presence for status")?
     {
         crate::conductor::AppPresence::Absent => Ok(false),
-        crate::conductor::AppPresence::Installed => conductor
-            .verify_if_migrated()
-            .await
-            .context("probing migrated state for status"),
+        crate::conductor::AppPresence::Installed => Ok(persisted_new_chain_opened),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::gd_wait_expired;
+    use super::{gd_wait_expired, install_error_outcome, OpenOutcome};
     use crate::state_file::now_us;
     use std::time::Duration;
 
@@ -572,5 +611,45 @@ mod tests {
         assert!(gd_wait_expired(started, now_us(), BUDGET));
         // Exactly at the budget is expired (`>=`), so it fails ON the boundary.
         assert!(gd_wait_expired(0, 1800 * 1_000_000, BUDGET));
+    }
+
+    #[test]
+    fn too_early_from_install_is_bounded_not_transient() {
+        // With the package as `init_properties` (and `ignore_genesis_failure:
+        // false`) the too-early successor GD can surface from the admin
+        // install/enable call itself. It must land on the bounded TooEarly path
+        // (the run loop's persisted deadline), never the unbounded Transient
+        // retry — the same self-recovery bound `drive_open_and_verify` gets.
+        let e = anyhow::anyhow!(
+            "Could not resolve a successor GlobalDefinition at init (NoGlobalDefinition)"
+        );
+        assert!(matches!(install_error_outcome(e), OpenOutcome::TooEarly(_)));
+        let e = anyhow::anyhow!("wasm error: No Global Definition found");
+        assert!(matches!(install_error_outcome(e), OpenOutcome::TooEarly(_)));
+    }
+
+    #[test]
+    fn terminal_verdict_from_install_is_a_hard_stop() {
+        // A terminal validator verdict surfaced at install retries can never
+        // fix — hard stop, exactly as when it surfaces from driving `init`.
+        let e = anyhow::anyhow!("opening summary agent does not match the notarized agent");
+        assert!(matches!(install_error_outcome(e), OpenOutcome::HardStop(_)));
+    }
+
+    #[test]
+    fn plain_blip_from_install_stays_transient() {
+        // An ordinary transport blip keeps the existing back-off-and-re-probe
+        // behavior; so does a raced already-migrated (the next probe finds the
+        // app installed and proceeds straight to verify).
+        let e = anyhow::anyhow!("websocket closed; reconnecting");
+        assert!(matches!(
+            install_error_outcome(e),
+            OpenOutcome::Transient(_)
+        ));
+        let e = anyhow::anyhow!("this chain has already been migrated");
+        assert!(matches!(
+            install_error_outcome(e),
+            OpenOutcome::Transient(_)
+        ));
     }
 }
