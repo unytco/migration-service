@@ -201,12 +201,8 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
         // shutdown and would hang the report collector on a down conductor; a
         // timeout reads UNKNOWN, never a definitive "not closed".
         let mut shutdown = ham::install_shutdown_handler();
-        let connected = match tokio::time::timeout(
-            budget,
-            HamConductor::connect(cfg, &mut shutdown),
-        )
-        .await
-        {
+        let connect = HamConductor::connect(cfg, &mut shutdown);
+        let connected = match tokio::time::timeout(budget, connect).await {
             Ok(c) => c,
             Err(_elapsed) => {
                 tracing::warn!(
