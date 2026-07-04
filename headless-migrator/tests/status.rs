@@ -494,3 +494,49 @@ async fn status_connect_is_bounded_on_a_down_conductor() {
     );
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// An interleaved `status` run must not erase the open service's persisted
+/// first-too-early stamp: the GD-wait budget is measured from that stamp
+/// across supervised restarts, so dropping it would renew the full budget on
+/// the next restart — the unbounded-retry class the bounded deadline closes.
+/// The full scenario: open persists the stamp mid-wait → an operator/report
+/// collector runs `status` → the restarted open service still seeds the
+/// ORIGINAL stamp.
+#[tokio::test]
+async fn status_run_preserves_the_gd_wait_stamp_for_the_next_open_restart() {
+    let tmp = tmp_state("gd-wait-stamp-preserved");
+
+    // The open service hit a too-early successor GD and persisted the FIRST
+    // too-early timestamp mid-wait.
+    let mut open_state = State::new(
+        Phase::Open,
+        Step::OpeningChain,
+        "waiting for the successor GD to come into effect",
+    );
+    open_state.gd_wait_started_us = Some(1_234_567);
+    open_state.write(&tmp).unwrap();
+
+    // An interleaved status report (new-server context, conductor down — the
+    // report collector's usual mid-migration read).
+    let cfg = down_cfg(&tmp);
+    let params = status_params();
+    let state = headless_migrator::status::run(&cfg, Some(&params))
+        .await
+        .expect("status run is Ok");
+    assert_eq!(
+        state.gd_wait_started_us,
+        Some(1_234_567),
+        "the status record carries the stamp through its rewrite"
+    );
+
+    // The subsequent open-service restart seeds the ORIGINAL stamp — the
+    // budget resumes, it does not renew.
+    let mut restarted = State::new(Phase::Open, Step::Probing, "");
+    restarted.seed_from_persisted(&tmp);
+    assert_eq!(
+        restarted.gd_wait_started_us,
+        Some(1_234_567),
+        "a post-status open restart must resume the SAME GD-wait budget"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}

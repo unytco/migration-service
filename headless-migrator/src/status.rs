@@ -135,7 +135,9 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
     // reports the authoritative teardown signal back rather than re-running a live
     // verify (which needs the old side and so can't run after teardown). Both
     // default to false / None if the file is absent — a standalone status that has
-    // never verified.
+    // never verified. The GD-wait stamp is carried for a different reason: not
+    // reported, but a status rewrite must not erase what the open service
+    // persisted mid-wait.
     let prior = State::read(&cfg.state_file).ok();
     let persisted_teardown = prior.as_ref().map(|s| s.safe_to_teardown).unwrap_or(false);
     // The persisted open signal feeds the read-only new-chain probe below. The
@@ -145,6 +147,10 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
         .as_ref()
         .map(|s| s.new_chain_opened || s.safe_to_teardown)
         .unwrap_or(false);
+    // The open service's first-too-early stamp must ride through a status
+    // rewrite untouched: dropping it would renew the bounded GD-wait budget on
+    // the next supervised open restart (`State::write` also backstops this).
+    let prior_gd_wait_started_us = prior.as_ref().and_then(|s| s.gd_wait_started_us);
     let prior_verify = prior.and_then(|s| s.verify);
 
     // The router coordinates (`params`) are present ONLY in the new-server
@@ -161,6 +167,7 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
         state.agent = Some(p.agent_b64.clone());
     }
     state.verify = prior_verify;
+    state.gd_wait_started_us = prior_gd_wait_started_us;
 
     let budget = status_connect_budget();
     if new_server_context {

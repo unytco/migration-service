@@ -51,13 +51,18 @@ pub enum Step {
 /// three-way distinction the monotonic latch needs but the reporting read
 /// ([`State::persisted_safe_to_teardown`]) collapses. Only the write path cares
 /// that a corrupt file is NOT an absent one.
-enum PriorLatch {
+enum PriorRecord {
     /// No state file yet — a genuinely first write; persist the caller's value.
     Absent,
-    /// The file read + parsed; carries its persisted `safe_to_teardown`.
-    Known(bool),
-    /// The file is present but could not be read / parsed — the prior latch is
-    /// UNKNOWN. Carries the read error so the caller can surface it.
+    /// The file read + parsed; carries the two write-guarded fields: the
+    /// monotonic `safe_to_teardown` latch and the write-once
+    /// `gd_wait_started_us` stamp.
+    Known {
+        safe_to_teardown: bool,
+        gd_wait_started_us: Option<i64>,
+    },
+    /// The file is present but could not be read / parsed — the prior guarded
+    /// fields are UNKNOWN. Carries the read error so the caller can surface it.
     Unreadable(anyhow::Error),
 }
 
@@ -166,6 +171,17 @@ impl State {
     /// ([`seed_from_persisted`]) so the in-memory record matches; this guard is the
     /// defensive backstop that holds even if a caller forgets to.
     ///
+    /// **Write-once stamp guard.** `gd_wait_started_us` records the FIRST
+    /// too-early `init` (the successor GD not yet in effect) so the open
+    /// service's bounded GD-wait budget is measured across supervised restarts,
+    /// not per process. A fresh `State` defaults it to `None`, so a writer that
+    /// never saw the stamp (a `status` report, the standalone `verify`) would
+    /// erase it — and the next open-service restart would renew the full
+    /// budget, reopening the unbounded-retry hole the stamp closes. So a `None`
+    /// in the record is filled from the prior on-disk stamp; a caller with its
+    /// own `Some` (the open service, seeded first) wins. Nothing clears the
+    /// stamp within a migration — the file itself is retired with the droplet.
+    ///
     /// **Read-error fail-safe.** The guard reads the prior on-disk record to learn
     /// the latch, so it must tell a genuinely-ABSENT file (a first write — fine to
     /// persist whatever the caller passed) from a file that is PRESENT but
@@ -180,15 +196,33 @@ impl State {
     /// corruption with a valid record.
     pub fn write(&self, path: &Path) -> Result<()> {
         let mut record = self.clone();
-        match Self::read_prior_latch(path) {
-            // Known prior latch is up → hold it up (monotonic latch).
-            PriorLatch::Known(true) => record.safe_to_teardown = true,
-            // Known prior latch is down, or a genuinely new file → persist the
-            // caller's value as-is (this may legitimately raise false→true).
-            PriorLatch::Known(false) | PriorLatch::Absent => {}
-            // Present but unreadable → UNKNOWN prior latch. Refuse to lower it:
-            // fail closed on a `false` write so a corrupt `true` can't be dropped.
-            PriorLatch::Unreadable(err) => {
+        match Self::read_prior_record(path) {
+            PriorRecord::Known {
+                safe_to_teardown,
+                gd_wait_started_us,
+            } => {
+                // A prior latch that is up is held up (monotonic); a prior
+                // `false` persists the caller's value as-is (a legitimate
+                // false→true raise included).
+                if safe_to_teardown {
+                    record.safe_to_teardown = true;
+                }
+                // Write-once stamp: fill a fresh record's `None` from the
+                // prior stamp so an interleaved status/verify write can't
+                // renew the open service's bounded GD-wait budget.
+                if record.gd_wait_started_us.is_none() {
+                    record.gd_wait_started_us = gd_wait_started_us;
+                }
+            }
+            // A genuinely new file → persist the caller's value as-is.
+            PriorRecord::Absent => {}
+            // Present but unreadable → the prior latch is UNKNOWN. Refuse to
+            // lower it: fail closed on a `false` write so a corrupt `true`
+            // can't be dropped. (The stamp rides the same fail-closed path; a
+            // latch-raising `true` write over corruption proceeds and repairs
+            // the file, accepting that an unreadable stamp is lost with it —
+            // by then the open has verified, so no GD wait remains.)
+            PriorRecord::Unreadable(err) => {
                 if !record.safe_to_teardown {
                     return Err(err.context(format!(
                         "refusing to lower safe_to_teardown: prior state file {} is present \
@@ -238,28 +272,32 @@ impl State {
     /// absent *or* unreadable file reads `false`, the conservative default
     /// (report not-safe rather than guess). The *write*-side latch guard does NOT
     /// reuse this collapse — it must distinguish absent from corrupt to avoid
-    /// dropping a latch it cannot read (see [`read_prior_latch`](Self::read_prior_latch)).
+    /// dropping a latch it cannot read (see [`read_prior_record`](Self::read_prior_record)).
     pub fn persisted_safe_to_teardown(path: &Path) -> bool {
         Self::read(path)
             .map(|s| s.safe_to_teardown)
             .unwrap_or(false)
     }
 
-    /// Classify the prior on-disk latch for the write-side fail-safe, telling a
+    /// Classify the prior on-disk record's write-guarded fields (the teardown
+    /// latch + the GD-wait stamp) for the write-side fail-safe, telling a
     /// genuinely-ABSENT file apart from a PRESENT-but-corrupt one. Unlike
     /// [`persisted_safe_to_teardown`](Self::persisted_safe_to_teardown) — which
     /// collapses both to `false` for *reporting* — the write guard must not, since
     /// a corrupt file may hold a latched `true` it cannot read and a fresh `false`
     /// written over it would silently drop that latch.
-    fn read_prior_latch(path: &Path) -> PriorLatch {
+    fn read_prior_record(path: &Path) -> PriorRecord {
         match std::fs::read_to_string(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorLatch::Absent,
-            Err(e) => PriorLatch::Unreadable(
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorRecord::Absent,
+            Err(e) => PriorRecord::Unreadable(
                 anyhow::Error::new(e).context(format!("reading {}", path.display())),
             ),
             Ok(raw) => match serde_json::from_str::<State>(&raw) {
-                Ok(s) => PriorLatch::Known(s.safe_to_teardown),
-                Err(e) => PriorLatch::Unreadable(
+                Ok(s) => PriorRecord::Known {
+                    safe_to_teardown: s.safe_to_teardown,
+                    gd_wait_started_us: s.gd_wait_started_us,
+                },
+                Err(e) => PriorRecord::Unreadable(
                     anyhow::Error::new(e).context(format!("parsing {}", path.display())),
                 ),
             },
