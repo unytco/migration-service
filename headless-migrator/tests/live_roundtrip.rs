@@ -104,6 +104,7 @@ fn load_live_env() -> Result<LiveEnv> {
         happ_path: var("LIVE_HAPP_PATH")?.into(),
         joining_url: var("LIVE_JOINING_URL")?,
         network_seed: std::env::var("LIVE_NETWORK_SEED").ok(),
+        gd_wait_timeout: std::time::Duration::from_secs(1800),
     };
 
     let open_params = OpenParams {

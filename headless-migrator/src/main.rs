@@ -55,8 +55,9 @@ enum Command {
     CloseService,
 
     /// Supervised loop: wait/retry the package fetch → fresh membrane proof for
-    /// the carried key → install_app → migration_init (first zome call) →
-    /// verify. Exits 0 only once the new chain is open + verified.
+    /// the carried key → install_app WITH the package as init_properties → drive
+    /// init via the first zome call → verify. Exits 0 only once the new chain is
+    /// open + verified.
     OpenService {
         /// Router base URL (the package source).
         #[arg(long)]

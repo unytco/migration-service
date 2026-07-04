@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 /// The outcome of one package fetch.
 pub enum FetchOutcome {
-    /// The package — ready to install + `migration_init`. Boxed so the large
+    /// The package — ready to install as the role's `init_properties`. Boxed so the large
     /// `MigrationInitRequest` doesn't bloat every `FetchOutcome` (the other
     /// variants hold only a `String`) — clears `clippy::large_enum_variant`.
     Package(Box<MigrationInitRequest>),

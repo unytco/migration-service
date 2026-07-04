@@ -6,7 +6,7 @@ mod support;
 use headless_migrator::conductor::AppPresence;
 use headless_migrator::probe::{
     classify_close_error, probe_close_state, probe_closed_status, probe_open_state, CloseNext,
-    CloseState, ClosedStatus, OpenNext, OpenState,
+    CloseState, ClosedStatus, OpenState,
 };
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
@@ -134,7 +134,7 @@ async fn closed_status_reads_unknown_on_transport_error() {
 // ── Open-side states ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn probe_absent_app_maps_to_fetch_install_open() {
+async fn probe_absent_app_is_not_installed() {
     let mock = MockConductor::default();
     mock.presence
         .lock()
@@ -142,31 +142,20 @@ async fn probe_absent_app_maps_to_fetch_install_open() {
         .push_back(Ok(AppPresence::Absent));
     let state = probe_open_state(&mock, "unyt").await.unwrap();
     assert_eq!(state, OpenState::NotInstalled);
-    assert_eq!(state.next(), OpenNext::FetchInstallOpen);
 }
 
 #[tokio::test]
-async fn probe_installed_not_migrated_maps_to_open_only() {
+async fn probe_present_app_is_installed_without_a_zome_call() {
+    // The pre-install probe is admin-only: it asks presence, NOT
+    // verify_if_migrated (which needs ham and drives init). So an installed app
+    // maps to `Installed` regardless of migrated state — whether it opened is
+    // decided by the ham-connected drive step, not the probe. No verify_migrated
+    // response is scripted: if the probe called it, the mock's `pop` would panic.
     let mock = MockConductor::default();
     mock.presence
         .lock()
         .unwrap()
         .push_back(Ok(AppPresence::Installed));
-    mock.verify_migrated.lock().unwrap().push_back(Ok(false));
     let state = probe_open_state(&mock, "unyt").await.unwrap();
-    assert_eq!(state, OpenState::InstalledNotMigrated);
-    assert_eq!(state.next(), OpenNext::OpenOnly);
-}
-
-#[tokio::test]
-async fn probe_migrated_maps_to_already_opened() {
-    let mock = MockConductor::default();
-    mock.presence
-        .lock()
-        .unwrap()
-        .push_back(Ok(AppPresence::Installed));
-    mock.verify_migrated.lock().unwrap().push_back(Ok(true));
-    let state = probe_open_state(&mock, "unyt").await.unwrap();
-    assert_eq!(state, OpenState::Migrated);
-    assert_eq!(state.next(), OpenNext::AlreadyOpened);
+    assert_eq!(state, OpenState::Installed);
 }

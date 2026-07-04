@@ -40,11 +40,9 @@ pub enum Call {
     RequestClosingSignature,
     CloseAgentChain,
     GetMigrationCloseState,
-    MigrationInit,
     VerifyIfMigrated,
     AppPresence,
     InstallApp,
-    UninstallApp,
 }
 
 /// A fully scripted mock conductor. Each field is either a fixed value or a
@@ -58,11 +56,9 @@ pub struct MockConductor {
     pub sign_responses: Mutex<VecDeque<anyhow::Result<SignClosingResponse>>>,
     pub close_result: Mutex<Option<anyhow::Result<ActionHash>>>,
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
-    pub migration_init: Mutex<VecDeque<anyhow::Result<()>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
     pub install_result: Mutex<VecDeque<anyhow::Result<()>>>,
-    pub uninstall_result: Mutex<VecDeque<anyhow::Result<()>>>,
 }
 
 impl MockConductor {
@@ -145,11 +141,6 @@ impl Conductor for MockConductor {
         Self::pop(&self.close_state, "get_migration_close_state")
     }
 
-    async fn migration_init(&self, _request: MigrationInitRequest) -> anyhow::Result<()> {
-        self.record(Call::MigrationInit);
-        Self::pop(&self.migration_init, "migration_init")
-    }
-
     async fn verify_if_migrated(&self) -> anyhow::Result<bool> {
         self.record(Call::VerifyIfMigrated);
         Self::pop(&self.verify_migrated, "verify_if_migrated")
@@ -163,11 +154,6 @@ impl Conductor for MockConductor {
     async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<()> {
         self.record(Call::InstallApp);
         Self::pop(&self.install_result, "install_app")
-    }
-
-    async fn uninstall_app(&self, _app_id: &str) -> anyhow::Result<()> {
-        self.record(Call::UninstallApp);
-        Self::pop(&self.uninstall_result, "uninstall_app")
     }
 }
 

@@ -1,10 +1,10 @@
 //! The migration error-substring contract, in ONE place.
 //!
-//! `rave_engine 0.4.0` and the alliance transactor DNA expose **no typed
-//! migration error enum** — a rejected `migration_init` / `get_migration_close_state`
-//! surfaces only as a stringly-rendered conductor error, and the router returns
-//! a string `code`. Classifying those into actions therefore means matching
-//! substrings, which is fragile: a DNA reword silently reclassifies an error.
+//! `rave_engine 0.6.0` now carries a typed `MigrationError` enum that renders a
+//! machine-extractable `[MIGERR:<CODE>]` prefix, but this classifier still keys
+//! off the English message text (and the router returns a string `code`), so a
+//! rejected `init` / `get_migration_close_state` is matched by **substring** —
+//! fragile: a DNA reword silently reclassifies unless the token stays stable.
 //!
 //! To keep that fragility auditable, every substring the close service, open
 //! service, and package fetch key off lives here as one table, next to the
@@ -14,22 +14,24 @@
 //!   * the alliance integrity `validate_opening_state_summary` +
 //!     `verify_notary_threshold` + `validate_carry_forward_structure`
 //!     (`dnas/alliance/zomes/integrity/transactor/src/entries/migration/`),
-//!   * the coordinator `migration_init` double-migration guard
+//!   * the coordinator's `chain_already_migrated` double-migration guard
 //!     (`.../coordinator/transactor/src/migration/open.rs`),
 //!   * the alliance `get_migration_close_state` close-state messages, and
 //!   * the router's wire error codes (`migration-service/router`).
 //!
-//! DNA-OWNER BACKLOG: expose typed migration-init / close errors (a
-//! `#[derive]`d error enum on the zome surface) so this substring contract can
-//! be replaced by a match on variants. Until then, any change to a validator
-//! message MUST be mirrored here.
+//! BACKLOG: `rave_engine`'s `MigrationError` already exposes stable
+//! `[MIGERR:<CODE>]` codes (`crates/rave_engine/.../migration/error.rs`, with a
+//! `from_rendered` parser); adopt them here — match the code, not the English
+//! text — so a validator message reword can't silently reclassify. Until then,
+//! any change to a validator message MUST be mirrored here.
 
-/// How a failed `migration_init` should be handled by the open service.
+/// How a failed open (`init`) should be handled by the open service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitErrorClass {
-    /// The open validator rejected a non-fresh chain (a zome call landed before
-    /// `migration_init`, leaving a non-zero balance / owed fees) — uninstall,
-    /// reinstall, retry. Recoverable: nothing of value is on that cell.
+    /// The open validator rejected a non-fresh chain at `init` — the chain being
+    /// opened already carries a non-zero balance / owed fees. With the chain
+    /// opened at genesis this is anomalous (not the old pre-`init` zome-call
+    /// race), so it is a **hard stop**, not a recoverable reinstall.
     NonFreshChain,
     /// The double-migration guard fired — another pass already opened the chain.
     /// Treat as success-adjacent: re-verify.
@@ -39,12 +41,17 @@ pub enum InitErrorClass {
     /// the new GD's opening threshold (or don't verify, or aren't from listed
     /// notaries), or the carry-forward section is malformed. Fail loudly.
     HardFailure,
+    /// The successor `GlobalDefinition` `init` needs to open the chain is not yet
+    /// in effect (not gossiped in, or before its effective date). Recoverable —
+    /// the open service re-drives `init` once the GD syncs — but under a BOUNDED
+    /// deadline, since the classifier can't tell "not yet" from "never".
+    TooEarly,
     /// Anything else (a websocket blip, a transient host error) — back off and
     /// re-probe.
     Transient,
 }
 
-/// Classify a `migration_init` error from its rendered chain.
+/// Classify an open (`init`) error from its rendered chain.
 ///
 /// Order matters: a terminal hard-failure verdict is checked **before** the
 /// broad `"already migrated"` / fresh-chain tokens, so a genuinely unfixable
@@ -61,6 +68,8 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
         InitErrorClass::AlreadyMigrated
     } else if is_non_fresh_chain(&r) {
         InitErrorClass::NonFreshChain
+    } else if is_successor_gd_not_in_effect(&r) {
+        InitErrorClass::TooEarly
     } else {
         InitErrorClass::Transient
     }
@@ -75,6 +84,23 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
 /// phrasing as belt-and-braces.
 fn is_non_fresh_chain(r_lower: &str) -> bool {
     r_lower.contains("added to a fresh chain") || r_lower.contains("source chain not empty")
+}
+
+/// The DNA's `init` could not resolve a successor `GlobalDefinition` to open the
+/// chain against — it is not yet in effect (not gossiped in, or before its
+/// effective date): a too-early install. Distinct from a generic transient blip
+/// because the open service bounds the retry by a deadline (the GD might never
+/// come). Mirrors the wrapper `apply_migration_init_properties` puts on the GD
+/// lookup ("Could not resolve a successor GlobalDefinition at init") plus the
+/// underlying "No Global Definition found".
+fn is_successor_gd_not_in_effect(r_lower: &str) -> bool {
+    // Anchored to the two distinctive phrases (verified in the alliance DNA:
+    // `migration/open.rs` wrapper + `progenitor_calls/global_definition.rs` lookup)
+    // — NOT the bare `"successor globaldefinition"` token, which would also swallow
+    // a *malformed* / mis-configured successor GD (a hard failure) into the bounded
+    // TooEarly retry until the deadline expires.
+    r_lower.contains("could not resolve a successor globaldefinition")
+        || r_lower.contains("no global definition found")
 }
 
 /// Terminal `Invalid` verdicts from the opening-summary validator + the notary
@@ -254,5 +280,27 @@ mod tests {
     fn unreachable_target_is_a_router_hard_stop() {
         assert!(router_code_is_hard_stop("unreachable_target"));
         assert!(!router_code_is_retryable("unreachable_target"));
+    }
+
+    #[test]
+    fn too_early_successor_gd_is_bounded_not_unbounded() {
+        // The DNA wraps the GD lookup as "Could not resolve a successor
+        // GlobalDefinition at init (...)"; that classifies as TooEarly (a bounded
+        // retry), NOT the unbounded Transient fallthrough.
+        assert_eq!(
+            classify_migration_init_error(
+                "Could not resolve a successor GlobalDefinition at init (NoGlobalDefinition)"
+            ),
+            InitErrorClass::TooEarly
+        );
+        assert_eq!(
+            classify_migration_init_error("wasm error: No Global Definition found"),
+            InitErrorClass::TooEarly
+        );
+        // A generic blip is still Transient (unbounded).
+        assert_eq!(
+            classify_migration_init_error("websocket closed; reconnecting"),
+            InitErrorClass::Transient
+        );
     }
 }

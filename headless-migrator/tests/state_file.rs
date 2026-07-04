@@ -246,3 +246,42 @@ fn verify_report_passed_requires_all_fields() {
     r.carry_forward_units_match = false;
     assert!(!r.passed(), "any failed field fails the whole verify");
 }
+
+/// The write-once GD-wait stamp: a fresh record (`gd_wait_started_us: None`)
+/// written by something that never saw the stamp — a `status` report, the
+/// standalone `verify` — must not erase the persisted first-too-early
+/// timestamp, or the open service's next supervised restart would renew its
+/// bounded GD-wait budget (the unbounded-retry hole again). A caller carrying
+/// its own stamp keeps it.
+#[test]
+fn write_never_erases_a_persisted_gd_wait_stamp() {
+    let path = tmp("gd-wait-stamp-guard");
+
+    // The open service persists the FIRST too-early stamp mid-wait.
+    let mut open_state = State::new(
+        Phase::Open,
+        Step::OpeningChain,
+        "successor GD not in effect",
+    );
+    open_state.gd_wait_started_us = Some(1_000_000);
+    open_state.write(&path).unwrap();
+
+    // A fresh writer with no stamp (a status/verify rewrite) — the stamp survives.
+    let fresh = State::new(Phase::Status, Step::Probing, "status rewrite");
+    fresh.write(&path).unwrap();
+    assert_eq!(
+        State::read(&path).unwrap().gd_wait_started_us,
+        Some(1_000_000),
+        "a stampless rewrite must not erase the persisted first-too-early stamp"
+    );
+
+    // A caller with its own stamp (the open service, seeded first) wins.
+    let mut own = State::new(Phase::Open, Step::OpeningChain, "carried stamp");
+    own.gd_wait_started_us = Some(1_000_000);
+    own.write(&path).unwrap();
+    assert_eq!(
+        State::read(&path).unwrap().gd_wait_started_us,
+        Some(1_000_000)
+    );
+    let _ = std::fs::remove_file(&path);
+}

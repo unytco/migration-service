@@ -15,6 +15,15 @@
 //! persisted value back — monotonic: once true, it stays true. Re-running a live
 //! verify here would flip the signal false the moment the old side is gone,
 //! exactly when an operator consults it to decide teardown is safe.
+//!
+//! `new_chain_opened` is likewise the PERSISTED signal (stamped by the open
+//! service the moment `init` has driven the open), gated on a bounded
+//! admin-only presence probe — never a live zome call. On a cell installed with
+//! migration `init_properties` the FIRST zome call drives `init` and opens the
+//! chain, so "probing" the new server via any zome call would perform the open
+//! outside the supervised open service's bounded/verified flow. A new-server
+//! `status` therefore makes no zome call at all; only the close side probes its
+//! (long-inited) old cell live.
 
 use anyhow::Result;
 use holo_hash::DnaHashB64;
@@ -126,9 +135,22 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
     // reports the authoritative teardown signal back rather than re-running a live
     // verify (which needs the old side and so can't run after teardown). Both
     // default to false / None if the file is absent — a standalone status that has
-    // never verified.
+    // never verified. The GD-wait stamp is carried for a different reason: not
+    // reported, but a status rewrite must not erase what the open service
+    // persisted mid-wait.
     let prior = State::read(&cfg.state_file).ok();
     let persisted_teardown = prior.as_ref().map(|s| s.safe_to_teardown).unwrap_or(false);
+    // The persisted open signal feeds the read-only new-chain probe below. The
+    // teardown latch subsumes it (it only latches once close + open + verify are
+    // all green), so a record carrying only the latch still reports opened.
+    let persisted_new_chain_opened = prior
+        .as_ref()
+        .map(|s| s.new_chain_opened || s.safe_to_teardown)
+        .unwrap_or(false);
+    // The open service's first-too-early stamp must ride through a status
+    // rewrite untouched: dropping it would renew the bounded GD-wait budget on
+    // the next supervised open restart (`State::write` also backstops this).
+    let prior_gd_wait_started_us = prior.as_ref().and_then(|s| s.gd_wait_started_us);
     let prior_verify = prior.and_then(|s| s.verify);
 
     // The router coordinates (`params`) are present ONLY in the new-server
@@ -145,16 +167,49 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
         state.agent = Some(p.agent_b64.clone());
     }
     state.verify = prior_verify;
+    state.gd_wait_started_us = prior_gd_wait_started_us;
 
-    // Old-chain + new-chain probes: need the app cell. Admin-only can't make
-    // zome calls, so we attempt a full ham connect — but BOUNDED, since
-    // `HamConductor::connect` retries forever until shutdown and would hang the
-    // report collector on a down conductor. A timeout (or no app cell) degrades
-    // to the documented `false` report via the admin-only presence fallback.
-    let mut shutdown = ham::install_shutdown_handler();
     let budget = status_connect_budget();
-    let connected =
-        match tokio::time::timeout(budget, HamConductor::connect(cfg, &mut shutdown)).await {
+    if new_server_context {
+        // NEW-server status makes NO zome call at all: on a cell installed with
+        // migration `init_properties` the FIRST zome call — any zome call, the
+        // old-chain probe's `get_migration_close_state` included — drives `init`
+        // and opens the chain, which only the supervised open service may do
+        // (bounded + verified). So the new-chain question is answered read-only
+        // by a BOUNDED admin-only presence probe reporting the open service's
+        // persisted signal ([`crate::open::probe_for_status`]), and the
+        // old-chain question is not probed here either: the new cell holds no
+        // committed close (the probe could only ever read `NotClosed`), and the
+        // derivation below supplies the implied-true once the chain is open.
+        match tokio::time::timeout(budget, HamConductor::connect_admin_only(cfg)).await {
+            Ok(Ok(admin)) => {
+                match crate::open::probe_for_status(&admin, &cfg.app_id, persisted_new_chain_opened)
+                    .await
+                {
+                    Ok(opened) => state.new_chain_opened = opened,
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "new-chain probe failed"),
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "admin connect for the new-chain probe failed; reporting defaults");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    budget_ms = budget.as_millis() as u64,
+                    "status admin connect timed out; reporting defaults"
+                );
+            }
+        }
+    } else {
+        // CLOSE-side status: the old-chain probe is a zome call on the OLD cell
+        // (safe — that chain's `init` ran long ago), which needs the full ham
+        // connect. BOUNDED, since `HamConductor::connect` retries forever until
+        // shutdown and would hang the report collector on a down conductor; a
+        // timeout reads UNKNOWN, never a definitive "not closed".
+        let mut shutdown = ham::install_shutdown_handler();
+        let connect = HamConductor::connect(cfg, &mut shutdown);
+        let connected = match tokio::time::timeout(budget, connect).await {
             Ok(c) => c,
             Err(_elapsed) => {
                 tracing::warn!(
@@ -164,44 +219,18 @@ pub async fn run(cfg: &Config, params: Option<&StatusParams>) -> Result<State> {
                 None
             }
         };
-    match connected {
-        Some(conductor) => {
+        match connected {
             // Old-chain probe — TRI-STATE, so an unreachable / errored conductor
-            // reads UNKNOWN, never a definitive "not closed". On the close side
-            // this is the authoritative answer; on the new server the cell is on
-            // the new DNA (no committed close), so it reads `NotClosed` and the
-            // derivation below supplies the implied-true.
-            apply_closed_status(&mut state, probe_closed_status(&conductor).await);
-
-            // New-chain probe — ONLY in the new-server context. On the close side
-            // the conductor is the OLD conductor; if its old DNA itself arrived via
-            // a prior migration, `verify_if_migrated` returns true and would
+            // reads UNKNOWN, never a definitive "not closed". Close-side this is
+            // the authoritative answer. The new-chain probe never runs here: the
+            // conductor is the OLD conductor, and if its old DNA itself arrived
+            // via a prior migration a live "migrated?" read would return true and
             // falsely flip `new_chain_opened` (and, via the derivation, force
-            // `old_chain_closed = true` mid-close). So it never runs close-side.
-            if new_server_context {
-                match crate::open::probe_for_status(&conductor, &cfg.app_id).await {
-                    Ok(opened) => state.new_chain_opened = opened,
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "new-chain probe failed"),
-                }
+            // `old_chain_closed = true` mid-close).
+            Some(conductor) => {
+                apply_closed_status(&mut state, probe_closed_status(&conductor).await)
             }
-        }
-        None => {
-            // No reachable app cell (timed out, or no app yet). The old-chain probe
-            // could not run → UNKNOWN on the close side. On the new server, fall
-            // back to a bounded admin-only presence probe for the new-chain
-            // question (the open side before / after install).
-            if !new_server_context {
-                state.old_chain_closed_unknown = true;
-            }
-            if new_server_context {
-                if let Ok(Ok(admin)) =
-                    tokio::time::timeout(budget, HamConductor::connect_admin_only(cfg)).await
-                {
-                    if let Ok(opened) = crate::open::probe_for_status(&admin, &cfg.app_id).await {
-                        state.new_chain_opened = opened;
-                    }
-                }
-            }
+            None => state.old_chain_closed_unknown = true,
         }
     }
 
