@@ -509,7 +509,19 @@ async fn verify_after_open_with(
         Ok(l) => l,
         Err(e) => return OpenOutcome::Transient(e.context("reading new-chain ledger for verify")),
     };
-    let report: VerifyReport = verify_against_ledger(&package.payload.closing_state, &ledger);
+    let opened = match conductor.get_opened_agreement_state().await {
+        Ok(o) => o,
+        Err(e) => {
+            return OpenOutcome::Transient(
+                e.context("reading new-chain opened agreement state for verify"),
+            )
+        }
+    };
+    let mut report: VerifyReport = verify_against_ledger(&package.payload.closing_state, &ledger);
+    let (agreement_state_match, mut agreement_mismatches) =
+        crate::verify::verify_agreement_state(&package.payload.closing_state, opened.as_ref());
+    report.agreement_state_match = agreement_state_match;
+    report.mismatches.append(&mut agreement_mismatches);
     let passed = report.passed();
     persist(cfg, state, |s| {
         s.verify = Some(report.clone());

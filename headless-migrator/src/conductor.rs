@@ -105,6 +105,21 @@ pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
     })
 }
 
+/// The opened chain's committed migrated agreement state, as the DNA's
+/// `get_opened_agreement_state` extern returns it. A LOCAL mirror of
+/// `rave_engine`'s `OpenedAgreementState` (added after the 0.6.0 release this
+/// crate pins) — msgpack decodes by field name, so the shapes stay
+/// interchangeable; swap to the crate type at the next `rave_engine` bump.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenedAgreementState {
+    pub agent_pubkey: holo_hash::AgentPubKey,
+    pub source_dna_hash: DnaHash,
+    pub target_dna_hash: DnaHash,
+    /// Sorted predecessor `SmartAgreement` hashes; the count is `.len()` —
+    /// deliberately not a separate field (a disagreement channel).
+    pub agreement_hashes: Vec<holo_hash::ActionHash>,
+}
+
 #[async_trait]
 pub trait Conductor: Send + Sync {
     /// Lightweight liveness probe against the conductor's app cell.
@@ -152,6 +167,12 @@ pub trait Conductor: Send + Sync {
     /// which reads them and opens the chain — so it doubles as the open service's
     /// "drive `init`" step (no separate `migration_init` extern).
     async fn verify_if_migrated(&self) -> Result<bool>;
+
+    /// `transactor::get_opened_agreement_state` — the migrated agreement state
+    /// the new chain actually COMMITTED at open (`None` ⇒ this chain did not
+    /// migrate). The independent new-chain half of Verify's agreement
+    /// cross-check against the router-fetched close package.
+    async fn get_opened_agreement_state(&self) -> Result<Option<OpenedAgreementState>>;
 
     // ── Admin app-lifecycle (open-side) ──────────────────────────────────
 
@@ -307,6 +328,18 @@ impl Conductor for HamConductor {
             .call_zome(&self.role_name, "transactor", "verify_if_migrated", ())
             .await
             .context("verify_if_migrated zome call failed")
+    }
+
+    async fn get_opened_agreement_state(&self) -> Result<Option<OpenedAgreementState>> {
+        self.ham()?
+            .call_zome(
+                &self.role_name,
+                "transactor",
+                "get_opened_agreement_state",
+                (),
+            )
+            .await
+            .context("get_opened_agreement_state zome call failed")
     }
 
     async fn app_presence(&self, app_id: &str) -> Result<AppPresence> {

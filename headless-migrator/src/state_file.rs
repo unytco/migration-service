@@ -121,13 +121,20 @@ pub struct State {
 pub struct VerifyReport {
     pub balance_match: bool,
     pub carry_forward_units_match: bool,
+    /// The B49 cross-check: the new chain's COMMITTED agreement state (read
+    /// via `get_opened_agreement_state`) matches the fetched close package's
+    /// carry-forward section — count and per-agreement hashes. `serde(default)`
+    /// keeps pre-existing persisted reports decoding (they never had the
+    /// field; their latch was already sealed at write time).
+    #[serde(default)]
+    pub agreement_state_match: bool,
     /// Per-field human detail for any mismatch (empty ⇒ all matched).
     pub mismatches: Vec<String>,
 }
 
 impl VerifyReport {
     pub fn passed(&self) -> bool {
-        self.balance_match && self.carry_forward_units_match
+        self.balance_match && self.carry_forward_units_match && self.agreement_state_match
     }
 }
 

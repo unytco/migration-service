@@ -49,6 +49,9 @@ pub enum Call {
 /// queue consumed per call; absent scripts return a sensible default or error.
 #[derive(Default)]
 pub struct MockConductor {
+    /// Scripted response for `get_opened_agreement_state` (`None` ⇒ the chain
+    /// reports not-migrated — the safe default for mismatch-path tests).
+    pub opened_agreement_state: Mutex<Option<headless_migrator::conductor::OpenedAgreementState>>,
     pub calls: Mutex<Vec<Call>>,
     pub ledger: Mutex<Option<Ledger>>,
     pub drop_fees: Mutex<Option<anyhow::Result<String>>>,
@@ -144,6 +147,12 @@ impl Conductor for MockConductor {
     async fn verify_if_migrated(&self) -> anyhow::Result<bool> {
         self.record(Call::VerifyIfMigrated);
         Self::pop(&self.verify_migrated, "verify_if_migrated")
+    }
+
+    async fn get_opened_agreement_state(
+        &self,
+    ) -> anyhow::Result<Option<headless_migrator::conductor::OpenedAgreementState>> {
+        Ok(self.opened_agreement_state.lock().unwrap().clone())
     }
 
     async fn app_presence(&self, _app_id: &str) -> anyhow::Result<AppPresence> {

@@ -28,6 +28,7 @@ fn round_trips_through_disk() {
     state.verify = Some(VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec![],
     });
 
@@ -159,6 +160,7 @@ fn seed_from_persisted_carries_the_monotonic_latch_and_verify() {
     verified.verify = Some(VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec![],
     });
     verified.write(&path).unwrap();
@@ -240,6 +242,7 @@ fn verify_report_passed_requires_all_fields() {
     let mut r = VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec![],
     };
     assert!(r.passed());

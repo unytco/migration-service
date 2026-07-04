@@ -1,17 +1,20 @@
 //! `Verify` per-field comparison: a match passes; each field's mismatch is
-//! reported independently with a nonzero (failing) report. The comparison is
-//! over the two values the new chain recomputes independently of the carried
-//! package — balance and CFU; the carried agreement-state section is verified
-//! on-chain by `migration_init`, not here (so there is no count field to test).
+//! reported independently with a nonzero (failing) report. Balance and CFU
+//! compare the carried package against the ledger the new chain recomputes;
+//! the agreement section (B49) compares it against the new chain's COMMITTED
+//! opened state, read back through `get_opened_agreement_state`.
 
 mod support;
 
 use std::time::Duration;
 
+use headless_migrator::conductor::OpenedAgreementState;
 use headless_migrator::config::Config;
 use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{Phase, State, Step, VerifyReport};
-use headless_migrator::verify::{build_verify_state, verify_against_ledger};
+use headless_migrator::verify::{
+    build_verify_state, verify_against_ledger, verify_agreement_state,
+};
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
 use zfuel::fuel::ZFuel;
@@ -55,6 +58,7 @@ fn passing_report() -> VerifyReport {
     VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec![],
     }
 }
@@ -63,6 +67,7 @@ fn failing_report() -> VerifyReport {
     VerifyReport {
         balance_match: false,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec!["balance mismatch".into()],
     }
 }
@@ -143,12 +148,22 @@ async fn passing_verify_then_status_reports_safe_to_teardown() {
 }
 
 #[test]
-fn all_fields_match_passes() {
+fn ledger_halves_match_when_the_new_chain_mirrors_the_close() {
+    // `verify_against_ledger` is the ledger HALF only (B49): it matches
+    // balance + CFU and cannot see the agreement section, so it leaves
+    // `agreement_state_match` false for the caller (`fetch_and_compare`) to
+    // fill. A full `passed()` therefore needs the agreement cross-check too
+    // (see `agreement_state_cross_check`), so here we check the two ledger
+    // fields directly.
     let closing = summary_state(unit_map(0, 100), CarryForwardUnits::new(), 2);
-    // New-chain ledger mirrors the close: balance + CFU equal closing_*.
     let ledger = ledger(unit_map(0, 100), CarryForwardUnits::new(), ZFuel::zero());
     let report = verify_against_ledger(&closing, &ledger);
-    assert!(report.passed(), "all fields match: {:?}", report.mismatches);
+    assert!(report.balance_match, "balance: {:?}", report.mismatches);
+    assert!(
+        report.carry_forward_units_match,
+        "cfu: {:?}",
+        report.mismatches
+    );
     assert!(report.mismatches.is_empty());
 }
 
@@ -181,21 +196,20 @@ fn carry_forward_units_mismatch_is_reported() {
 }
 
 #[test]
-fn agreement_count_is_not_a_verify_field() {
-    // A close summary carrying any number of agreements still passes verify so
-    // long as balance + CFU match: the carry-forward section's integrity is the
-    // job of `migration_init`'s on-chain validator (notary signatures cover the
-    // whole payload, and the validator re-checks the section's structure), NOT a
-    // self-comparison here. This is the regression guard for the removed
-    // tautological `committed.len() == fetched.len()` check (which could never
-    // fail, since both lengths came from the one fetched package).
+fn ledger_half_alone_does_not_pass_without_the_agreement_cross_check() {
+    // B49 reversed the old "agreement count is not a verify field" stance:
+    // once `get_opened_agreement_state` exists the cross-check is a genuine
+    // two-source comparison, so the LEDGER half alone must NOT pass —
+    // `verify_against_ledger` leaves `agreement_state_match` false, and only
+    // `fetch_and_compare` (which reads the extern) can raise it. Regression
+    // guard against reverting to the balance+CFU-only pass.
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 3);
     let ledger = ledger(unit_map(0, 10), CarryForwardUnits::new(), ZFuel::zero());
     let report = verify_against_ledger(&closing, &ledger);
+    assert!(report.balance_match && report.carry_forward_units_match);
     assert!(
-        report.passed(),
-        "agreement count is not a verify field: {:?}",
-        report.mismatches
+        !report.passed(),
+        "the agreement cross-check is required for a full pass"
     );
 }
 
@@ -210,4 +224,61 @@ fn multiple_mismatches_all_reported() {
     assert!(!report.balance_match);
     assert!(!report.carry_forward_units_match);
     assert_eq!(report.mismatches.len(), 2);
+}
+
+/// B49 — the agreement cross-check: committed state matching the carried
+/// section passes; a count or hash divergence (and a not-migrated read) each
+/// fail with a named mismatch.
+#[test]
+fn agreement_state_cross_check() {
+    let closing = summary_state(unit_map(0, 5), CarryForwardUnits::new(), 2);
+    let mut carried: Vec<holo_hash::ActionHash> = closing
+        .agreement_carry_forward
+        .iter()
+        .map(|c| c.smart_agreement_hash.clone())
+        .collect();
+    carried.sort();
+
+    let matching = OpenedAgreementState {
+        agent_pubkey: agent(3),
+        source_dna_hash: dna(1),
+        target_dna_hash: dna(2),
+        agreement_hashes: carried.clone(),
+    };
+    let (ok, mismatches) = verify_agreement_state(&closing, Some(&matching));
+    assert!(ok, "matching committed state must pass: {mismatches:?}");
+
+    // A truncated committed section (the open somehow applied 1 of 2).
+    let truncated = OpenedAgreementState {
+        agreement_hashes: carried[..1].to_vec(),
+        ..matching.clone()
+    };
+    let (ok, mismatches) = verify_agreement_state(&closing, Some(&truncated));
+    assert!(!ok);
+    assert!(
+        mismatches.iter().any(|m| m.contains("agreement-count")),
+        "must name the count mismatch: {mismatches:?}"
+    );
+
+    // A count-preserving substitution still mismatches on the hash set.
+    let mut swapped_hashes = carried.clone();
+    swapped_hashes[0] = action_hash(200);
+    swapped_hashes.sort();
+    let swapped = OpenedAgreementState {
+        agreement_hashes: swapped_hashes,
+        ..matching.clone()
+    };
+    let (ok, mismatches) = verify_agreement_state(&closing, Some(&swapped));
+    assert!(!ok);
+    assert!(
+        mismatches.iter().any(|m| m.contains("agreement-hash")),
+        "must name the hash mismatch: {mismatches:?}"
+    );
+
+    // The new chain reporting not-migrated is a mismatch by definition.
+    let (ok, mismatches) = verify_agreement_state(&closing, None);
+    assert!(!ok);
+    assert!(mismatches
+        .iter()
+        .any(|m| m.contains("no opened agreement state")));
 }
