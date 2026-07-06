@@ -59,11 +59,12 @@ holochain_types = "=0.6.2-rc.0"
 hdi = "=0.7.2-rc.0"
 
 # Shared migration protocol + ledger types (SummaryStatePayload / NotarySignature /
-# SignClosingResponse / CommittedClose / MigrationInitRequest / Ledger). The same
-# published release notary-daemon pins — no git pins (see the spec's § Versioning).
-rave_engine = "0.6.0"
+# SignClosingResponse / CommittedClose / MigrationInitRequest / Ledger) plus the
+# OpenedAgreementState verify cross-check type — published release, no git pins
+# (see the spec's § Versioning).
+rave_engine = "0.7.0"
 # ZFuel — the ledger's `fees_owed` unit, for the close service's fee-owed probe
-# (same version rave_engine 0.6.0 resolves, so `ZFuel` is the identical type).
+# (the same version rave_engine resolves, so `ZFuel` is the identical type).
 zfuel = "0.6.2"
 
 [dev-dependencies]

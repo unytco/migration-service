@@ -44,7 +44,7 @@ hdi = "=0.7.2-rc.0"
 
 # Shared migration protocol types (ReadCloseResponse / NotarySignature /
 # SummaryStatePayload / SummaryState).
-rave_engine = "0.6.0"
+rave_engine = "0.7.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

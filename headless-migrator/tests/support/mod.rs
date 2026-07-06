@@ -221,6 +221,7 @@ pub fn summary_state(
                 smart_agreement_hash: action_hash(100 + i as u8),
                 last_execution_action_hash: action_hash(150 + i as u8),
                 carryover: serde_json::json!({ "i": i }),
+                locked: None,
             })
             .collect(),
     }
