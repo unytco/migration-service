@@ -519,7 +519,7 @@ async fn verify_after_open_with(
     };
     let mut report: VerifyReport = verify_against_ledger(&package.payload.closing_state, &ledger);
     let (agreement_state_match, mut agreement_mismatches) =
-        crate::verify::verify_agreement_state(&package.payload.closing_state, opened.as_ref());
+        crate::verify::verify_agreement_state(&package.payload, opened.as_ref());
     report.agreement_state_match = agreement_state_match;
     report.mismatches.append(&mut agreement_mismatches);
     let passed = report.passed();

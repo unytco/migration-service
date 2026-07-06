@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use holo_hash::DnaHashB64;
-use rave_engine::types::entries::migration::v0_1::SummaryState;
+use rave_engine::types::entries::migration::v0_1::{SummaryState, SummaryStatePayload};
 use rave_engine::types::ledger::Ledger;
 
 use crate::conductor::{Conductor, HamConductor, OpenedAgreementState};
@@ -69,15 +69,23 @@ pub fn verify_against_ledger(closing_state: &SummaryState, ledger: &Ledger) -> V
     }
 }
 
-/// The B49 cross-check: the fetched package's carry-forward section against
-/// the new chain's COMMITTED opened agreement state. Pure over its inputs.
-/// `opened == None` (chain reports not-migrated) is a mismatch by definition —
-/// a verify only runs against a chain the open service believes migrated.
+/// The B49 cross-check: the fetched package against the new chain's COMMITTED
+/// opened agreement state. Pure over its inputs. `opened == None` (chain
+/// reports not-migrated) is a mismatch by definition — a verify only runs
+/// against a chain the open service believes migrated.
+///
+/// Both the **migration identity** (agent + source/target DNA) and the carried
+/// agreement set must match. Identity is not optional: the agreement hash set
+/// alone can coincide across migrations, so without it a response for a
+/// different agent/source/target could pass and eventually raise
+/// `safe_to_teardown`. The identity tuple lives on the fetched
+/// `SummaryStatePayload`, so the whole payload is passed in.
 pub fn verify_agreement_state(
-    closing_state: &SummaryState,
+    payload: &SummaryStatePayload,
     opened: Option<&OpenedAgreementState>,
 ) -> (bool, Vec<String>) {
-    let mut carried: Vec<holo_hash::ActionHash> = closing_state
+    let mut carried: Vec<holo_hash::ActionHash> = payload
+        .closing_state
         .agreement_carry_forward
         .iter()
         .map(|c| c.smart_agreement_hash.clone())
@@ -90,6 +98,24 @@ pub fn verify_agreement_state(
         ),
         Some(o) => {
             let mut mismatches = Vec::new();
+            if o.agent_pubkey != payload.agent_pubkey {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened agent {:?} != close package agent {:?}",
+                    o.agent_pubkey, payload.agent_pubkey
+                ));
+            }
+            if o.source_dna_hash != payload.source_dna_hash {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened source DNA {:?} != close package source {:?}",
+                    o.source_dna_hash, payload.source_dna_hash
+                ));
+            }
+            if o.target_dna_hash != payload.target_dna_hash {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened target DNA {:?} != close package target {:?}",
+                    o.target_dna_hash, payload.target_dna_hash
+                ));
+            }
             if o.agreement_hashes.len() != carried.len() {
                 mismatches.push(format!(
                     "agreement-count mismatch: new chain committed {} != close package carried {}",
@@ -151,7 +177,7 @@ pub async fn fetch_and_compare(
         .context("reading new-chain opened agreement state for verify")?;
     let mut report = verify_against_ledger(&package.payload.closing_state, &ledger);
     let (agreement_state_match, mut agreement_mismatches) =
-        verify_agreement_state(&package.payload.closing_state, opened.as_ref());
+        verify_agreement_state(&package.payload, opened.as_ref());
     report.agreement_state_match = agreement_state_match;
     report.mismatches.append(&mut agreement_mismatches);
     Ok(Some(report))

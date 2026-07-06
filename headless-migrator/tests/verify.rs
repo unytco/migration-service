@@ -227,12 +227,16 @@ fn multiple_mismatches_all_reported() {
 }
 
 /// B49 — the agreement cross-check: committed state matching the carried
-/// section passes; a count or hash divergence (and a not-migrated read) each
-/// fail with a named mismatch.
+/// section AND the migration identity passes; a count/hash divergence, an
+/// identity mismatch, or a not-migrated read each fail with a named mismatch.
 #[test]
 fn agreement_state_cross_check() {
     let closing = summary_state(unit_map(0, 5), CarryForwardUnits::new(), 2);
-    let mut carried: Vec<holo_hash::ActionHash> = closing
+    // `payload(3, ..)` carries agent(3), source dna(1), target dna(2) — the
+    // identity the matching opened state below mirrors.
+    let package = payload(3, closing);
+    let mut carried: Vec<holo_hash::ActionHash> = package
+        .closing_state
         .agreement_carry_forward
         .iter()
         .map(|c| c.smart_agreement_hash.clone())
@@ -245,7 +249,7 @@ fn agreement_state_cross_check() {
         target_dna_hash: dna(2),
         agreement_hashes: carried.clone(),
     };
-    let (ok, mismatches) = verify_agreement_state(&closing, Some(&matching));
+    let (ok, mismatches) = verify_agreement_state(&package, Some(&matching));
     assert!(ok, "matching committed state must pass: {mismatches:?}");
 
     // A truncated committed section (the open somehow applied 1 of 2).
@@ -253,7 +257,7 @@ fn agreement_state_cross_check() {
         agreement_hashes: carried[..1].to_vec(),
         ..matching.clone()
     };
-    let (ok, mismatches) = verify_agreement_state(&closing, Some(&truncated));
+    let (ok, mismatches) = verify_agreement_state(&package, Some(&truncated));
     assert!(!ok);
     assert!(
         mismatches.iter().any(|m| m.contains("agreement-count")),
@@ -268,15 +272,40 @@ fn agreement_state_cross_check() {
         agreement_hashes: swapped_hashes,
         ..matching.clone()
     };
-    let (ok, mismatches) = verify_agreement_state(&closing, Some(&swapped));
+    let (ok, mismatches) = verify_agreement_state(&package, Some(&swapped));
     assert!(!ok);
     assert!(
         mismatches.iter().any(|m| m.contains("agreement-hash")),
         "must name the hash mismatch: {mismatches:?}"
     );
 
+    // IDENTITY mismatch: the SAME carried hash set but a different agent /
+    // source / target must NOT pass — otherwise a response for another
+    // migration could raise `safe_to_teardown`.
+    for wrong in [
+        OpenedAgreementState {
+            agent_pubkey: agent(9),
+            ..matching.clone()
+        },
+        OpenedAgreementState {
+            source_dna_hash: dna(7),
+            ..matching.clone()
+        },
+        OpenedAgreementState {
+            target_dna_hash: dna(7),
+            ..matching.clone()
+        },
+    ] {
+        let (ok, mismatches) = verify_agreement_state(&package, Some(&wrong));
+        assert!(!ok, "an identity mismatch must fail: {mismatches:?}");
+        assert!(
+            mismatches.iter().any(|m| m.contains("identity mismatch")),
+            "must name the identity mismatch: {mismatches:?}"
+        );
+    }
+
     // The new chain reporting not-migrated is a mismatch by definition.
-    let (ok, mismatches) = verify_agreement_state(&closing, None);
+    let (ok, mismatches) = verify_agreement_state(&package, None);
     assert!(!ok);
     assert!(mismatches
         .iter()
