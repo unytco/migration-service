@@ -2791,9 +2791,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rave_engine"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dffd83638146a1649e6fa13a6d39591b66851b6fe867270b113714eedd29bf7"
+checksum = "7dc10516ef205c1f5b858c4e92b567c792f575038d38da09ec00a0dea9122687"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",

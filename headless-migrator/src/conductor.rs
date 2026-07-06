@@ -106,19 +106,10 @@ pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
 }
 
 /// The opened chain's committed migrated agreement state, as the DNA's
-/// `get_opened_agreement_state` extern returns it. A LOCAL mirror of
-/// `rave_engine`'s `OpenedAgreementState` (added after the 0.6.0 release this
-/// crate pins) — msgpack decodes by field name, so the shapes stay
-/// interchangeable; swap to the crate type at the next `rave_engine` bump.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct OpenedAgreementState {
-    pub agent_pubkey: holo_hash::AgentPubKey,
-    pub source_dna_hash: DnaHash,
-    pub target_dna_hash: DnaHash,
-    /// Sorted predecessor `SmartAgreement` hashes; the count is `.len()` —
-    /// deliberately not a separate field (a disagreement channel).
-    pub agreement_hashes: Vec<holo_hash::ActionHash>,
-}
+/// `get_opened_agreement_state` extern returns it — re-exported from
+/// `rave_engine` under this module's path, so call sites read it as
+/// `conductor::OpenedAgreementState`.
+pub use rave_engine::types::entries::migration::v0_1::OpenedAgreementState;
 
 #[async_trait]
 pub trait Conductor: Send + Sync {
