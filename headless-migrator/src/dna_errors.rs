@@ -1,29 +1,56 @@
-//! The migration error-substring contract, in ONE place.
+//! The migration error contract, in ONE place — typed code first, substring
+//! fallback second.
 //!
-//! `rave_engine 0.6.0` now carries a typed `MigrationError` enum that renders a
-//! machine-extractable `[MIGERR:<CODE>]` prefix, but this classifier still keys
-//! off the English message text (and the router returns a string `code`), so a
-//! rejected `init` / `get_migration_close_state` is matched by **substring** —
-//! fragile: a DNA reword silently reclassifies unless the token stays stable.
+//! `rave_engine`'s `MigrationError` renders a machine-extractable
+//! `[MIGERR:<CODE>]` prefix on every DNA-side migration verdict, and
+//! `MigrationError::from_rendered` recovers the variant from a
+//! conductor-wrapped string. Every classifier below matches **the code, not
+//! the English text**, so a validator message reword can never silently
+//! reclassify. The substring tables remain only as the fallback for the
+//! surfaces that carry no tag:
 //!
-//! To keep that fragility auditable, every substring the close service, open
-//! service, and package fetch key off lives here as one table, next to the
-//! exact validator/router source it mirrors — rather than three lists drifting
-//! apart across `open.rs`, `probe.rs`, and `fetch.rs`. The substrings below are
-//! copied from:
-//!   * the alliance integrity `validate_opening_state_summary` +
-//!     `verify_notary_threshold` + `validate_carry_forward_structure`
-//!     (`dnas/alliance/zomes/integrity/transactor/src/entries/migration/`),
-//!   * the coordinator's `chain_already_migrated` double-migration guard
-//!     (`.../coordinator/transactor/src/migration/open.rs`),
-//!   * the alliance `get_migration_close_state` close-state messages, and
-//!   * the router's wire error codes (`migration-service/router`).
+//!   * the coordinator's untagged too-early wrapper ("Could not resolve a
+//!     successor GlobalDefinition at init") + the GD lookup's "No Global
+//!     Definition found" (`.../progenitor_calls/global_definition.rs`),
+//!   * transport / conductor errors that never came from a validator, and
+//!   * the router's wire error codes (`migration-service/router`) — a separate
+//!     string namespace that shares this home, unchanged.
 //!
-//! BACKLOG: `rave_engine`'s `MigrationError` already exposes stable
-//! `[MIGERR:<CODE>]` codes (`crates/rave_engine/.../migration/error.rs`, with a
-//! `from_rendered` parser); adopt them here — match the code, not the English
-//! text — so a validator message reword can't silently reclassify. Until then,
-//! any change to a validator message MUST be mirrored here.
+//! Any change to an UNTAGGED message must still be mirrored here; tagged
+//! messages may reword freely.
+
+use rave_engine::types::entries::migration::MigrationError;
+
+/// Map a typed DNA migration error to the open service's class. Exhaustive on
+/// purpose: a future variant fails compilation here instead of drifting into a
+/// default. Close-side codes cannot legitimately surface from an `init` — an
+/// anomaly is a HARD stop (fail loud), never an unbounded retry.
+fn init_class_of(code: MigrationError) -> InitErrorClass {
+    use MigrationError::*;
+    match code {
+        OpeningSummaryUpdateForbidden
+        | KeyDoesNotMatchNotarizedAgent
+        | TargetDnaMismatch
+        | CarryForwardMalformed
+        | SourceNotAcceptedPredecessor
+        | MigrationDisabled
+        | DuplicateNotarySigner
+        | SelfNotarizedClose
+        | NotaryNotConfigured
+        | SignatureDoesNotVerify
+        | NotaryThresholdNotMet => InitErrorClass::HardFailure,
+        AlreadyMigrated => InitErrorClass::AlreadyMigrated,
+        NonFreshChain => InitErrorClass::NonFreshChain,
+        ClosingSummaryUpdateForbidden
+        | CloseAuthorMismatch
+        | CloseSourceDnaMismatch
+        | StaleClose
+        | CloseTargetNotUpgradeTarget
+        | CloseSummaryMismatch
+        | NoClosingSummary
+        | NoCloseChainAction => InitErrorClass::HardFailure,
+    }
+}
 
 /// How a failed open (`init`) should be handled by the open service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +88,9 @@ pub enum InitErrorClass {
 /// fallthrough — so an unfixable verdict is never mistaken for a transient blip
 /// (which would retry forever on, e.g., a wrong carried key).
 pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
+    if let Some(code) = MigrationError::from_rendered(rendered) {
+        return init_class_of(code);
+    }
     let r = rendered.to_lowercase();
     if is_migration_init_hard_failure(&r) {
         InitErrorClass::HardFailure
@@ -146,6 +176,9 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
 /// forever). Mirrors M13's two strings; lowercased internally so the caller may
 /// pass the raw rendered error.
 pub fn is_close_target_hard_failure(rendered: &str) -> bool {
+    if let Some(code) = MigrationError::from_rendered(rendered) {
+        return code == MigrationError::CloseTargetNotUpgradeTarget;
+    }
     let r = rendered.to_lowercase();
     // `prepare_closing_summary` pre-check: "target DNA {:?} is not in this network's upgrade_targets".
     r.contains("is not in this network's upgrade_targets")
@@ -170,6 +203,11 @@ pub enum CloseErrorClass {
 /// `"no CloseChain action found on chain"` contract is the alliance close
 /// surface's; an open chain says `"No closing state summary found"`.
 pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
+    match MigrationError::from_rendered(rendered) {
+        Some(MigrationError::NoCloseChainAction) => return CloseErrorClass::PartialClose,
+        Some(_) => return CloseErrorClass::Open,
+        None => {}
+    }
     if rendered.contains("no CloseChain action found") {
         CloseErrorClass::PartialClose
     } else {
@@ -188,6 +226,12 @@ pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
 /// keys off: `"No closing state summary found"` (plain open) and
 /// `"no CloseChain action found on chain"` (partial close).
 pub fn is_recognized_close_state_response(rendered: &str) -> bool {
+    if let Some(code) = MigrationError::from_rendered(rendered) {
+        return matches!(
+            code,
+            MigrationError::NoClosingSummary | MigrationError::NoCloseChainAction
+        );
+    }
     rendered.contains("No closing state summary found")
         || rendered.contains("no CloseChain action found")
 }
@@ -243,6 +287,50 @@ pub fn router_code_is_retryable(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_codes_classify_regardless_of_wording() {
+        // The point of the typed contract: the English may reword freely, the
+        // code still classifies (the old substring matching silently fell to
+        // Transient on any reword).
+        assert_eq!(
+            classify_migration_init_error("Guest(\"[MIGERR:MIG_KEY_MISMATCH] totally reworded\")"),
+            InitErrorClass::HardFailure
+        );
+        assert_eq!(
+            classify_migration_init_error("[MIGERR:MIG_NON_FRESH_CHAIN] anything at all"),
+            InitErrorClass::NonFreshChain
+        );
+        assert_eq!(
+            classify_migration_init_error("[MIGERR:MIG_ALREADY_MIGRATED] whatever"),
+            InitErrorClass::AlreadyMigrated
+        );
+    }
+
+    #[test]
+    fn typed_close_codes_drive_the_close_classifiers() {
+        assert!(is_close_target_hard_failure(
+            "[MIGERR:MIG_CLOSE_TARGET_NOT_UPGRADE_TARGET] reworded entirely"
+        ));
+        // A recognized non-target tag answers definitively: not a target fault.
+        assert!(!is_close_target_hard_failure(
+            "[MIGERR:MIG_STALE_CLOSE] the chain moved"
+        ));
+        assert_eq!(
+            classify_close_error("[MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] partial close"),
+            CloseErrorClass::PartialClose
+        );
+        assert_eq!(
+            classify_close_error("[MIGERR:MIG_NO_CLOSING_SUMMARY] open chain"),
+            CloseErrorClass::Open
+        );
+        assert!(is_recognized_close_state_response(
+            "[MIGERR:MIG_NO_CLOSING_SUMMARY] x"
+        ));
+        assert!(!is_recognized_close_state_response(
+            "[MIGERR:MIG_STALE_CLOSE] x"
+        ));
+    }
 
     #[test]
     fn close_target_faults_are_hard_failures() {

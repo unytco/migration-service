@@ -76,6 +76,7 @@ fn seed_verified_open(path: &std::path::Path) {
     s.verify = Some(VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
+        agreement_state_match: true,
         mismatches: vec![],
     });
     s.write(path).unwrap();

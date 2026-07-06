@@ -4,34 +4,26 @@
 //! exit. The comparison is a pure function over its inputs so it is unit-tested
 //! without a conductor.
 //!
-//! ## Why there is no agreement-state cross-check here
+//! ## The agreement-state cross-check (B49)
 //!
-//! The carry-forward section's integrity is enforced **on-chain, not by this
-//! verify**. The M-of-N notary signatures are made over the whole
-//! `SummaryStatePayload` (which embeds `agreement_carry_forward`), and the new
-//! DNA's `migration_init` validator re-checks both those signatures and the
-//! section's structure (size cap + unique keys) at author time — so a section
-//! truncated or tampered with between fetch and open does not produce a
-//! mismatched-count chain to verify against: it fails `migration_init` itself
-//! with an `Invalid` verdict the open service surfaces as a hard failure (see
-//! [`crate::open::classify_migration_init_error`]). The only post-open
-//! cross-check this module can make is against values the new-chain ledger
-//! recomputes independently — balance and CFU — which the new chain opened
-//! with as its *opening* state. A counting `committed.len() == fetched.len()`
-//! guard would be a self-comparison (both lengths come from the one fetched
-//! package), so it is deliberately absent: a guard that can never fail is false
-//! assurance. (A new-chain extern exposing the *opened* agreement state would
-//! let this module add a genuine independent count cross-check — noted as a
-//! DNA-owner backlog item.)
+//! The carry-forward section's integrity is enforced on-chain (the notary
+//! signatures cover the whole `SummaryStatePayload`, and the open validator
+//! re-checks signatures + structure at author time). What verify adds is an
+//! INDEPENDENT two-source comparison: the router-fetched close package on one
+//! side, and what the new chain actually COMMITTED on the other, read back
+//! through the DNA's `get_opened_agreement_state` extern — count and
+//! per-agreement hashes both. (A count taken from the fetched package alone
+//! compared a value against itself and was deliberately absent until the
+//! extern existed.)
 
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use holo_hash::DnaHashB64;
-use rave_engine::types::entries::migration::v0_1::SummaryState;
+use rave_engine::types::entries::migration::v0_1::{SummaryState, SummaryStatePayload};
 use rave_engine::types::ledger::Ledger;
 
-use crate::conductor::{Conductor, HamConductor};
+use crate::conductor::{Conductor, HamConductor, OpenedAgreementState};
 use crate::config::Config;
 use crate::fetch::{self, FetchOutcome};
 use crate::state_file::{Phase, State, Step, VerifyReport};
@@ -70,7 +62,75 @@ pub fn verify_against_ledger(closing_state: &SummaryState, ledger: &Ledger) -> V
     VerifyReport {
         balance_match,
         carry_forward_units_match,
+        // The ledger halves can't see the agreement section; the caller fills
+        // this from `verify_agreement_state` (fetch_and_compare does both).
+        agreement_state_match: false,
         mismatches,
+    }
+}
+
+/// The B49 cross-check: the fetched package against the new chain's COMMITTED
+/// opened agreement state. Pure over its inputs. `opened == None` (chain
+/// reports not-migrated) is a mismatch by definition — a verify only runs
+/// against a chain the open service believes migrated.
+///
+/// Both the **migration identity** (agent + source/target DNA) and the carried
+/// agreement set must match. Identity is not optional: the agreement hash set
+/// alone can coincide across migrations, so without it a response for a
+/// different agent/source/target could pass and eventually raise
+/// `safe_to_teardown`. The identity tuple lives on the fetched
+/// `SummaryStatePayload`, so the whole payload is passed in.
+pub fn verify_agreement_state(
+    payload: &SummaryStatePayload,
+    opened: Option<&OpenedAgreementState>,
+) -> (bool, Vec<String>) {
+    let mut carried: Vec<holo_hash::ActionHash> = payload
+        .closing_state
+        .agreement_carry_forward
+        .iter()
+        .map(|c| c.smart_agreement_hash.clone())
+        .collect();
+    carried.sort();
+    match opened {
+        None => (
+            false,
+            vec!["agreement-state mismatch: the new chain reports no opened agreement state (chain not migrated?)".to_string()],
+        ),
+        Some(o) => {
+            let mut mismatches = Vec::new();
+            if o.agent_pubkey != payload.agent_pubkey {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened agent {:?} != close package agent {:?}",
+                    o.agent_pubkey, payload.agent_pubkey
+                ));
+            }
+            if o.source_dna_hash != payload.source_dna_hash {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened source DNA {:?} != close package source {:?}",
+                    o.source_dna_hash, payload.source_dna_hash
+                ));
+            }
+            if o.target_dna_hash != payload.target_dna_hash {
+                mismatches.push(format!(
+                    "agreement-state identity mismatch: opened target DNA {:?} != close package target {:?}",
+                    o.target_dna_hash, payload.target_dna_hash
+                ));
+            }
+            if o.agreement_hashes.len() != carried.len() {
+                mismatches.push(format!(
+                    "agreement-count mismatch: new chain committed {} != close package carried {}",
+                    o.agreement_hashes.len(),
+                    carried.len()
+                ));
+            }
+            if o.agreement_hashes != carried {
+                mismatches.push(format!(
+                    "agreement-hash mismatch: new chain committed {:?} != close package carried {:?}",
+                    o.agreement_hashes, carried
+                ));
+            }
+            (mismatches.is_empty(), mismatches)
+        }
     }
 }
 
@@ -111,10 +171,16 @@ pub async fn fetch_and_compare(
         .get_ledger()
         .await
         .context("reading new-chain ledger for verify")?;
-    Ok(Some(verify_against_ledger(
-        &package.payload.closing_state,
-        &ledger,
-    )))
+    let opened = conductor
+        .get_opened_agreement_state()
+        .await
+        .context("reading new-chain opened agreement state for verify")?;
+    let mut report = verify_against_ledger(&package.payload.closing_state, &ledger);
+    let (agreement_state_match, mut agreement_mismatches) =
+        verify_agreement_state(&package.payload, opened.as_ref());
+    report.agreement_state_match = agreement_state_match;
+    report.mismatches.append(&mut agreement_mismatches);
+    Ok(Some(report))
 }
 
 /// Build the [`State`] record the standalone `Verify` command persists from its
