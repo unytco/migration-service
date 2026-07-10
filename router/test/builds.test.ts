@@ -1,0 +1,128 @@
+import { describe, expect, it } from "vitest";
+import {
+  compareVersions,
+  lineageOf,
+  lineageOfReleaseUrl,
+  newestOnLineage,
+  publishedBuilds,
+  type Build,
+  type CacheLike,
+} from "../src/builds";
+import type { Env, FetchLike } from "../src/notary";
+
+const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
+
+const jsonResp = (status: number, b: unknown) =>
+  new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+
+const releasesResp = (rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>) =>
+  jsonResp(
+    200,
+    rels.map((r) => ({
+      tag_name: r.tag,
+      draft: r.draft ?? false,
+      prerelease: r.prerelease ?? false,
+      html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
+    })),
+  );
+
+const ghFetch = (make: () => Response): FetchLike => (async () => make()) as FetchLike;
+
+describe("lineageOf", () => {
+  it("takes major.minor from full, short, and v-prefixed versions", () => {
+    expect(lineageOf("0.93.0")).toBe("0.93");
+    expect(lineageOf("0.93")).toBe("0.93");
+    expect(lineageOf("v0.93.1")).toBe("0.93");
+    expect(lineageOf(" 1.4.2 ")).toBe("1.4");
+  });
+  it("is null for unparseable / empty / nullish", () => {
+    expect(lineageOf("nightly")).toBeNull();
+    expect(lineageOf("")).toBeNull();
+    expect(lineageOf(null)).toBeNull();
+    expect(lineageOf(undefined)).toBeNull();
+  });
+});
+
+describe("lineageOfReleaseUrl", () => {
+  it("parses the lineage from a release-tag URL", () => {
+    expect(lineageOfReleaseUrl("https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0")).toBe("0.2");
+  });
+  it("is null for a non-tag URL or nullish", () => {
+    expect(lineageOfReleaseUrl("https://example/b")).toBeNull();
+    expect(lineageOfReleaseUrl(undefined)).toBeNull();
+  });
+});
+
+describe("compareVersions", () => {
+  it("orders by major, then minor, then patch", () => {
+    expect(compareVersions("0.3.2", "0.3.1")).toBeGreaterThan(0);
+    expect(compareVersions("0.3.1", "0.3.2")).toBeLessThan(0);
+    expect(compareVersions("1.0.0", "0.9.9")).toBeGreaterThan(0);
+    expect(compareVersions("0.3.0", "0.3.0")).toBe(0);
+  });
+});
+
+describe("newestOnLineage", () => {
+  const builds: Build[] = [
+    { version: "0.3.1", release_url: "u1" },
+    { version: "0.3.4", release_url: "u2" },
+    { version: "0.2.9", release_url: "u3" },
+  ];
+  it("returns the highest patch on the lineage", () => {
+    expect(newestOnLineage(builds, "0.3")).toEqual({ version: "0.3.4", release_url: "u2" });
+  });
+  it("is null when nothing is on the lineage or the lineage is null", () => {
+    expect(newestOnLineage(builds, "0.9")).toBeNull();
+    expect(newestOnLineage(builds, null)).toBeNull();
+  });
+});
+
+describe("publishedBuilds", () => {
+  it("keeps only published, anchored tags (drops draft, pre-release, rc, and garbage)", async () => {
+    const fetch = ghFetch(() =>
+      releasesResp([
+        { tag: "v0.3.4" },
+        { tag: "v0.3.3", draft: true },
+        { tag: "v0.3.2", prerelease: true },
+        { tag: "v0.3.1-rc.2" },
+        { tag: "nightly" },
+      ]),
+    );
+    const builds = await publishedBuilds(fetch, ENV);
+    expect(builds).toEqual([
+      { version: "0.3.4", release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.4" },
+    ]);
+  });
+
+  it("returns [] on a non-2xx upstream (never throws)", async () => {
+    expect(await publishedBuilds(ghFetch(() => jsonResp(403, {})), ENV)).toEqual([]);
+  });
+
+  it("returns [] when the upstream fetch throws", async () => {
+    const boom = (async () => {
+      throw new TypeError("down");
+    }) as FetchLike;
+    expect(await publishedBuilds(boom, ENV)).toEqual([]);
+  });
+
+  it("serves a cache hit without fetching, and populates the cache on a miss", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls++;
+      return releasesResp([{ tag: "v0.3.1" }]);
+    }) as FetchLike;
+    const store = new Map<string, Build[]>();
+    const cache: CacheLike = {
+      async get(k) {
+        return store.get(k) ?? null;
+      },
+      async set(k, v) {
+        store.set(k, v);
+      },
+    };
+    const first = await publishedBuilds(fetch, ENV, cache);
+    const second = await publishedBuilds(fetch, ENV, cache);
+    expect(calls).toBe(1);
+    expect(second).toEqual(first);
+  });
+});

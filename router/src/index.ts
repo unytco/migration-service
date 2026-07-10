@@ -10,6 +10,7 @@ import { Registry, type RawRegistry } from "./registry";
 import { errorJson } from "./errors";
 import type { Env } from "./notary";
 import { healthz, migrate, migrationOptions, updateCheck, type MigrateBody } from "./handlers";
+import { cfCache } from "./builds";
 
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
@@ -56,7 +57,19 @@ export default {
         return withCors(migrationOptions(registry, url.searchParams.get("to_dna_hash")));
       }
       if (request.method === "GET" && pathname === "/v1/update-check") {
-        return withCors(updateCheck(registry, url.searchParams.get("current_dna_hash")));
+        // The Cache API lives only in the Worker runtime; in the node unit env it's absent, so the
+        // shield is simply skipped (correctness is unchanged — it only bounds GitHub traffic).
+        const buildCache = typeof caches !== "undefined" ? cfCache(caches.default) : undefined;
+        return withCors(
+          await updateCheck(
+            registry,
+            url.searchParams.get("current_dna_hash"),
+            url.searchParams.get("app_version"),
+            fetch,
+            env,
+            buildCache,
+          ),
+        );
       }
       if (request.method === "POST" && pathname === "/v1/migrate") {
         let body: MigrateBody;
