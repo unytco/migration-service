@@ -7,7 +7,11 @@
 
 import type { Env, FetchLike } from "./notary";
 
-const RELEASES_URL = "https://api.github.com/repos/unytco/unyt-sandbox/releases?per_page=100";
+const RELEASES_API = "https://api.github.com/repos/unytco/unyt-sandbox/releases";
+const PER_PAGE = 100;
+/** Safety bound on the release scan: 10 pages = 1000 releases. Logged if ever hit — beyond it an
+ * older lineage's newest build could be missed (raise it, or add a read-only token + wider scan). */
+const MAX_PAGES = 10;
 /** Synthetic cache key (the Cache API keys on a URL). One listing covers every lineage, so a
  * single fetch per period serves them all — comfortably inside GitHub's unauthenticated limit. */
 const CACHE_KEY = "https://migration-router.internal/gh/unyt-sandbox/releases";
@@ -72,32 +76,50 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
     const hit = await cache.get(CACHE_KEY).catch(() => null);
     if (hit) return hit;
   }
-  let raw: unknown;
-  try {
-    const headers: Record<string, string> = {
-      accept: "application/vnd.github+json",
-      "user-agent": "unyt-migration-router",
-    };
-    // Optional read-only token — the escape hatch that raises the rate ceiling if the live-lineage
-    // count ever grows. Unauthenticated by default.
-    if (env.GITHUB_TOKEN) headers.authorization = `Bearer ${env.GITHUB_TOKEN}`;
-    const resp = await fetchImpl(RELEASES_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    if (!resp.ok) return [];
-    raw = await resp.json();
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(raw)) return [];
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "unyt-migration-router",
+  };
+  // Optional read-only token — the escape hatch that raises the rate ceiling if the live-lineage
+  // count ever grows. Unauthenticated by default.
+  if (env.GITHUB_TOKEN) headers.authorization = `Bearer ${env.GITHUB_TOKEN}`;
+
+  // Paginate the WHOLE release history. GitHub orders releases newest-first ACROSS the repo, so the
+  // newest build of an OLDER-but-still-supported lineage can sit past page 1 once the history grows —
+  // reading only page 1 would silently drop its latest_build. A page-1 failure yields [] (no build
+  // axis); a later-page failure returns what we have so far (best-effort). Bounded by MAX_PAGES; the
+  // whole result is cached, so this costs at most MAX_PAGES requests per lineage-independent period.
   const builds: Build[] = [];
-  for (const r of raw as GhRelease[]) {
-    // Pre-release filtered explicitly; a draft is absent from an unauthenticated listing by
-    // construction, and filtered here too so a read-only token can't leak one.
-    if (r.draft === true || r.prerelease === true) continue;
-    const tag = typeof r.tag_name === "string" ? r.tag_name : "";
-    if (!TAG_RE.test(tag)) continue;
-    const url = typeof r.html_url === "string" ? r.html_url : "";
-    if (!url) continue;
-    builds.push({ version: tag.slice(1), release_url: url });
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    let batch: unknown;
+    try {
+      const resp = await fetchImpl(`${RELEASES_API}?per_page=${PER_PAGE}&page=${page}`, {
+        headers,
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!resp.ok) return page === 1 ? [] : builds;
+      batch = await resp.json();
+    } catch {
+      return page === 1 ? [] : builds;
+    }
+    if (!Array.isArray(batch)) return page === 1 ? [] : builds;
+    const releases = batch as GhRelease[];
+    for (const r of releases) {
+      // Pre-release filtered explicitly; a draft is absent from an unauthenticated listing by
+      // construction, and filtered here too so a read-only token can't leak one.
+      if (r.draft === true || r.prerelease === true) continue;
+      const tag = typeof r.tag_name === "string" ? r.tag_name : "";
+      if (!TAG_RE.test(tag)) continue;
+      const url = typeof r.html_url === "string" ? r.html_url : "";
+      if (!url) continue;
+      builds.push({ version: tag.slice(1), release_url: url });
+    }
+    if (releases.length < PER_PAGE) break; // last page reached
+    if (page === MAX_PAGES) {
+      console.warn(
+        `migration-router: GitHub release scan hit the ${MAX_PAGES}-page cap; an older lineage's latest_build may be missing`
+      );
+    }
   }
   if (cache) await cache.set(CACHE_KEY, builds, CACHE_TTL_SECONDS).catch(() => {});
   return builds;

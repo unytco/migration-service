@@ -94,6 +94,21 @@ describe("publishedBuilds", () => {
     ]);
   });
 
+  it("paginates past the first page so an older lineage's newest build isn't lost", async () => {
+    // Page 1 = 100 newest releases, all on lineage 0.95 (a full page → a page 2 exists). Page 2 =
+    // the older 0.93 lineage's builds. Reading only page 1 would drop 0.93's latest_build entirely.
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ tag: `v0.95.${i}` }));
+    const page2 = [{ tag: "v0.93.7" }, { tag: "v0.93.6" }];
+    const fetch = (async (input: RequestInfo | URL) => {
+      const u = typeof input === "string" ? input : input.toString();
+      const page = /[?&]page=(\d+)/.exec(u)?.[1] ?? "1";
+      return releasesResp(page === "1" ? page1 : page === "2" ? page2 : []);
+    }) as FetchLike;
+    const builds = await publishedBuilds(fetch, ENV);
+    expect(newestOnLineage(builds, "0.95")?.version).toBe("0.95.99");
+    expect(newestOnLineage(builds, "0.93")?.version).toBe("0.93.7"); // found on page 2
+  });
+
   it("returns [] on a non-2xx upstream (never throws)", async () => {
     expect(await publishedBuilds(ghFetch(() => jsonResp(403, {})), ENV)).toEqual([]);
   });
