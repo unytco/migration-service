@@ -113,6 +113,26 @@ describe("publishedBuilds", () => {
     expect(await publishedBuilds(ghFetch(() => jsonResp(403, {})), ENV)).toEqual([]);
   });
 
+  it("negative-caches [] briefly on a total failure so a GitHub outage isn't re-hit every poll", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls++;
+      return jsonResp(503, {});
+    }) as FetchLike;
+    const store = new Map<string, Build[]>();
+    const cache: CacheLike = {
+      async get(k) {
+        return store.get(k) ?? null;
+      },
+      async set(k, v) {
+        store.set(k, v);
+      },
+    };
+    expect(await publishedBuilds(fetch, ENV, cache)).toEqual([]);
+    expect(await publishedBuilds(fetch, ENV, cache)).toEqual([]); // served from the negative cache
+    expect(calls).toBe(1); // GitHub hit once, not on every call
+  });
+
   it("returns [] when the upstream fetch throws", async () => {
     const boom = (async () => {
       throw new TypeError("down");

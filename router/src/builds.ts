@@ -12,6 +12,9 @@ const PER_PAGE = 100;
 /** Safety bound on the release scan: 10 pages = 1000 releases. Logged if ever hit — beyond it an
  * older lineage's newest build could be missed (raise it, or add a read-only token + wider scan). */
 const MAX_PAGES = 10;
+/** Brief negative cache: on a total upstream failure, hold [] this long so a GitHub outage isn't
+ * re-hit on every poll (a genuine recovery is picked up on the next period). */
+const FAIL_CACHE_TTL_SECONDS = 30;
 /** Synthetic cache key (the Cache API keys on a URL). One listing covers every lineage, so a
  * single fetch per period serves them all — comfortably inside GitHub's unauthenticated limit. */
 const CACHE_KEY = "https://migration-router.internal/gh/unyt-sandbox/releases";
@@ -90,6 +93,12 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
   // axis); a later-page failure returns what we have so far (best-effort). Bounded by MAX_PAGES; the
   // whole result is cached, so this costs at most MAX_PAGES requests per lineage-independent period.
   const builds: Build[] = [];
+  // On a TOTAL failure (page 1, nothing collected) briefly negative-cache [] so a GitHub outage isn't
+  // re-hit on every poll; a later-page failure keeps the partial scan without caching (next retries).
+  const bail = async (page: number): Promise<Build[]> => {
+    if (page === 1 && cache) await cache.set(CACHE_KEY, [], FAIL_CACHE_TTL_SECONDS).catch(() => {});
+    return page === 1 ? [] : builds;
+  };
   for (let page = 1; page <= MAX_PAGES; page++) {
     let batch: unknown;
     try {
@@ -97,12 +106,12 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
         headers,
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
-      if (!resp.ok) return page === 1 ? [] : builds;
+      if (!resp.ok) return bail(page);
       batch = await resp.json();
     } catch {
-      return page === 1 ? [] : builds;
+      return bail(page);
     }
-    if (!Array.isArray(batch)) return page === 1 ? [] : builds;
+    if (!Array.isArray(batch)) return bail(page);
     const releases = batch as GhRelease[];
     for (const r of releases) {
       // Pre-release filtered explicitly; a draft is absent from an unauthenticated listing by
