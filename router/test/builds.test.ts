@@ -133,6 +133,32 @@ describe("publishedBuilds", () => {
     expect(calls).toBe(1); // GitHub hit once, not on every call
   });
 
+  it("brief-caches the PARTIAL scan on a persistent later-page failure (earlier pages not re-hit)", async () => {
+    let calls = 0;
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ tag: `v0.95.${i}` }));
+    const fetch = (async (input: RequestInfo | URL) => {
+      calls++;
+      const u = typeof input === "string" ? input : input.toString();
+      const page = /[?&]page=(\d+)/.exec(u)?.[1] ?? "1";
+      return page === "1" ? releasesResp(page1) : jsonResp(503, {}); // page 2 persistently fails
+    }) as FetchLike;
+    const store = new Map<string, Build[]>();
+    const cache: CacheLike = {
+      async get(k) {
+        return store.get(k) ?? null;
+      },
+      async set(k, v) {
+        store.set(k, v);
+      },
+    };
+    const first = await publishedBuilds(fetch, ENV, cache); // page 1 ok, page 2 fails → partial
+    expect(newestOnLineage(first, "0.95")?.version).toBe("0.95.99");
+    const afterFirst = calls; // page 1 + page 2
+    const second = await publishedBuilds(fetch, ENV, cache); // served from the partial cache
+    expect(second).toEqual(first);
+    expect(calls).toBe(afterFirst); // no re-fetch — earlier pages not re-requested
+  });
+
   it("returns [] when the upstream fetch throws", async () => {
     const boom = (async () => {
       throw new TypeError("down");

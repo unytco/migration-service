@@ -93,11 +93,14 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
   // axis); a later-page failure returns what we have so far (best-effort). Bounded by MAX_PAGES; the
   // whole result is cached, so this costs at most MAX_PAGES requests per lineage-independent period.
   const builds: Build[] = [];
-  // On a TOTAL failure (page 1, nothing collected) briefly negative-cache [] so a GitHub outage isn't
-  // re-hit on every poll; a later-page failure keeps the partial scan without caching (next retries).
+  // Brief negative cache on ANY upstream failure so a persistent outage — page 1 OR a later page —
+  // isn't re-hit every poll. Page 1 → []; a later page → the partial scan so far (rather than re-
+  // requesting the earlier pages each period). Held only FAIL_CACHE_TTL, so a recovered page is
+  // picked up on the next period.
   const bail = async (page: number): Promise<Build[]> => {
-    if (page === 1 && cache) await cache.set(CACHE_KEY, [], FAIL_CACHE_TTL_SECONDS).catch(() => {});
-    return page === 1 ? [] : builds;
+    const result = page === 1 ? [] : builds;
+    if (cache) await cache.set(CACHE_KEY, result, FAIL_CACHE_TTL_SECONDS).catch(() => {});
+    return result;
   };
   for (let page = 1; page <= MAX_PAGES; page++) {
     let batch: unknown;
