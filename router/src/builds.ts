@@ -7,7 +7,8 @@
 
 import type { Env, FetchLike } from "./notary";
 
-const RELEASES_API = "https://api.github.com/repos/unytco/unyt-sandbox/releases";
+const RELEASES_API =
+  "https://api.github.com/repos/unytco/unyt-sandbox/releases";
 const PER_PAGE = 100;
 /** Safety bound on the release scan: 10 pages = 1000 releases. Logged if ever hit — beyond it an
  * older lineage's newest build could be missed (raise it, or add a read-only token + wider scan). */
@@ -21,11 +22,21 @@ const CACHE_KEY = "https://migration-router.internal/gh/unyt-sandbox/releases";
 const CACHE_TTL_SECONDS = 600; // 10-min shield; Cache API is per-colo, so this bound is per-datacenter.
 const FETCH_TIMEOUT_MS = 10_000;
 
+/** A downloadable installer attached to a release — the raw material for the in-app same-lineage
+ * updater (release-patterns task 07). `url` is GitHub's `browser_download_url`, under the release repo
+ * so it passes the app's download allowlist; the app matches its platform's installer by `name`. */
+export interface BuildAsset {
+  name: string;
+  url: string;
+}
+
 /** A published build on a lineage. `version` is bare semver ("0.93.2"); `release_url` is the
- * release page — always under the release repo, so it passes the app's download allowlist. */
+ * release page — always under the release repo, so it passes the app's download allowlist.
+ * `assets` are the release's downloadable installers (absent on old test fixtures → treated as []). */
 export interface Build {
   version: string;
   release_url: string;
+  assets?: BuildAsset[];
 }
 
 /** Rate-shield seam over the Worker Cache API: production wraps `caches.default` (`cfCache`),
@@ -47,7 +58,9 @@ export function lineageOf(version: string | null | undefined): string | null {
 }
 
 /** major.minor parsed from a registry release-tag URL (".../releases/tag/v0.2.0" → "0.2"); null if none. */
-export function lineageOfReleaseUrl(url: string | null | undefined): string | null {
+export function lineageOfReleaseUrl(
+  url: string | null | undefined,
+): string | null {
   if (!url) return null;
   const m = /\/releases\/tag\/(v\d+\.\d+\.\d+)/.exec(url);
   return m ? lineageOf(m[1]) : null;
@@ -69,12 +82,17 @@ interface GhRelease {
   draft?: boolean;
   prerelease?: boolean;
   html_url?: string;
+  assets?: { name?: string; browser_download_url?: string }[];
 }
 
 /** Fetch + filter GitHub's releases to PUBLISHED builds (not draft, not pre-release, tag exactly
  * `vMAJOR.MINOR.PATCH`). Returns [] on any upstream failure — never throws, so the caller's
  * migration answer is always produced. Cached across requests when a cache is provided. */
-export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: CacheLike): Promise<Build[]> {
+export async function publishedBuilds(
+  fetchImpl: FetchLike,
+  env: Env,
+  cache?: CacheLike,
+): Promise<Build[]> {
   if (cache) {
     const hit = await cache.get(CACHE_KEY).catch(() => null);
     if (hit) return hit;
@@ -99,16 +117,22 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
   // picked up on the next period.
   const bail = async (page: number): Promise<Build[]> => {
     const result = page === 1 ? [] : builds;
-    if (cache) await cache.set(CACHE_KEY, result, FAIL_CACHE_TTL_SECONDS).catch(() => {});
+    if (cache)
+      await cache
+        .set(CACHE_KEY, result, FAIL_CACHE_TTL_SECONDS)
+        .catch(() => {});
     return result;
   };
   for (let page = 1; page <= MAX_PAGES; page++) {
     let batch: unknown;
     try {
-      const resp = await fetchImpl(`${RELEASES_API}?per_page=${PER_PAGE}&page=${page}`, {
-        headers,
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
+      const resp = await fetchImpl(
+        `${RELEASES_API}?per_page=${PER_PAGE}&page=${page}`,
+        {
+          headers,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        },
+      );
       if (!resp.ok) return bail(page);
       batch = await resp.json();
     } catch {
@@ -124,21 +148,35 @@ export async function publishedBuilds(fetchImpl: FetchLike, env: Env, cache?: Ca
       if (!TAG_RE.test(tag)) continue;
       const url = typeof r.html_url === "string" ? r.html_url : "";
       if (!url) continue;
-      builds.push({ version: tag.slice(1), release_url: url });
+      // Carry the release's downloadable installers for the in-app updater. Only well-formed entries
+      // (a name + a browser_download_url) survive; the app still validates each URL against its allowlist.
+      const assets: BuildAsset[] = Array.isArray(r.assets)
+        ? r.assets.flatMap((a) =>
+            typeof a?.name === "string" &&
+            typeof a?.browser_download_url === "string"
+              ? [{ name: a.name, url: a.browser_download_url }]
+              : [],
+          )
+        : [];
+      builds.push({ version: tag.slice(1), release_url: url, assets });
     }
     if (releases.length < PER_PAGE) break; // last page reached
     if (page === MAX_PAGES) {
       console.warn(
-        `migration-router: GitHub release scan hit the ${MAX_PAGES}-page cap; an older lineage's latest_build may be missing`
+        `migration-router: GitHub release scan hit the ${MAX_PAGES}-page cap; an older lineage's latest_build may be missing`,
       );
     }
   }
-  if (cache) await cache.set(CACHE_KEY, builds, CACHE_TTL_SECONDS).catch(() => {});
+  if (cache)
+    await cache.set(CACHE_KEY, builds, CACHE_TTL_SECONDS).catch(() => {});
   return builds;
 }
 
 /** Newest published build on `lineage` (major.minor), or null when none qualifies. */
-export function newestOnLineage(builds: readonly Build[], lineage: string | null): Build | null {
+export function newestOnLineage(
+  builds: readonly Build[],
+  lineage: string | null,
+): Build | null {
   if (!lineage) return null;
   let best: Build | null = null;
   for (const b of builds) {
@@ -163,7 +201,10 @@ export function cfCache(cache: Cache): CacheLike {
     },
     async set(key, value, ttlSeconds) {
       const resp = new Response(JSON.stringify(value), {
-        headers: { "content-type": "application/json", "cache-control": `max-age=${ttlSeconds}` },
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `max-age=${ttlSeconds}`,
+        },
       });
       await cache.put(new Request(key), resp);
     },

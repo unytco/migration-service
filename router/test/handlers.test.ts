@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
-import { migrate, migrationOptions, shuffled, updateCheck, type MigrateBody } from "../src/handlers";
+import {
+  migrate,
+  migrationOptions,
+  shuffled,
+  updateCheck,
+  type MigrateBody,
+} from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
 import type { Build, CacheLike } from "../src/builds";
 
@@ -35,7 +41,8 @@ function registry(): Registry {
         version: "alliance-v0.2.0",
         upgrades_from: v01,
         upgrade_targets: [v03],
-        release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+        release_url:
+          "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
         notaries: [{ url: "https://n2", api: "v1" }],
       },
       {
@@ -64,13 +71,20 @@ function mockFetch(byOrigin: Record<string, () => Response>): FetchLike {
  * `sourceDna` to `targetDna` (the close's single-landing target). */
 const packageResp = (sourceDna: string, targetDna: string, marker: string) =>
   jsonResp(200, {
-    payload: { source_dna_hash: sourceDna, target_dna_hash: targetDna, closing_state: {} },
+    payload: {
+      source_dna_hash: sourceDna,
+      target_dna_hash: targetDna,
+      closing_state: {},
+    },
     notary_signatures: [{ notary: "uhCAk_notary", signature: marker }],
     close_action: `close-${marker}`,
   });
 
 const jsonResp = (status: number, body: unknown) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 
 async function body(resp: Response): Promise<any> {
   return resp.json();
@@ -130,7 +144,9 @@ describe("migrationOptions", () => {
 });
 
 // A GitHub releases listing (newest-first). draft/prerelease/rc entries prove the filter.
-const ghReleases = (rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>) =>
+const ghReleases = (
+  rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>,
+) =>
   jsonResp(
     200,
     rels.map((r) => ({
@@ -168,7 +184,12 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
     const r = Registry.load({
       version: 1,
       dnas: [
-        { dna_hash: a, version: "a", upgrade_targets: [bDna], notaries: [{ url: "https://na", api: "v1" }] },
+        {
+          dna_hash: a,
+          version: "a",
+          upgrade_targets: [bDna],
+          notaries: [{ url: "https://na", api: "v1" }],
+        },
         {
           dna_hash: bDna,
           version: "b",
@@ -179,7 +200,11 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
       ],
     });
     const resp = await body(await updateCheck(r, a, null, noGh, ENV));
-    expect(resp.target).toEqual({ to_dna_hash: bDna, to_version: "b", release_url: "https://example/b" });
+    expect(resp.target).toEqual({
+      to_dna_hash: bDna,
+      to_version: "b",
+      release_url: "https://example/b",
+    });
   });
 
   it("chain tip has no upgrade", async () => {
@@ -188,8 +213,13 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
   });
 
   it("unknown current DNA has no upgrade", async () => {
-    const b = await body(await updateCheck(registry(), "uhC0k_unknown", null, noGh, ENV));
-    expect(b).toEqual({ current_dna_hash: "uhC0k_unknown", has_upgrade: false });
+    const b = await body(
+      await updateCheck(registry(), "uhC0k_unknown", null, noGh, ENV),
+    );
+    expect(b).toEqual({
+      current_dna_hash: "uhC0k_unknown",
+      has_upgrade: false,
+    });
   });
 
   it("missing current_dna_hash errors", async () => {
@@ -199,19 +229,26 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
   });
 
   it("an unparseable app_version is treated as absent (no GitHub call, no build axis)", async () => {
-    const b = await body(await updateCheck(registry(), v03, "nightly", noGh, ENV));
+    const b = await body(
+      await updateCheck(registry(), v03, "nightly", noGh, ENV),
+    );
     expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
   });
 });
 
 describe("updateCheck — build axis (app_version present)", () => {
   it("reports the newest published build on the caller's lineage as latest_build", async () => {
-    const fetch = ghFetch(() => ghReleases([{ tag: "v0.3.2" }, { tag: "v0.3.1" }, { tag: "v0.2.9" }]));
-    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    const fetch = ghFetch(() =>
+      ghReleases([{ tag: "v0.3.2" }, { tag: "v0.3.1" }, { tag: "v0.2.9" }]),
+    );
+    const b = await body(
+      await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
+    );
     expect(b.has_upgrade).toBe(false); // v03 is the chain tip
     expect(b.latest_build).toEqual({
       version: "0.3.2",
       release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.2",
+      assets: [],
     });
   });
 
@@ -224,13 +261,17 @@ describe("updateCheck — build axis (app_version present)", () => {
         { tag: "v0.3.5" },
       ]),
     );
-    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    const b = await body(
+      await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
+    );
     expect(b.latest_build.version).toBe("0.3.5");
   });
 
   it("omits latest_build when the caller's lineage has no published build (never falsy)", async () => {
     const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }]));
-    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    const b = await body(
+      await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
+    );
     expect(b.has_upgrade).toBe(false);
     expect("latest_build" in b).toBe(false);
   });
@@ -241,20 +282,30 @@ describe("updateCheck — build axis (app_version present)", () => {
     const r = Registry.load({
       version: 1,
       dnas: [
-        { dna_hash: from, version: "from", upgrade_targets: [to], notaries: [{ url: "https://nf", api: "v1" }] },
+        {
+          dna_hash: from,
+          version: "from",
+          upgrade_targets: [to],
+          notaries: [{ url: "https://nf", api: "v1" }],
+        },
         {
           dna_hash: to,
           version: "to",
           upgrades_from: from,
-          release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          release_url:
+            "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],
     });
-    const fetch = ghFetch(() => ghReleases([{ tag: "v0.5.3" }, { tag: "v0.5.0" }]));
+    const fetch = ghFetch(() =>
+      ghReleases([{ tag: "v0.5.3" }, { tag: "v0.5.0" }]),
+    );
     const b = await body(await updateCheck(r, from, "0.5.0", fetch, ENV));
     expect(b.has_upgrade).toBe(true);
-    expect(b.target.release_url).toBe("https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.3");
+    expect(b.target.release_url).toBe(
+      "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.3",
+    );
     expect(b.latest_build.version).toBe("0.5.3"); // caller is also on 0.5
   });
 
@@ -264,19 +315,27 @@ describe("updateCheck — build axis (app_version present)", () => {
     const r = Registry.load({
       version: 1,
       dnas: [
-        { dna_hash: from, version: "from", upgrade_targets: [to], notaries: [{ url: "https://nf", api: "v1" }] },
+        {
+          dna_hash: from,
+          version: "from",
+          upgrade_targets: [to],
+          notaries: [{ url: "https://nf", api: "v1" }],
+        },
         {
           dna_hash: to,
           version: "to",
           upgrades_from: from,
-          release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          release_url:
+            "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],
     });
     const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }])); // nothing on 0.5
     const b = await body(await updateCheck(r, from, "0.9.0", fetch, ENV));
-    expect(b.target.release_url).toBe("https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0");
+    expect(b.target.release_url).toBe(
+      "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+    );
   });
 
   it("keeps the migration answer and omits latest_build when GitHub is unreachable (still 2xx)", async () => {
@@ -332,21 +391,39 @@ describe("migrate — pair validation", () => {
   }
 
   it("rejects unknown to_dna", async () => {
-    expect(await migrateWith({ from_dna_hash: v01, to_dna_hash: "x", agent_pubkey: AGENT })).toEqual({
+    expect(
+      await migrateWith({
+        from_dna_hash: v01,
+        to_dna_hash: "x",
+        agent_pubkey: AGENT,
+      }),
+    ).toEqual({
       status: 400,
       code: "unknown_to_dna",
     });
   });
 
   it("rejects unknown from_dna", async () => {
-    expect(await migrateWith({ from_dna_hash: "x", to_dna_hash: v02, agent_pubkey: AGENT })).toEqual({
+    expect(
+      await migrateWith({
+        from_dna_hash: "x",
+        to_dna_hash: v02,
+        agent_pubkey: AGENT,
+      }),
+    ).toEqual({
       status: 400,
       code: "unknown_from_dna",
     });
   });
 
   it("rejects chain root as to_dna", async () => {
-    expect(await migrateWith({ from_dna_hash: v01, to_dna_hash: v01, agent_pubkey: AGENT })).toEqual({
+    expect(
+      await migrateWith({
+        from_dna_hash: v01,
+        to_dna_hash: v01,
+        agent_pubkey: AGENT,
+      }),
+    ).toEqual({
       status: 400,
       code: "to_is_chain_root",
     });
@@ -361,18 +438,33 @@ describe("migrate — pair validation", () => {
       version: 1,
       dnas: [
         { dna_hash: x, version: "x", upgrade_targets: [y], notaries: [] },
-        { dna_hash: y, version: "y", upgrades_from: x, upgrade_targets: [z], notaries: [] },
+        {
+          dna_hash: y,
+          version: "y",
+          upgrades_from: x,
+          upgrade_targets: [z],
+          notaries: [],
+        },
         { dna_hash: z, version: "z", upgrades_from: y, notaries: [] },
       ],
     });
-    const resp = await migrate(r, { from_dna_hash: x, to_dna_hash: z, agent_pubkey: AGENT }, ENV, noFetch);
+    const resp = await migrate(
+      r,
+      { from_dna_hash: x, to_dna_hash: z, agent_pubkey: AGENT },
+      ENV,
+      noFetch,
+    );
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("unreachable_target");
   });
 });
 
 describe("migrate — notary dispatch + failover", () => {
-  const goodPair = { from_dna_hash: v01, to_dna_hash: v02, agent_pubkey: AGENT };
+  const goodPair = {
+    from_dna_hash: v01,
+    to_dna_hash: v02,
+    agent_pubkey: AGENT,
+  };
 
   it("returns the three-field package verbatim from a healthy notary", async () => {
     const f = mockFetch({
@@ -384,7 +476,11 @@ describe("migrate — notary dispatch + failover", () => {
     const b = await body(resp);
     expect(resp.status).toBe(200);
     expect(b).toEqual({
-      payload: { source_dna_hash: v01, target_dna_hash: v02, closing_state: {} },
+      payload: {
+        source_dna_hash: v01,
+        target_dna_hash: v02,
+        closing_state: {},
+      },
       notary_signatures: [{ notary: "uhCAk_notary", signature: "sig-a" }],
       close_action: "close-sig-a",
     });
@@ -414,17 +510,22 @@ describe("migrate — notary dispatch + failover", () => {
 
   it("fails over to the next notary when the first errors transiently", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
       "https://n1b": () => packageResp(v01, v02, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    const b = await body(
+      await migrate(registry(), goodPair, ENV, f, KEEP_ORDER),
+    );
     expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 
   it("all notaries unable_to_verify → 503 unable_to_verify", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
-      "https://n1b": () => jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
+      "https://n1b": () =>
+        jsonResp(500, { error: { code: "unable_to_verify", message: "x" } }),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     expect(resp.status).toBe(503);
@@ -441,7 +542,8 @@ describe("migrate — notary dispatch + failover", () => {
   it("hard stop (no_close_found) propagates immediately without trying the next", async () => {
     let n1bCalled = false;
     const f = mockFetch({
-      "https://n1a": () => jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
       "https://n1b": () => {
         n1bCalled = true;
         return packageResp(v01, v02, "should-not-be-used");
@@ -456,7 +558,8 @@ describe("migrate — notary dispatch + failover", () => {
   it("hard stop (warranted) propagates immediately without trying the next", async () => {
     let n1bCalled = false;
     const f = mockFetch({
-      "https://n1a": () => jsonResp(422, { error: { code: "warranted", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(422, { error: { code: "warranted", message: "x" } }),
       "https://n1b": () => {
         n1bCalled = true;
         return packageResp(v01, v02, "should-not-be-used");
@@ -473,8 +576,10 @@ describe("migrate — notary dispatch + failover", () => {
   // into a generic outage, and a single unable_to_verify wins the aggregate.
   it("all notaries auth_failed → 502 auth_failed (distinct, not unable_to_verify)", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
-      "https://n1b": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+      "https://n1b": () =>
+        jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     expect(resp.status).toBe(502);
@@ -483,8 +588,10 @@ describe("migrate — notary dispatch + failover", () => {
 
   it("all notaries rate_limited → 503 rate_limited (distinct, not unable_to_verify)", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
-      "https://n1b": () => jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
+      "https://n1b": () =>
+        jsonResp(429, { error: { code: "rate_limited", message: "x" } }),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     expect(resp.status).toBe(503);
@@ -493,8 +600,10 @@ describe("migrate — notary dispatch + failover", () => {
 
   it("auth_failed then unable_to_verify aggregates to 503 unable_to_verify", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
-      "https://n1b": () => jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }),
+      "https://n1a": () =>
+        jsonResp(401, { error: { code: "auth_failed", message: "x" } }),
+      "https://n1b": () =>
+        jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     expect(resp.status).toBe(503);
@@ -506,7 +615,10 @@ describe("migrate — notary dispatch + failover", () => {
   it("daemon bad_request hard-stops without trying the next notary", async () => {
     let n1bCalled = false;
     const f = mockFetch({
-      "https://n1a": () => jsonResp(400, { error: { code: "bad_request", message: "bad pubkey" } }),
+      "https://n1a": () =>
+        jsonResp(400, {
+          error: { code: "bad_request", message: "bad pubkey" },
+        }),
       "https://n1b": () => {
         n1bCalled = true;
         return packageResp(v01, v02, "should-not-be-used");
@@ -544,7 +656,12 @@ describe("migrate — notary dispatch + failover", () => {
       "https://n1b": () => packageResp(v02, v03, "wrong-cell"),
       "https://n2": () => packageResp(v02, v03, "real"),
     });
-    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    const resp = await migrate(
+      registry(),
+      { to_dna_hash: v03, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
     expect(resp.status).toBe(200);
     expect((await body(resp)).notary_signatures[0].signature).toBe("real");
   });
@@ -556,7 +673,12 @@ describe("migrate — notary dispatch + failover", () => {
       "https://n1b": () => packageResp(v02, v03, "x"),
       "https://n2": () => packageResp(v03, v03, "x"), // queried as v02 → mismatch
     });
-    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    const resp = await migrate(
+      registry(),
+      { to_dna_hash: v03, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
     expect(resp.status).toBe(500);
     const b = await body(resp);
     expect(b.error.code).toBe("internal");
@@ -570,10 +692,20 @@ describe("migrate — notary dispatch + failover", () => {
       version: 1,
       dnas: [
         { dna_hash: v01, version: "v1", upgrade_targets: [v02], notaries: [] },
-        { dna_hash: v02, version: "v2", upgrades_from: v01, notaries: [{ url: "https://n2", api: "v1" }] },
+        {
+          dna_hash: v02,
+          version: "v2",
+          upgrades_from: v01,
+          notaries: [{ url: "https://n2", api: "v1" }],
+        },
       ],
     };
-    const resp = await migrate(Registry.load(raw), { to_dna_hash: v02, agent_pubkey: AGENT }, ENV, mockFetch({}));
+    const resp = await migrate(
+      Registry.load(raw),
+      { to_dna_hash: v02, agent_pubkey: AGENT },
+      ENV,
+      mockFetch({}),
+    );
     expect(resp.status).toBe(500);
     expect((await body(resp)).error.code).toBe("internal");
   });
@@ -581,8 +713,10 @@ describe("migrate — notary dispatch + failover", () => {
   // A daemon internal error must surface AS `internal`, not be masked as an outage.
   it("all notaries return a daemon internal error → 500 internal (not all_orgs_unhealthy)", async () => {
     const f = mockFetch({
-      "https://n1a": () => jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
-      "https://n1b": () => jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
+      "https://n1a": () =>
+        jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
+      "https://n1b": () =>
+        jsonResp(500, { error: { code: "internal", message: "daemon boom" } }),
     });
     const resp = await migrate(registry(), goodPair, ENV, f);
     expect(resp.status).toBe(500);
@@ -610,9 +744,15 @@ describe("migrate — notary dispatch + failover", () => {
     const f = mockFetch({
       "https://n1a": () => packageResp(v02, v03, "x"), // v01 queried → source mismatch → internal
       "https://n1b": () => packageResp(v02, v03, "x"),
-      "https://n2": () => jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }), // v02 transient
+      "https://n2": () =>
+        jsonResp(503, { error: { code: "unable_to_verify", message: "x" } }), // v02 transient
     });
-    const resp = await migrate(registry(), { to_dna_hash: v03, agent_pubkey: AGENT }, ENV, f);
+    const resp = await migrate(
+      registry(),
+      { to_dna_hash: v03, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
     expect(resp.status).toBe(500);
     const b = await body(resp);
     expect(b.error.code).toBe("internal");
@@ -637,10 +777,15 @@ describe("migrate — notary dispatch + failover", () => {
   it("malformed 200 body fails over to the next notary", async () => {
     const f = mockFetch({
       "https://n1a": () =>
-        new Response("not json{", { status: 200, headers: { "content-type": "application/json" } }),
+        new Response("not json{", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
       "https://n1b": () => packageResp(v01, v02, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    const b = await body(
+      await migrate(registry(), goodPair, ENV, f, KEEP_ORDER),
+    );
     expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 
@@ -652,17 +797,25 @@ describe("migrate — notary dispatch + failover", () => {
       "https://n1a": () => jsonResp(200, { payload: { dna_hash: v01 } }), // no signatures/close_action
       "https://n1b": () => packageResp(v01, v02, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    const b = await body(
+      await migrate(registry(), goodPair, ENV, f, KEEP_ORDER),
+    );
     expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 
   it("200 body with null package fields fails over to the next notary", async () => {
     const f = mockFetch({
       "https://n1a": () =>
-        jsonResp(200, { payload: null, notary_signatures: null, close_action: null }),
+        jsonResp(200, {
+          payload: null,
+          notary_signatures: null,
+          close_action: null,
+        }),
       "https://n1b": () => packageResp(v01, v02, "sig-b"),
     });
-    const b = await body(await migrate(registry(), goodPair, ENV, f, KEEP_ORDER));
+    const b = await body(
+      await migrate(registry(), goodPair, ENV, f, KEEP_ORDER),
+    );
     expect(b.notary_signatures[0].signature).toBe("sig-b");
   });
 });
@@ -689,9 +842,16 @@ describe("migrate — skip routing + discovery", () => {
     const f = mockFetch({
       "https://n1a": () => packageResp(v01, v03, "found"),
       "https://n1b": () => packageResp(v01, v03, "found"),
-      "https://n2": () => jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
+      "https://n2": () =>
+        jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
     });
-    const resp = await migrate(registry(), skipPair(undefined, v03), ENV, f, KEEP_ORDER);
+    const resp = await migrate(
+      registry(),
+      skipPair(undefined, v03),
+      ENV,
+      f,
+      KEEP_ORDER,
+    );
     expect(resp.status).toBe(200);
     expect((await body(resp)).close_action).toBe("close-found");
   });
@@ -702,9 +862,16 @@ describe("migrate — skip routing + discovery", () => {
     const f = mockFetch({
       "https://n1a": () => packageResp(v01, v02, "stale"),
       "https://n1b": () => packageResp(v01, v02, "stale"),
-      "https://n2": () => jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
+      "https://n2": () =>
+        jsonResp(404, { error: { code: "no_close_found", message: "x" } }),
     });
-    const resp = await migrate(registry(), skipPair(undefined, v03), ENV, f, KEEP_ORDER);
+    const resp = await migrate(
+      registry(),
+      skipPair(undefined, v03),
+      ENV,
+      f,
+      KEEP_ORDER,
+    );
     expect(resp.status).toBe(404);
     expect((await body(resp)).error.code).toBe("no_close_found");
   });
@@ -716,10 +883,20 @@ describe("migrate — skip routing + discovery", () => {
       version: 1,
       dnas: [
         { dna_hash: base, version: "base", notaries: [] },
-        { dna_hash: island, version: "island", upgrades_from: base, notaries: [] },
+        {
+          dna_hash: island,
+          version: "island",
+          upgrades_from: base,
+          notaries: [],
+        },
       ],
     });
-    const resp = await migrate(r, skipPair(undefined, island), ENV, mockFetch({}));
+    const resp = await migrate(
+      r,
+      skipPair(undefined, island),
+      ENV,
+      mockFetch({}),
+    );
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("unreachable_target");
   });
@@ -727,7 +904,12 @@ describe("migrate — skip routing + discovery", () => {
 
 describe("migrate — request validation (B6)", () => {
   it("missing required fields → 400 bad_request", async () => {
-    const resp = await migrate(registry(), { from_dna_hash: v01 }, ENV, mockFetch({}));
+    const resp = await migrate(
+      registry(),
+      { from_dna_hash: v01 },
+      ENV,
+      mockFetch({}),
+    );
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("bad_request");
   });
