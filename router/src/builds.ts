@@ -24,10 +24,17 @@ const FETCH_TIMEOUT_MS = 10_000;
 
 /** A downloadable installer attached to a release — the raw material for the in-app same-lineage
  * updater (release-patterns task 07). `url` is GitHub's `browser_download_url`, under the release repo
- * so it passes the app's download allowlist; the app matches its platform's installer by `name`. */
+ * so it passes the app's download allowlist; the app matches its platform's installer by `name`. The
+ * router stays platform-agnostic — it has no business knowing a `.dmg` from a `.deb`.
+ *
+ * `digest` (GitHub's `"sha256:<hex>"`, absent on older releases) lets the app catch a truncated or
+ * corrupt download before handing an installer to the OS. It is NOT a defense against a compromised
+ * release: it rides this same response, so whoever can swap the asset can swap the digest. Its value is
+ * on Linux (`.deb`/`.AppImage`), where no OS signature check sits behind us. */
 export interface BuildAsset {
   name: string;
   url: string;
+  digest?: string;
 }
 
 /** A published build on a lineage. `version` is bare semver ("0.93.2"); `release_url` is the
@@ -82,7 +89,7 @@ interface GhRelease {
   draft?: boolean;
   prerelease?: boolean;
   html_url?: string;
-  assets?: { name?: string; browser_download_url?: string }[];
+  assets?: { name?: string; browser_download_url?: string; digest?: string }[];
 }
 
 /** Fetch + filter GitHub's releases to PUBLISHED builds (not draft, not pre-release, tag exactly
@@ -154,7 +161,16 @@ export async function publishedBuilds(
         ? r.assets.flatMap((a) =>
             typeof a?.name === "string" &&
             typeof a?.browser_download_url === "string"
-              ? [{ name: a.name, url: a.browser_download_url }]
+              ? [
+                  {
+                    name: a.name,
+                    url: a.browser_download_url,
+                    // Carried when GitHub supplies it; older releases have none.
+                    ...(typeof a.digest === "string" && a.digest
+                      ? { digest: a.digest }
+                      : {}),
+                  },
+                ]
               : [],
           )
         : [];

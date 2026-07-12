@@ -145,7 +145,12 @@ describe("migrationOptions", () => {
 
 // A GitHub releases listing (newest-first). draft/prerelease/rc entries prove the filter.
 const ghReleases = (
-  rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>,
+  rels: Array<{
+    tag: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    assets?: Array<{ name: string; url: string; digest?: string }>;
+  }>,
 ) =>
   jsonResp(
     200,
@@ -154,6 +159,11 @@ const ghReleases = (
       draft: r.draft ?? false,
       prerelease: r.prerelease ?? false,
       html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
+      assets: (r.assets ?? []).map((a) => ({
+        name: a.name,
+        browser_download_url: a.url,
+        ...(a.digest ? { digest: a.digest } : {}),
+      })),
     })),
   );
 
@@ -249,6 +259,32 @@ describe("updateCheck — build axis (app_version present)", () => {
       version: "0.3.2",
       release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.2",
       assets: [],
+    });
+  });
+
+  it("carries the release's installers (name + url + digest) through latest_build on the wire", async () => {
+    // Pins the cross-service contract end to end, not just in the parser: this response IS what the app's
+    // in-app updater consumes to pick its platform's installer, so the wire shape is asserted here.
+    const dmg = {
+      name: "unyt_0.3.2_full-arc_aarch64_darwin.dmg",
+      url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.3.2/unyt_0.3.2_full-arc_aarch64_darwin.dmg",
+      digest: "sha256:abc123",
+    };
+    const deb = {
+      name: "unyt_0.3.2_full-arc_x86_64_linux.deb",
+      url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.3.2/unyt_0.3.2_full-arc_x86_64_linux.deb",
+    };
+    const fetch = ghFetch(() =>
+      ghReleases([{ tag: "v0.3.2", assets: [dmg, deb] }, { tag: "v0.3.1" }]),
+    );
+    const b = await body(
+      await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
+    );
+    expect(b.latest_build).toEqual({
+      version: "0.3.2",
+      release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.2",
+      // Platform-agnostic: every installer is passed through, and the app selects its own.
+      assets: [dmg, deb],
     });
   });
 

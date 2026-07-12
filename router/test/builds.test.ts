@@ -23,7 +23,7 @@ const releasesResp = (
     tag: string;
     draft?: boolean;
     prerelease?: boolean;
-    assets?: Array<{ name: string; url: string }>;
+    assets?: Array<{ name: string; url: string; digest?: string }>;
   }>,
 ) =>
   jsonResp(
@@ -36,6 +36,7 @@ const releasesResp = (
       assets: (r.assets ?? []).map((a) => ({
         name: a.name,
         browser_download_url: a.url,
+        ...(a.digest ? { digest: a.digest } : {}),
       })),
     })),
   );
@@ -253,6 +254,42 @@ describe("publishedBuilds", () => {
       {
         name: "unyt_0.93.2_x64.dmg",
         url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/unyt_0.93.2_x64.dmg",
+      },
+    ]);
+  });
+
+  it("carries GitHub's asset digest when present, and omits it when absent", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() =>
+        releasesResp([
+          {
+            tag: "v0.93.2",
+            assets: [
+              {
+                name: "signed.deb",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/signed.deb",
+                digest: "sha256:deadbeef",
+              },
+              {
+                name: "older.deb",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/older.deb",
+              },
+            ],
+          },
+        ]),
+      ),
+      ENV,
+    );
+    expect(builds[0].assets).toEqual([
+      {
+        name: "signed.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/signed.deb",
+        digest: "sha256:deadbeef",
+      },
+      // No digest on the release → the field is simply absent (the app then skips verification).
+      {
+        name: "older.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/older.deb",
       },
     ]);
   });
