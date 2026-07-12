@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
 import { migrate, migrationOptions, shuffled, updateCheck, type MigrateBody } from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
+import type { Build, CacheLike } from "../src/builds";
 
 const v01 = "uhC0k_v01";
 const v02 = "uhC0k_v02";
@@ -128,9 +129,32 @@ describe("migrationOptions", () => {
   });
 });
 
-describe("updateCheck", () => {
+// A GitHub releases listing (newest-first). draft/prerelease/rc entries prove the filter.
+const ghReleases = (rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>) =>
+  jsonResp(
+    200,
+    rels.map((r) => ({
+      tag_name: r.tag,
+      draft: r.draft ?? false,
+      prerelease: r.prerelease ?? false,
+      html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
+    })),
+  );
+
+/** A fetch that answers only api.github.com (via `make`) and throws for anything else. */
+function ghFetch(make: () => Response): FetchLike {
+  return (async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.startsWith("https://api.github.com")) return make();
+    throw new TypeError(`network error: no mock for ${url}`);
+  }) as FetchLike;
+}
+
+describe("updateCheck — migration axis (no app_version → unchanged, no GitHub call)", () => {
+  const noGh = mockFetch({}); // throws on any call → proves the no-version path reaches nobody
+
   it("returns the FURTHEST target (skips past v0.2 to v0.3), omitting release_url when absent", async () => {
-    const b = await body(updateCheck(registry(), v01));
+    const b = await body(await updateCheck(registry(), v01, null, noGh, ENV));
     expect(b).toEqual({
       current_dna_hash: v01,
       has_upgrade: true,
@@ -154,24 +178,148 @@ describe("updateCheck", () => {
         },
       ],
     });
-    const resp = await body(updateCheck(r, a));
+    const resp = await body(await updateCheck(r, a, null, noGh, ENV));
     expect(resp.target).toEqual({ to_dna_hash: bDna, to_version: "b", release_url: "https://example/b" });
   });
 
   it("chain tip has no upgrade", async () => {
-    const b = await body(updateCheck(registry(), v03));
+    const b = await body(await updateCheck(registry(), v03, null, noGh, ENV));
     expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
   });
 
   it("unknown current DNA has no upgrade", async () => {
-    const b = await body(updateCheck(registry(), "uhC0k_unknown"));
+    const b = await body(await updateCheck(registry(), "uhC0k_unknown", null, noGh, ENV));
     expect(b).toEqual({ current_dna_hash: "uhC0k_unknown", has_upgrade: false });
   });
 
   it("missing current_dna_hash errors", async () => {
-    const resp = updateCheck(registry(), null);
+    const resp = await updateCheck(registry(), null, null, noGh, ENV);
     expect(resp.status).toBe(400);
     expect((await body(resp)).error.code).toBe("unknown_current_dna");
+  });
+
+  it("an unparseable app_version is treated as absent (no GitHub call, no build axis)", async () => {
+    const b = await body(await updateCheck(registry(), v03, "nightly", noGh, ENV));
+    expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
+  });
+});
+
+describe("updateCheck — build axis (app_version present)", () => {
+  it("reports the newest published build on the caller's lineage as latest_build", async () => {
+    const fetch = ghFetch(() => ghReleases([{ tag: "v0.3.2" }, { tag: "v0.3.1" }, { tag: "v0.2.9" }]));
+    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    expect(b.has_upgrade).toBe(false); // v03 is the chain tip
+    expect(b.latest_build).toEqual({
+      version: "0.3.2",
+      release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.2",
+    });
+  });
+
+  it("excludes drafts, pre-releases and non-anchored tags", async () => {
+    const fetch = ghFetch(() =>
+      ghReleases([
+        { tag: "v0.3.9", draft: true },
+        { tag: "v0.3.8", prerelease: true },
+        { tag: "v0.3.7-rc.1" },
+        { tag: "v0.3.5" },
+      ]),
+    );
+    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    expect(b.latest_build.version).toBe("0.3.5");
+  });
+
+  it("omits latest_build when the caller's lineage has no published build (never falsy)", async () => {
+    const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }]));
+    const b = await body(await updateCheck(registry(), v03, "0.3.0", fetch, ENV));
+    expect(b.has_upgrade).toBe(false);
+    expect("latest_build" in b).toBe(false);
+  });
+
+  it("resolves a migration target's link to the newest build of the TARGET lineage, overriding the recorded tag", async () => {
+    const from = "uhC0k_from";
+    const to = "uhC0k_to";
+    const r = Registry.load({
+      version: 1,
+      dnas: [
+        { dna_hash: from, version: "from", upgrade_targets: [to], notaries: [{ url: "https://nf", api: "v1" }] },
+        {
+          dna_hash: to,
+          version: "to",
+          upgrades_from: from,
+          release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          notaries: [{ url: "https://nt", api: "v1" }],
+        },
+      ],
+    });
+    const fetch = ghFetch(() => ghReleases([{ tag: "v0.5.3" }, { tag: "v0.5.0" }]));
+    const b = await body(await updateCheck(r, from, "0.5.0", fetch, ENV));
+    expect(b.has_upgrade).toBe(true);
+    expect(b.target.release_url).toBe("https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.3");
+    expect(b.latest_build.version).toBe("0.5.3"); // caller is also on 0.5
+  });
+
+  it("falls back to the recorded target link when GitHub can't resolve the target lineage", async () => {
+    const from = "uhC0k_from2";
+    const to = "uhC0k_to2";
+    const r = Registry.load({
+      version: 1,
+      dnas: [
+        { dna_hash: from, version: "from", upgrade_targets: [to], notaries: [{ url: "https://nf", api: "v1" }] },
+        {
+          dna_hash: to,
+          version: "to",
+          upgrades_from: from,
+          release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          notaries: [{ url: "https://nt", api: "v1" }],
+        },
+      ],
+    });
+    const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }])); // nothing on 0.5
+    const b = await body(await updateCheck(r, from, "0.9.0", fetch, ENV));
+    expect(b.target.release_url).toBe("https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0");
+  });
+
+  it("keeps the migration answer and omits latest_build when GitHub is unreachable (still 2xx)", async () => {
+    const boom = (async () => {
+      throw new TypeError("network down");
+    }) as FetchLike;
+    const resp = await updateCheck(registry(), v01, "0.3.0", boom, ENV);
+    expect(resp.status).toBe(200);
+    const b = await body(resp);
+    expect(b.has_upgrade).toBe(true);
+    expect(b.target.to_dna_hash).toBe(v03);
+    expect("latest_build" in b).toBe(false);
+  });
+
+  it("treats a rate-limited / erroring upstream as no builds (still 2xx, migration intact)", async () => {
+    const fetch = ghFetch(() => jsonResp(429, { message: "rate limited" }));
+    const resp = await updateCheck(registry(), v01, "0.3.0", fetch, ENV);
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).has_upgrade).toBe(true);
+  });
+
+  it("fetches the GitHub listing at most once across calls when a cache is provided", async () => {
+    let calls = 0;
+    const fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("https://api.github.com")) {
+        calls++;
+        return ghReleases([{ tag: "v0.3.1" }]);
+      }
+      throw new TypeError(`no mock for ${url}`);
+    }) as FetchLike;
+    const store = new Map<string, Build[]>();
+    const cache: CacheLike = {
+      async get(k) {
+        return store.get(k) ?? null;
+      },
+      async set(k, v) {
+        store.set(k, v);
+      },
+    };
+    await updateCheck(registry(), v03, "0.3.0", fetch, ENV, cache);
+    await updateCheck(registry(), v03, "0.3.0", fetch, ENV, cache);
+    expect(calls).toBe(1);
   });
 });
 

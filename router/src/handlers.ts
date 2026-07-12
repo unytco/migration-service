@@ -4,6 +4,7 @@
 import { errorJson, ok } from "./errors";
 import { Registry, type DnaEntry } from "./registry";
 import { fetchClose, type Env, type FetchLike, type HardStop } from "./notary";
+import { publishedBuilds, lineageOf, lineageOfReleaseUrl, newestOnLineage, type CacheLike } from "./builds";
 
 export const API_VERSIONS = ["v1"] as const;
 export const PROTOCOL_VERSIONS = ["v0_1"] as const;
@@ -25,29 +26,75 @@ export function migrationOptions(registry: Registry, toDnaHash: string | null): 
   return ok({ to_dna_hash: toDnaHash, options });
 }
 
-/** GET /v1/update-check?current_dna_hash=
- * Forward lookup: given the app's currently-installed DNA, is there a newer one to
- * migrate to, and where to download it. Detection-only — no auth, no notary calls. */
-export function updateCheck(registry: Registry, currentDnaHash: string | null): Response {
+/** GET /v1/update-check?current_dna_hash=&app_version=
+ * Two orthogonal answers on one response:
+ *  - migration axis (`has_upgrade` + `target`): is this DNA superseded — registry-only, as before.
+ *  - build axis (`latest_build`): the newest published build on the caller's OWN lineage, resolved
+ *    from GitHub and gated on a parseable `app_version`.
+ * Detection-only — no auth, no notary calls. A caller sending no (or an unparseable) app_version
+ * gets byte-identical behaviour to the pre-two-channel router: the migration answer with its
+ * recorded target link and no build axis. Any GitHub failure degrades to exactly that too, so the
+ * migration answer never breaks (still 2xx). */
+export async function updateCheck(
+  registry: Registry,
+  currentDnaHash: string | null,
+  appVersion: string | null,
+  fetchImpl: FetchLike,
+  env: Env,
+  cache?: CacheLike,
+): Promise<Response> {
   if (!currentDnaHash) {
     return errorJson(400, "unknown_current_dna", "current_dna_hash query parameter is required");
   }
-  // The FURTHEST proven target (deepest descendant in `upgrade_targets`) — the app
-  // jumps straight there in one hop rather than version-by-version.
+
+  // The FURTHEST proven target (deepest descendant in `upgrade_targets`) — one hop straight there.
   const target = registry.furthestTargetOf(currentDnaHash);
-  if (!target) {
-    // Unknown DNA, chain tip, or no proven target — nothing to upgrade to.
-    return ok({ current_dna_hash: currentDnaHash, has_upgrade: false });
+  const callerLineage = lineageOf(appVersion);
+
+  // No parseable app version → build axis off; byte-identical to the pre-two-channel router.
+  if (callerLineage === null) {
+    return ok(migrationAnswer(currentDnaHash, target, target?.release_url));
   }
+
+  // app_version present → resolve published builds ONCE (never throws; [] on any failure), reused
+  // for both the target's freshest download link and the caller's own latest_build.
+  const builds = await publishedBuilds(fetchImpl, env, cache);
+
+  // Target link: newest published build of the TARGET's lineage (parsed from the tag in its
+  // registry release_url), falling back to the recorded link so a migration always carries one.
+  let targetLink = target?.release_url;
+  if (target) {
+    const fresh = newestOnLineage(builds, lineageOfReleaseUrl(target.release_url));
+    if (fresh) targetLink = fresh.release_url;
+  }
+
+  // Build axis: newest published build on the caller's OWN lineage. Absent is NOT "up to date".
+  const latest = newestOnLineage(builds, callerLineage);
+
   return ok({
+    ...migrationAnswer(currentDnaHash, target, targetLink),
+    ...(latest ? { latest_build: { version: latest.version, release_url: latest.release_url } } : {}),
+  });
+}
+
+/** The migration axis of the response — shared by the fast (no-version) and full paths. */
+function migrationAnswer(
+  currentDnaHash: string,
+  target: DnaEntry | null | undefined,
+  releaseUrl: string | undefined,
+) {
+  if (!target) {
+    return { current_dna_hash: currentDnaHash, has_upgrade: false as const };
+  }
+  return {
     current_dna_hash: currentDnaHash,
-    has_upgrade: true,
+    has_upgrade: true as const,
     target: {
       to_dna_hash: target.dna_hash,
       to_version: target.version,
-      ...(target.release_url !== undefined ? { release_url: target.release_url } : {}),
+      ...(releaseUrl !== undefined ? { release_url: releaseUrl } : {}),
     },
-  });
+  };
 }
 
 export interface MigrateBody {

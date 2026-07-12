@@ -10,6 +10,9 @@ export interface Env {
   /** Cloudflare Access service-token credentials (so only this Worker reaches the daemon). */
   CF_ACCESS_CLIENT_ID?: string;
   CF_ACCESS_CLIENT_SECRET?: string;
+  /** Optional read-only GitHub token for /v1/update-check's build lookup — unauthenticated by
+   * default; set only to raise the rate ceiling if the live-lineage count ever grows. */
+  GITHUB_TOKEN?: string;
 }
 
 /** Injectable fetch so tests can mock daemon responses. */
