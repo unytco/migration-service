@@ -4,19 +4,36 @@
 import { errorJson, ok } from "./errors";
 import { Registry, type DnaEntry } from "./registry";
 import { fetchClose, type Env, type FetchLike, type HardStop } from "./notary";
-import { publishedBuilds, lineageOf, lineageOfReleaseUrl, newestOnLineage, type CacheLike } from "./builds";
+import {
+  publishedBuilds,
+  lineageOf,
+  lineageOfReleaseUrl,
+  newestOnLineage,
+  type CacheLike,
+} from "./builds";
 
 export const API_VERSIONS = ["v1"] as const;
 export const PROTOCOL_VERSIONS = ["v0_1"] as const;
 
 export function healthz(): Response {
-  return ok({ status: "ok", api_versions: API_VERSIONS, protocol_versions: PROTOCOL_VERSIONS });
+  return ok({
+    status: "ok",
+    api_versions: API_VERSIONS,
+    protocol_versions: PROTOCOL_VERSIONS,
+  });
 }
 
 /** GET /v1/migration-options?to_dna_hash= */
-export function migrationOptions(registry: Registry, toDnaHash: string | null): Response {
+export function migrationOptions(
+  registry: Registry,
+  toDnaHash: string | null,
+): Response {
   if (!toDnaHash) {
-    return errorJson(400, "unknown_to_dna", "to_dna_hash query parameter is required");
+    return errorJson(
+      400,
+      "unknown_to_dna",
+      "to_dna_hash query parameter is required",
+    );
   }
   // Any source with a proven path to `to` (direct skip, not just the immediate
   // predecessor) — the app may have closed on any of them.
@@ -44,7 +61,11 @@ export async function updateCheck(
   cache?: CacheLike,
 ): Promise<Response> {
   if (!currentDnaHash) {
-    return errorJson(400, "unknown_current_dna", "current_dna_hash query parameter is required");
+    return errorJson(
+      400,
+      "unknown_current_dna",
+      "current_dna_hash query parameter is required",
+    );
   }
 
   // The FURTHEST proven target (deepest descendant in `upgrade_targets`) — one hop straight there.
@@ -64,7 +85,10 @@ export async function updateCheck(
   // registry release_url), falling back to the recorded link so a migration always carries one.
   let targetLink = target?.release_url;
   if (target) {
-    const fresh = newestOnLineage(builds, lineageOfReleaseUrl(target.release_url));
+    const fresh = newestOnLineage(
+      builds,
+      lineageOfReleaseUrl(target.release_url),
+    );
     if (fresh) targetLink = fresh.release_url;
   }
 
@@ -73,7 +97,15 @@ export async function updateCheck(
 
   return ok({
     ...migrationAnswer(currentDnaHash, target, targetLink),
-    ...(latest ? { latest_build: { version: latest.version, release_url: latest.release_url } } : {}),
+    ...(latest
+      ? {
+          latest_build: {
+            version: latest.version,
+            release_url: latest.release_url,
+            assets: latest.assets ?? [],
+          },
+        }
+      : {}),
   });
 }
 
@@ -105,7 +137,10 @@ export interface MigrateBody {
 
 /** Fisher–Yates on a copy. `rand` is injectable so tests can seed the order;
  * production uses `Math.random`. */
-export function shuffled<T>(xs: readonly T[], rand: () => number = Math.random): T[] {
+export function shuffled<T>(
+  xs: readonly T[],
+  rand: () => number = Math.random,
+): T[] {
   const out = xs.slice();
   for (let i = out.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
@@ -127,12 +162,25 @@ export async function migrate(
   // longer know its predecessor, so the router discovers the source.
   if (!to_dna_hash || !agent_pubkey) {
     // Client error: 4xx `bad_request`, not the 5xx `internal` the envelope reserves for our faults.
-    return errorJson(400, "bad_request", "to_dna_hash and agent_pubkey are required");
+    return errorJson(
+      400,
+      "bad_request",
+      "to_dna_hash and agent_pubkey are required",
+    );
   }
   const toEntry = registry.get(to_dna_hash);
-  if (!toEntry) return errorJson(400, "unknown_to_dna", `unknown to_dna_hash ${to_dna_hash}`);
+  if (!toEntry)
+    return errorJson(
+      400,
+      "unknown_to_dna",
+      `unknown to_dna_hash ${to_dna_hash}`,
+    );
   if (!toEntry.upgrades_from) {
-    return errorJson(400, "to_is_chain_root", `${to_dna_hash} is a chain root (no predecessor)`);
+    return errorJson(
+      400,
+      "to_is_chain_root",
+      `${to_dna_hash} is a chain root (no predecessor)`,
+    );
   }
 
   // Resolve candidate sources: a supplied `from` is validated and used directly;
@@ -140,7 +188,12 @@ export async function migrate(
   let sources: DnaEntry[];
   if (from_dna_hash) {
     const fromEntry = registry.get(from_dna_hash);
-    if (!fromEntry) return errorJson(400, "unknown_from_dna", `unknown from_dna_hash ${from_dna_hash}`);
+    if (!fromEntry)
+      return errorJson(
+        400,
+        "unknown_from_dna",
+        `unknown from_dna_hash ${from_dna_hash}`,
+      );
     if (!registry.reaches(from_dna_hash, to_dna_hash)) {
       return errorJson(
         400,
@@ -152,7 +205,11 @@ export async function migrate(
   } else {
     sources = registry.sourcesReaching(to_dna_hash);
     if (sources.length === 0) {
-      return errorJson(400, "unreachable_target", `no registered source reaches ${to_dna_hash}`);
+      return errorJson(
+        400,
+        "unreachable_target",
+        `no registered source reaches ${to_dna_hash}`,
+      );
     }
   }
 
@@ -188,7 +245,10 @@ export async function migrate(
         }
         // A package with NO target_dna_hash is malformed (every daemon binds one) — a
         // daemon fault, not a clean stale close. A sibling may serve a well-formed one.
-        if (typeof outcome.target_dna_hash !== "string" || outcome.target_dna_hash.length === 0) {
+        if (
+          typeof outcome.target_dna_hash !== "string" ||
+          outcome.target_dna_hash.length === 0
+        ) {
           sawMalformedPackage = true;
           continue;
         }
@@ -199,7 +259,12 @@ export async function migrate(
       if (outcome.kind === "hard_stop") {
         // Terminal regardless of source — no source fixes a warranted chain or bad request.
         if (outcome.code === "warranted" || outcome.code === "bad_request") {
-          return errorJson(outcome.status, outcome.code, outcome.message, outcome.details);
+          return errorJson(
+            outcome.status,
+            outcome.code,
+            outcome.message,
+            outcome.details,
+          );
         }
         // A content verdict every daemon of this source returns identically — next source.
         if (outcome.code === "no_close_found") break;
@@ -216,20 +281,37 @@ export async function migrate(
   // won't fix themselves by retrying, and a definite fault must never read as a momentary
   // outage even when a transient sibling co-occurs and would otherwise mask it.
   if (internalFault) {
-    return errorJson(internalFault.status, internalFault.code, internalFault.message, internalFault.details);
+    return errorJson(
+      internalFault.status,
+      internalFault.code,
+      internalFault.message,
+      internalFault.details,
+    );
   }
   if (transientCodes.includes("internal") || sawMalformedPackage) {
-    return errorJson(500, "internal", "a notary daemon returned an internal error for a candidate source");
+    return errorJson(
+      500,
+      "internal",
+      "a notary daemon returned an internal error for a candidate source",
+    );
   }
   // Zero registered notaries is a registry fault on our side — 5xx so it's fixed, and so a
   // close that may live on that source is never reported "absent".
   if (sawZeroNotary) {
-    return errorJson(500, "internal", "a candidate source has no registered notaries — registry misconfiguration");
+    return errorJson(
+      500,
+      "internal",
+      "a candidate source has no registered notaries — registry misconfiguration",
+    );
   }
   // Then the retryable transients — the close may be on a momentarily-unreachable source.
   // unable_to_verify (likely exists but not verifiable yet) wins the group.
   if (transientCodes.includes("unable_to_verify")) {
-    return errorJson(503, "unable_to_verify", "all notaries were unable to verify the close state");
+    return errorJson(
+      503,
+      "unable_to_verify",
+      "all notaries were unable to verify the close state",
+    );
   }
   if (transientCodes.includes("auth_failed")) {
     return errorJson(
@@ -239,11 +321,23 @@ export async function migrate(
     );
   }
   if (transientCodes.includes("rate_limited")) {
-    return errorJson(503, "rate_limited", "notaries are rate limiting requests; retry shortly");
+    return errorJson(
+      503,
+      "rate_limited",
+      "notaries are rate limiting requests; retry shortly",
+    );
   }
   if (transientCodes.length > 0) {
-    return errorJson(503, "all_orgs_unhealthy", "all candidate notaries are unavailable");
+    return errorJson(
+      503,
+      "all_orgs_unhealthy",
+      "all candidate notaries are unavailable",
+    );
   }
   // Every candidate was reachable and definitively had no close bound to `to`.
-  return errorJson(404, "no_close_found", "no committed close bound to the requested target was found");
+  return errorJson(
+    404,
+    "no_close_found",
+    "no committed close bound to the requested target was found",
+  );
 }

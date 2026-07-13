@@ -13,9 +13,19 @@ import type { Env, FetchLike } from "../src/notary";
 const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
 
 const jsonResp = (status: number, b: unknown) =>
-  new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
+  new Response(JSON.stringify(b), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 
-const releasesResp = (rels: Array<{ tag: string; draft?: boolean; prerelease?: boolean }>) =>
+const releasesResp = (
+  rels: Array<{
+    tag: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    assets?: Array<{ name: string; url: string; digest?: string }>;
+  }>,
+) =>
   jsonResp(
     200,
     rels.map((r) => ({
@@ -23,10 +33,16 @@ const releasesResp = (rels: Array<{ tag: string; draft?: boolean; prerelease?: b
       draft: r.draft ?? false,
       prerelease: r.prerelease ?? false,
       html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
+      assets: (r.assets ?? []).map((a) => ({
+        name: a.name,
+        browser_download_url: a.url,
+        ...(a.digest ? { digest: a.digest } : {}),
+      })),
     })),
   );
 
-const ghFetch = (make: () => Response): FetchLike => (async () => make()) as FetchLike;
+const ghFetch = (make: () => Response): FetchLike =>
+  (async () => make()) as FetchLike;
 
 describe("lineageOf", () => {
   it("takes major.minor from full, short, and v-prefixed versions", () => {
@@ -45,7 +61,11 @@ describe("lineageOf", () => {
 
 describe("lineageOfReleaseUrl", () => {
   it("parses the lineage from a release-tag URL", () => {
-    expect(lineageOfReleaseUrl("https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0")).toBe("0.2");
+    expect(
+      lineageOfReleaseUrl(
+        "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+      ),
+    ).toBe("0.2");
   });
   it("is null for a non-tag URL or nullish", () => {
     expect(lineageOfReleaseUrl("https://example/b")).toBeNull();
@@ -69,7 +89,10 @@ describe("newestOnLineage", () => {
     { version: "0.2.9", release_url: "u3" },
   ];
   it("returns the highest patch on the lineage", () => {
-    expect(newestOnLineage(builds, "0.3")).toEqual({ version: "0.3.4", release_url: "u2" });
+    expect(newestOnLineage(builds, "0.3")).toEqual({
+      version: "0.3.4",
+      release_url: "u2",
+    });
   });
   it("is null when nothing is on the lineage or the lineage is null", () => {
     expect(newestOnLineage(builds, "0.9")).toBeNull();
@@ -90,14 +113,21 @@ describe("publishedBuilds", () => {
     );
     const builds = await publishedBuilds(fetch, ENV);
     expect(builds).toEqual([
-      { version: "0.3.4", release_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.4" },
+      {
+        version: "0.3.4",
+        release_url:
+          "https://github.com/unytco/unyt-sandbox/releases/tag/v0.3.4",
+        assets: [],
+      },
     ]);
   });
 
   it("paginates past the first page so an older lineage's newest build isn't lost", async () => {
     // Page 1 = 100 newest releases, all on lineage 0.95 (a full page → a page 2 exists). Page 2 =
     // the older 0.93 lineage's builds. Reading only page 1 would drop 0.93's latest_build entirely.
-    const page1 = Array.from({ length: 100 }, (_, i) => ({ tag: `v0.95.${i}` }));
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      tag: `v0.95.${i}`,
+    }));
     const page2 = [{ tag: "v0.93.7" }, { tag: "v0.93.6" }];
     const fetch = (async (input: RequestInfo | URL) => {
       const u = typeof input === "string" ? input : input.toString();
@@ -110,7 +140,12 @@ describe("publishedBuilds", () => {
   });
 
   it("returns [] on a non-2xx upstream (never throws)", async () => {
-    expect(await publishedBuilds(ghFetch(() => jsonResp(403, {})), ENV)).toEqual([]);
+    expect(
+      await publishedBuilds(
+        ghFetch(() => jsonResp(403, {})),
+        ENV,
+      ),
+    ).toEqual([]);
   });
 
   it("negative-caches [] briefly on a total failure so a GitHub outage isn't re-hit every poll", async () => {
@@ -135,7 +170,9 @@ describe("publishedBuilds", () => {
 
   it("brief-caches the PARTIAL scan on a persistent later-page failure (earlier pages not re-hit)", async () => {
     let calls = 0;
-    const page1 = Array.from({ length: 100 }, (_, i) => ({ tag: `v0.95.${i}` }));
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      tag: `v0.95.${i}`,
+    }));
     const fetch = (async (input: RequestInfo | URL) => {
       calls++;
       const u = typeof input === "string" ? input : input.toString();
@@ -185,5 +222,116 @@ describe("publishedBuilds", () => {
     const second = await publishedBuilds(fetch, ENV, cache);
     expect(calls).toBe(1);
     expect(second).toEqual(first);
+  });
+
+  it("carries a release's downloadable installer assets (name + browser_download_url → name + url)", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() =>
+        releasesResp([
+          {
+            tag: "v0.93.2",
+            assets: [
+              {
+                name: "unyt_0.93.2_amd64.deb",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/unyt_0.93.2_amd64.deb",
+              },
+              {
+                name: "unyt_0.93.2_x64.dmg",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/unyt_0.93.2_x64.dmg",
+              },
+            ],
+          },
+        ]),
+      ),
+      ENV,
+    );
+    expect(builds).toHaveLength(1);
+    expect(builds[0].assets).toEqual([
+      {
+        name: "unyt_0.93.2_amd64.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/unyt_0.93.2_amd64.deb",
+      },
+      {
+        name: "unyt_0.93.2_x64.dmg",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/unyt_0.93.2_x64.dmg",
+      },
+    ]);
+  });
+
+  it("carries GitHub's asset digest when present, and omits it when absent", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() =>
+        releasesResp([
+          {
+            tag: "v0.93.2",
+            assets: [
+              {
+                name: "signed.deb",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/signed.deb",
+                digest: "sha256:deadbeef",
+              },
+              {
+                name: "older.deb",
+                url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/older.deb",
+              },
+            ],
+          },
+        ]),
+      ),
+      ENV,
+    );
+    expect(builds[0].assets).toEqual([
+      {
+        name: "signed.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/signed.deb",
+        digest: "sha256:deadbeef",
+      },
+      // No digest on the release → the field is simply absent (the app then skips verification).
+      {
+        name: "older.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/older.deb",
+      },
+    ]);
+  });
+
+  it("a release with no assets yields an empty asset list", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() => releasesResp([{ tag: "v0.93.2" }])),
+      ENV,
+    );
+    expect(builds[0].assets).toEqual([]);
+  });
+
+  it("drops malformed assets (missing name or download url), keeping the well-formed ones", async () => {
+    const raw = jsonResp(200, [
+      {
+        tag_name: "v0.93.2",
+        draft: false,
+        prerelease: false,
+        html_url: "https://github.com/unytco/unyt-sandbox/releases/tag/v0.93.2",
+        assets: [
+          {
+            name: "good.deb",
+            browser_download_url:
+              "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/good.deb",
+          },
+          { name: "no-url.deb" },
+          {
+            browser_download_url:
+              "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/no-name",
+          },
+        ],
+      },
+    ]);
+    const builds = await publishedBuilds(
+      ghFetch(() => raw),
+      ENV,
+    );
+    expect(builds[0].assets).toEqual([
+      {
+        name: "good.deb",
+        url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.93.2/good.deb",
+      },
+    ]);
   });
 });
