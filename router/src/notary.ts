@@ -13,6 +13,9 @@ export interface Env {
   /** Optional read-only GitHub token for /v1/update-check's build lookup — unauthenticated by
    * default; set only to raise the rate ceiling if the live-lineage count ever grows. */
   GITHUB_TOKEN?: string;
+  /** Local-testnet only (never set on the deployed Worker): point the build axis at a local
+   * artifact server speaking the GitHub releases JSON shape. See builds.ts `releasesApi`. */
+  GITHUB_RELEASES_URL?: string;
 }
 
 /** Injectable fetch so tests can mock daemon responses. */
@@ -84,12 +87,15 @@ export async function fetchClose(
 
   let resp: Response;
   try {
-    resp = await fetchImpl(`${daemonUrl.replace(/\/$/, "")}/${api}/fetch-close`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ agent_pubkey: agentPubkey }),
-      signal: AbortSignal.timeout(FETCH_CLOSE_TIMEOUT_MS),
-    });
+    resp = await fetchImpl(
+      `${daemonUrl.replace(/\/$/, "")}/${api}/fetch-close`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ agent_pubkey: agentPubkey }),
+        signal: AbortSignal.timeout(FETCH_CLOSE_TIMEOUT_MS),
+      },
+    );
   } catch {
     return { kind: "transient", code: "all_orgs_unhealthy" };
   }
@@ -108,20 +114,31 @@ export async function fetchClose(
       return { kind: "transient", code: "unable_to_verify" };
     }
     // A 200 missing any package field (or null) is as malformed as a non-JSON body — fail over.
-    if (body.payload == null || body.notary_signatures == null || body.close_action == null) {
+    if (
+      body.payload == null ||
+      body.notary_signatures == null ||
+      body.close_action == null
+    ) {
       return { kind: "transient", code: "unable_to_verify" };
     }
     // B2: the daemon serves exactly one DNA, so a wrong `source_dna_hash` is a
     // misconfigured notary (registry URL ↔ daemon mismatch) — reject as `internal`.
-    const payloadSourceDna = (body.payload as { source_dna_hash?: unknown } | undefined)
-      ?.source_dna_hash;
-    if (typeof payloadSourceDna === "string" && payloadSourceDna !== expectedDnaHash) {
+    const payloadSourceDna = (
+      body.payload as { source_dna_hash?: unknown } | undefined
+    )?.source_dna_hash;
+    if (
+      typeof payloadSourceDna === "string" &&
+      payloadSourceDna !== expectedDnaHash
+    ) {
       return {
         kind: "hard_stop",
         status: 500,
         code: "internal",
         message: "notary returned a payload for a different source DNA",
-        details: { expected_dna_hash: expectedDnaHash, got_dna_hash: payloadSourceDna },
+        details: {
+          expected_dna_hash: expectedDnaHash,
+          got_dna_hash: payloadSourceDna,
+        },
       };
     }
     return {
@@ -129,7 +146,9 @@ export async function fetchClose(
       payload: body.payload,
       notary_signatures: body.notary_signatures,
       close_action: body.close_action,
-      target_dna_hash: (body.payload as { target_dna_hash?: unknown } | undefined)?.target_dna_hash,
+      target_dna_hash: (
+        body.payload as { target_dna_hash?: unknown } | undefined
+      )?.target_dna_hash,
     };
   }
 
@@ -137,7 +156,9 @@ export async function fetchClose(
   let message = `notary returned ${resp.status}`;
   let details: unknown;
   try {
-    const body = (await resp.json()) as { error?: { code?: string; message?: string; details?: unknown } };
+    const body = (await resp.json()) as {
+      error?: { code?: string; message?: string; details?: unknown };
+    };
     if (body.error?.code) code = body.error.code;
     if (body.error?.message) message = body.error.message;
     details = body.error?.details;
@@ -146,7 +167,13 @@ export async function fetchClose(
   }
 
   if (HARD_STOP_CODES.has(code)) {
-    return { kind: "hard_stop", status: resp.status, code: code as ErrorCode, message, details };
+    return {
+      kind: "hard_stop",
+      status: resp.status,
+      code: code as ErrorCode,
+      message,
+      details,
+    };
   }
   // Not a hard stop: preserve the daemon's code so the router can surface the real
   // cause if every candidate fails the same way.

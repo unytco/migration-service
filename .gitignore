@@ -9,6 +9,7 @@ router/node_modules/
 router/dist/
 router/.wrangler/
 .dev.vars
+router/registry.local.json
 
 # misc
 .DS_Store

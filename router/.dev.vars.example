@@ -1,0 +1,14 @@
+# wrangler dev env for the local testnet — copy to .dev.vars (gitignored).
+# These are LOCAL-ONLY values, not credentials for anything deployed.
+
+# Bearer shared with every local notary daemon (the same value goes into the
+# daemon's env as MIGRATION_NOTARY_BEARER_TOKEN — automation/local wires it).
+MIGRATION_NOTARY_BEARER_TOKEN=local-testnet-bearer
+
+# Point the build axis (/v1/update-check latest_build) at the local artifact
+# server instead of GitHub, so a UI-release rehearsal can see its local patch
+# build. Omit to use real GitHub (the migrate flow never touches it either way).
+# GITHUB_RELEASES_URL=http://localhost:8788/releases
+
+# CF-Access service-token creds are DELIBERATELY absent: the router only adds
+# CF-Access headers when both are set, and local daemons sit behind no tunnel.

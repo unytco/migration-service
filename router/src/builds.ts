@@ -9,6 +9,14 @@ import type { Env, FetchLike } from "./notary";
 
 const RELEASES_API =
   "https://api.github.com/repos/unytco/unyt-sandbox/releases";
+
+/** The releases listing endpoint: GitHub by default; `env.GITHUB_RELEASES_URL` overrides it so a
+ * local testnet can point the build axis at its artifact server (an env binding the deployed Worker
+ * never sets — local-testnet task 02). The override must speak the GitHub releases JSON shape. */
+function releasesApi(env: Env): string {
+  return env.GITHUB_RELEASES_URL || RELEASES_API;
+}
+
 const PER_PAGE = 100;
 /** Safety bound on the release scan: 10 pages = 1000 releases. Logged if ever hit — beyond it an
  * older lineage's newest build could be missed (raise it, or add a read-only token + wider scan). */
@@ -134,7 +142,7 @@ export async function publishedBuilds(
     let batch: unknown;
     try {
       const resp = await fetchImpl(
-        `${RELEASES_API}?per_page=${PER_PAGE}&page=${page}`,
+        `${releasesApi(env)}?per_page=${PER_PAGE}&page=${page}`,
         {
           headers,
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),

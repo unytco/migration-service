@@ -9,7 +9,11 @@ function chain(): RawRegistry {
   return {
     version: 1,
     dnas: [
-      { dna_hash: v01, version: "alliance-v0.1.0", notaries: [{ url: "https://n1", api: "v1" }] },
+      {
+        dna_hash: v01,
+        version: "alliance-v0.1.0",
+        notaries: [{ url: "https://n1", api: "v1" }],
+      },
       {
         dna_hash: v02,
         version: "alliance-v0.2.0",
@@ -61,7 +65,9 @@ describe("Registry.load", () => {
   });
 
   it("rejects an unsupported schema version", () => {
-    expect(() => Registry.load({ ...chain(), version: 99 })).toThrow(/unsupported registry version/);
+    expect(() => Registry.load({ ...chain(), version: 99 })).toThrow(
+      /unsupported registry version/,
+    );
   });
 
   it("rejects a duplicate dna_hash", () => {
@@ -91,6 +97,45 @@ describe("Registry.load", () => {
     const raw = chain();
     raw.dnas[0].notaries[0].url = "http://n1";
     expect(() => Registry.load(raw)).toThrow(/notary url must be https/);
+  });
+
+  // Local-testnet mode (allowHttpNotaries — used only by the index.local.ts entry
+  // point): plain-http daemons on container IPs are admitted, and NOTHING else is
+  // relaxed. The deployed default must stay https-only even when an options object
+  // is passed.
+
+  it("local mode: admits an http:// notary url under allowHttpNotaries", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "http://10.87.0.12:8790";
+    const reg = Registry.load(raw, { allowHttpNotaries: true });
+    expect(reg.get(raw.dnas[0].dna_hash)?.notaries[0].url).toBe(
+      "http://10.87.0.12:8790",
+    );
+  });
+
+  it("local mode: an explicit options object WITHOUT the flag still rejects http", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "http://10.87.0.12:8790";
+    expect(() => Registry.load(raw, {})).toThrow(/notary url must be https/);
+    expect(() => Registry.load(raw, { allowHttpNotaries: false })).toThrow(
+      /notary url must be https/,
+    );
+  });
+
+  it("local mode: a non-http(s) scheme is still rejected with the flag on", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "ftp://10.87.0.12:8790";
+    expect(() => Registry.load(raw, { allowHttpNotaries: true })).toThrow(
+      /notary url must be https/,
+    );
+  });
+
+  it("local mode: every other invariant is still enforced with the flag on", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].api = "v9";
+    expect(() => Registry.load(raw, { allowHttpNotaries: true })).toThrow(
+      /unsupported notary api/,
+    );
   });
 
   it("rejects a notary entry with a missing url", () => {
@@ -133,7 +178,12 @@ describe("Registry.load", () => {
 
   it("rejects a fork (two successors of one DNA)", () => {
     const raw = chain();
-    raw.dnas.push({ dna_hash: "uhC0k_v02b", version: "alliance-v0.2.0b", upgrades_from: v01, notaries: [] });
+    raw.dnas.push({
+      dna_hash: "uhC0k_v02b",
+      version: "alliance-v0.2.0b",
+      upgrades_from: v01,
+      notaries: [],
+    });
     expect(() => Registry.load(raw)).toThrow(/multiple successors/);
   });
 
@@ -145,7 +195,9 @@ describe("Registry.load", () => {
   it("rejects an upgrade_target that does not resolve", () => {
     const raw = skipChain();
     raw.dnas[0].upgrade_targets = [v02, "uhC0k_missing"];
-    expect(() => Registry.load(raw)).toThrow(/upgrade_target .* does not resolve/);
+    expect(() => Registry.load(raw)).toThrow(
+      /upgrade_target .* does not resolve/,
+    );
   });
 
   it("rejects an upgrade_target that is not a forward descendant", () => {

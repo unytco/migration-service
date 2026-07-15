@@ -37,6 +37,17 @@ export interface RawRegistry {
 
 export const SUPPORTED_REGISTRY_VERSION = 1;
 
+/** Options for [`Registry.load`]. */
+export interface RegistryLoadOptions {
+  /**
+   * Local-testnet mode ONLY (documentation/specs/local-testnet/): admit `http://` notary URLs so a
+   * local registry can name plain-http daemons on container IPs. The deployed Worker entry point
+   * (`index.ts`) never passes this — it exists solely for the local entry point (`index.local.ts`),
+   * so the relaxation is structurally absent from a deployed bundle rather than merely defaulted off.
+   */
+  allowHttpNotaries?: boolean;
+}
+
 export class Registry {
   private byHash: Map<string, DnaEntry>;
   /** predecessor dna_hash → its single successor's dna_hash (the chain is linear). */
@@ -52,27 +63,37 @@ export class Registry {
   }
 
   /** Parse + validate. Throws on any invariant violation (caller fails the Worker health). */
-  static load(raw: RawRegistry): Registry {
+  static load(raw: RawRegistry, opts?: RegistryLoadOptions): Registry {
     if (raw.version !== SUPPORTED_REGISTRY_VERSION) {
       throw new Error(
         `unsupported registry version ${raw.version} (expected ${SUPPORTED_REGISTRY_VERSION})`,
       );
     }
-    if (!Array.isArray(raw.dnas)) throw new Error("registry.dnas must be an array");
+    if (!Array.isArray(raw.dnas))
+      throw new Error("registry.dnas must be an array");
 
     const seen = new Set<string>();
     for (const d of raw.dnas) {
       if (!d.dna_hash) throw new Error("registry entry missing dna_hash");
-      if (seen.has(d.dna_hash)) throw new Error(`duplicate dna_hash ${d.dna_hash}`);
+      if (seen.has(d.dna_hash))
+        throw new Error(`duplicate dna_hash ${d.dna_hash}`);
       seen.add(d.dna_hash);
-      if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
-      if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
+      if (!d.version)
+        throw new Error(`registry entry ${d.dna_hash} missing version`);
+      if (!Array.isArray(d.notaries))
+        throw new Error(`registry entry ${d.dna_hash} missing notaries`);
       for (const n of d.notaries) {
-        if (!n.url?.startsWith("https://")) {
-          throw new Error(`registry entry ${d.dna_hash}: notary url must be https`);
+        const httpAdmitted =
+          opts?.allowHttpNotaries === true && n.url?.startsWith("http://");
+        if (!n.url?.startsWith("https://") && !httpAdmitted) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: notary url must be https`,
+          );
         }
         if (!SUPPORTED_DAEMON_APIS.has(n.api)) {
-          throw new Error(`registry entry ${d.dna_hash}: unsupported notary api ${n.api}`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: unsupported notary api ${n.api}`,
+          );
         }
       }
     }
@@ -81,7 +102,9 @@ export class Registry {
     for (const d of raw.dnas) {
       if (d.upgrades_from) {
         if (!seen.has(d.upgrades_from)) {
-          throw new Error(`upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`);
+          throw new Error(
+            `upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`,
+          );
         }
         const existing = successorOfHash.get(d.upgrades_from);
         if (existing) {
@@ -118,14 +141,20 @@ export class Registry {
       const seenTargets = new Set<string>();
       for (const t of d.upgrade_targets) {
         if (seenTargets.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: duplicate upgrade_target ${t}`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: duplicate upgrade_target ${t}`,
+          );
         }
         seenTargets.add(t);
         if (!byHash.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} does not resolve`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: upgrade_target ${t} does not resolve`,
+          );
         }
         if (!descendants.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} is not a forward descendant`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: upgrade_target ${t} is not a forward descendant`,
+          );
         }
       }
     }
@@ -179,6 +208,9 @@ export class Registry {
 
   /** Is `toDnaHash` a proven upgrade target of `fromDnaHash`? */
   reaches(fromDnaHash: string, toDnaHash: string): boolean {
-    return this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ?? false;
+    return (
+      this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ??
+      false
+    );
   }
 }
