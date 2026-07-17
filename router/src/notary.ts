@@ -68,6 +68,23 @@ const FETCH_CLOSE_TIMEOUT_MS = 10_000;
  * `source_dna_hash` differs from `expectedDnaHash` is a misconfigured notary →
  * `internal` hard stop (B2). The package's `target_dna_hash` is surfaced for the
  * handler's target-filter. */
+/**
+ * Normalize a DNA hash the daemon may serialize EITHER as its canonical b64
+ * string ("uhC0k…") OR as a raw HoloHash byte array — the notary relays the
+ * zome's close payload verbatim, and holo_hash serializes to bytes there. The
+ * router compares these against the registry's b64 DNA hashes, so it must accept
+ * both. Returns the b64 form, or `undefined` for null / an unrecognized shape.
+ * (A 39-byte HoloHash → `"u"` + unpadded base64url, matching `encodeHashToBase64`.)
+ */
+export function normalizeDnaHashB64(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.length > 0 && value.every((b) => typeof b === "number")) {
+    const bin = String.fromCharCode(...(value as number[]));
+    return "u" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  return undefined;
+}
+
 export async function fetchClose(
   daemonUrl: string,
   api: string,
@@ -123,13 +140,12 @@ export async function fetchClose(
     }
     // B2: the daemon serves exactly one DNA, so a wrong `source_dna_hash` is a
     // misconfigured notary (registry URL ↔ daemon mismatch) — reject as `internal`.
-    const payloadSourceDna = (
-      body.payload as { source_dna_hash?: unknown } | undefined
-    )?.source_dna_hash;
-    if (
-      typeof payloadSourceDna === "string" &&
-      payloadSourceDna !== expectedDnaHash
-    ) {
+    // Normalize first: the hash may be a b64 string or a raw byte array, and a
+    // non-string used to SKIP this check (fail-open) — normalizing closes that.
+    const payloadSourceDna = normalizeDnaHashB64(
+      (body.payload as { source_dna_hash?: unknown } | undefined)?.source_dna_hash,
+    );
+    if (payloadSourceDna !== undefined && payloadSourceDna !== expectedDnaHash) {
       return {
         kind: "hard_stop",
         status: 500,
@@ -143,12 +159,15 @@ export async function fetchClose(
     }
     return {
       kind: "package",
+      // The payload is passed to the app verbatim — its hashes stay in the
+      // on-chain (byte) form the successor DNA's `init` expects; only the router's
+      // OWN routing field is normalized to b64 for comparison against the registry.
       payload: body.payload,
       notary_signatures: body.notary_signatures,
       close_action: body.close_action,
-      target_dna_hash: (
-        body.payload as { target_dna_hash?: unknown } | undefined
-      )?.target_dna_hash,
+      target_dna_hash: normalizeDnaHashB64(
+        (body.payload as { target_dna_hash?: unknown } | undefined)?.target_dna_hash,
+      ),
     };
   }
 
