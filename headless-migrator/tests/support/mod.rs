@@ -10,10 +10,11 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
+use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
 use rave_engine::types::entries::migration::v0_1::{
     AgreementCarryForward, CommittedClose, MigrationInitRequest, NotarySignature,
@@ -163,6 +164,40 @@ impl Conductor for MockConductor {
     async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<()> {
         self.record(Call::InstallApp);
         Self::pop(&self.install_result, "install_app")
+    }
+}
+
+/// A [`Connector`] that hands the open loop a scripted [`MockConductor`] for
+/// both the admin-only and the `ham` connection, so `open::run_with` drives the
+/// whole flow with no live conductor. `admin` and `ham` are `Arc`s the test also
+/// holds, so it can inspect the recorded calls after the run. The common case
+/// (`shared`) points both at ONE mock — the flow's admin-probe and post-install
+/// ham calls then land in a single call log.
+pub struct MockConnector {
+    pub admin: Arc<MockConductor>,
+    pub ham: Arc<MockConductor>,
+}
+
+impl MockConnector {
+    /// Both connections resolve to the SAME mock.
+    pub fn shared(mock: Arc<MockConductor>) -> Self {
+        Self {
+            admin: mock.clone(),
+            ham: mock,
+        }
+    }
+}
+
+#[async_trait]
+impl Connector for MockConnector {
+    async fn connect_admin_only(&self) -> anyhow::Result<Arc<dyn Conductor>> {
+        let c: Arc<dyn Conductor> = self.admin.clone();
+        Ok(c)
+    }
+
+    async fn connect_ham(&self, _shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>> {
+        let c: Arc<dyn Conductor> = self.ham.clone();
+        Some(c)
     }
 }
 
