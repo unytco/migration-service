@@ -1,0 +1,30 @@
+[package]
+name = "dna-hash"
+version = "0.1.0"
+edition = "2021"
+description = "Predict a role's DNA hash from a hApp/DNA bundle + the install-time network seed + properties, WITHOUT deploying — so the migration registry's successor `to_dna_hash` can be filled before its fleet exists. See workshop backlog B85."
+
+[lib]
+name = "dna_hash"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dna-hash"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the SAME Holochain as the notary-daemon / headless-migrator so the
+# computed hash is byte-identical to what the conductor produces at install.
+holochain_types = "=0.6.2-rc.0"
+holo_hash = { version = "=0.6.2-rc.0", features = ["encoding"] }
+holochain_serialized_bytes = "=0.0.57"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+anyhow = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+# Build a `.webhapp` fixture in-test (wrap the committed `.happ`) to lock in the
+# webhapp→inner-happ load path. Pinned to the version holochain_types resolves so
+# `WebAppBundle::from(Bundle<WebAppManifest>)` sees the same `mr_bundle` type.
+mr_bundle = "=0.6.1"
