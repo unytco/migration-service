@@ -5,11 +5,11 @@ target/
 
 # Node / Worker
 node_modules/
-router/node_modules/
-router/dist/
-router/.wrangler/
+migration-router/node_modules/
+migration-router/dist/
+migration-router/.wrangler/
 .dev.vars
-router/registry.local.json
+migration-router/registry.local.json
 
 # misc
 .DS_Store

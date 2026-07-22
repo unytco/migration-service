@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
 use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
+use holochain_types::prelude::CellId;
 use rave_engine::types::entries::migration::v0_1::{
     AgreementCarryForward, CommittedClose, MigrationInitRequest, NotarySignature,
     PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryState, SummaryStatePayload,
@@ -43,6 +44,7 @@ pub enum Call {
     GetMigrationCloseState,
     VerifyIfMigrated,
     AppPresence,
+    InstalledCellId,
     InstallApp,
 }
 
@@ -62,7 +64,13 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
-    pub install_result: Mutex<VecDeque<anyhow::Result<()>>>,
+    /// The `CellId` each scripted install reports the provisioned cell landed on
+    /// — the open service checks it against the migration target (DNA + agent).
+    pub install_result: Mutex<VecDeque<anyhow::Result<CellId>>>,
+    /// The `CellId` an ALREADY-installed app reports. `None` (the default) means
+    /// "can't be read", which the open service treats as unknown rather than a
+    /// mismatch — so the existing already-installed tests are unaffected.
+    pub installed_cell: Mutex<Option<CellId>>,
 }
 
 impl MockConductor {
@@ -161,7 +169,16 @@ impl Conductor for MockConductor {
         Self::pop(&self.presence, "app_presence")
     }
 
-    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<()> {
+    async fn installed_cell_id(
+        &self,
+        _app_id: &str,
+        _role_name: &str,
+    ) -> anyhow::Result<Option<CellId>> {
+        self.record(Call::InstalledCellId);
+        Ok(self.installed_cell.lock().unwrap().clone())
+    }
+
+    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<CellId> {
         self.record(Call::InstallApp);
         Self::pop(&self.install_result, "install_app")
     }

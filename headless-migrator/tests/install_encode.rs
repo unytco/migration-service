@@ -10,7 +10,7 @@ mod support;
 
 use headless_migrator::conductor::{build_install_payload, InstallSpec};
 use holochain_types::app::RoleSettings;
-use holochain_types::prelude::SerializedBytes;
+use holochain_types::prelude::{DnaModifiersOpt, SerializedBytes, YamlProperties};
 use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
 use rave_engine::types::CarryForwardUnits;
 
@@ -23,8 +23,24 @@ fn alliance_spec(migration_package: Option<MigrationInitRequest>) -> InstallSpec
         agent_key: agent(7),
         happ_path: std::path::PathBuf::from("/tmp/unyt.happ"),
         network_seed: None,
+        properties: None,
         membrane_proof: None,
         migration_package,
+    }
+}
+
+/// The sole provisioned role's DNA modifiers override, as the payload carries it.
+fn only_role_modifiers(spec: &InstallSpec) -> Option<DnaModifiersOpt<YamlProperties>> {
+    let payload = build_install_payload(spec).expect("build install payload");
+    let (_name, settings) = payload
+        .roles_settings
+        .expect("roles_settings present")
+        .into_iter()
+        .next()
+        .expect("exactly one role");
+    match settings {
+        RoleSettings::Provisioned { modifiers, .. } => modifiers,
+        _ => panic!("the migrating role must be Provisioned"),
     }
 }
 
@@ -68,5 +84,53 @@ fn fresh_non_migrating_install_carries_no_init_properties() {
         only_role_init_properties(&alliance_spec(None)),
         None,
         "a fresh, non-migrating install carries no init_properties"
+    );
+}
+
+/// The network's DNA properties are hashed into the DNA hash, so the install
+/// must carry them verbatim — the migrating cell lands on the network's DNA only
+/// if its properties are byte-identical to every other agent's.
+#[test]
+fn install_carries_the_networks_dna_properties() {
+    let props: YamlProperties = serde_json::from_str(
+        r#"{"progenitor_pubkey":"uhCAkfake","joining_server_signer":"uhCAkalso"}"#,
+    )
+    .expect("parse properties");
+    let mut spec = alliance_spec(None);
+    spec.network_seed = Some("unyt-local-testnet-b".into());
+    spec.properties = Some(props.clone());
+
+    let modifiers = only_role_modifiers(&spec).expect("modifiers override present");
+    assert_eq!(
+        modifiers.network_seed.as_deref(),
+        Some("unyt-local-testnet-b")
+    );
+    assert_eq!(
+        modifiers.properties.map(SerializedBytes::try_from),
+        Some(SerializedBytes::try_from(props)),
+        "the role's properties must encode byte-for-byte as the network's — a \
+         re-ordered or re-encoded map is a different DNA hash"
+    );
+}
+
+/// The regression this guards: an override built from a seed alone used to carry
+/// `properties: None`. The conductor only applies `Some` fields, so the real
+/// clobber is emitting an override that CANNOT carry properties at all — with the
+/// happ manifest declaring none (`properties: ~`), the cell then genesises on a
+/// property-less DNA, a different hash from the network's, in its own empty DHT.
+#[test]
+fn install_never_emits_a_properties_nilling_modifier() {
+    let mut seed_only = alliance_spec(None);
+    seed_only.network_seed = Some("unyt-local-testnet-b".into());
+    let modifiers = only_role_modifiers(&seed_only).expect("modifiers override present");
+    assert!(
+        modifiers.properties.is_none(),
+        "with no properties to apply the override must leave the field unset, \
+         never a value that overwrites the DNA's"
+    );
+
+    assert!(
+        only_role_modifiers(&alliance_spec(None)).is_none(),
+        "with neither modifier to apply, no override is sent at all"
     );
 }

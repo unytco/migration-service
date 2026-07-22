@@ -19,7 +19,7 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     defaults:
       run:
-        working-directory: router
+        working-directory: migration-router
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,14 +29,14 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: router/package-lock.json
+          cache-dependency-path: migration-router/package-lock.json
       - run: npm ci
       - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: router
+          workingDirectory: migration-router
         # Runtime Worker secrets (MIGRATION_NOTARY_BEARER_TOKEN,
         # CF_ACCESS_CLIENT_ID/SECRET) are set once via `wrangler secret put`,
         # independent of this deploy token.

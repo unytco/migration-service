@@ -1,5 +1,5 @@
 // Cloudflare Worker entry point — LOCAL-TESTNET mode (documentation/specs/
-// local-testnet/). Loads router/registry.local.json (gitignored; start from
+// local-testnet/). Loads migration-router/registry.local.json (gitignored; start from
 // registry.local.example.json) with http:// notary URLs admitted, so a local
 // registry can name plain-http daemons on container IPs. Run via
 // `npm run dev:local` (wrangler dev -c wrangler.local.toml); the deployed

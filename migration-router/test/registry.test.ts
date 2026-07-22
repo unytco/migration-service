@@ -30,7 +30,9 @@ function chain(): RawRegistry {
   };
 }
 
-/** A skip-enabled chain: v01 proves a path to both v02 and v03; v02 to v03. */
+/** A skip-enabled chain: v01 proves a path to both v02 and v03; v02 to v03.
+ * v02 + v03 are `published` (customer-visible) so `furthestTargetOf` surfaces them — the
+ * customers-last gate is exercised separately by the `published` tests below. */
 function skipChain(): RawRegistry {
   return {
     version: 1,
@@ -46,12 +48,14 @@ function skipChain(): RawRegistry {
         version: "alliance-v0.2.0",
         upgrades_from: v01,
         upgrade_targets: [v03],
+        published: true,
         notaries: [{ url: "https://n2", api: "v1" }],
       },
       {
         dna_hash: v03,
         version: "alliance-v0.3.0",
         upgrades_from: v02,
+        published: true,
         notaries: [{ url: "https://n3", api: "v1" }],
       },
     ],
@@ -241,5 +245,107 @@ describe("Registry.load", () => {
     expect(r.reaches(v02, v03)).toBe(true);
     expect(r.reaches(v02, v01)).toBe(false);
     expect(r.reaches("unknown", v03)).toBe(false);
+  });
+});
+
+// The customers-last visibility gate: `published` is HONORED by furthestTargetOf (the
+// /v1/update-check banner) but IGNORED by reaches / sourcesReaching (the /v1/migrate close-package
+// fetch), so a successor can be served to the headless server open BEFORE it is surfaced to
+// customers. Absent `published` = unpublished (the safe default).
+describe("Registry — published (customer-visibility) gate", () => {
+  /** A single-step chain v01 → v02, with v02's published state parameterised. */
+  function gated(published?: boolean): RawRegistry {
+    const v02Entry: RawRegistry["dnas"][number] = {
+      dna_hash: v02,
+      version: "alliance-v0.2.0",
+      upgrades_from: v01,
+      notaries: [{ url: "https://n2", api: "v1" }],
+    };
+    if (published !== undefined) v02Entry.published = published;
+    return {
+      version: 1,
+      dnas: [
+        {
+          dna_hash: v01,
+          version: "alliance-v0.1.0",
+          upgrade_targets: [v02],
+          notaries: [{ url: "https://n1", api: "v1" }],
+        },
+        v02Entry,
+      ],
+    };
+  }
+
+  it("furthestTargetOf hides an unpublished target (published:false → no banner)", () => {
+    const r = Registry.load(gated(false));
+    expect(r.furthestTargetOf(v01)).toBeUndefined();
+  });
+
+  it("furthestTargetOf hides a target with NO published field (absent = unpublished)", () => {
+    const r = Registry.load(gated(undefined));
+    expect(r.furthestTargetOf(v01)).toBeUndefined();
+  });
+
+  it("furthestTargetOf surfaces the target once it is published:true", () => {
+    const r = Registry.load(gated(true));
+    expect(r.furthestTargetOf(v01)?.dna_hash).toBe(v02);
+  });
+
+  it("furthestTargetOf skips an unpublished furthest target and falls back to the nearest published one", () => {
+    // v01 proves [v02(published), v03(NOT published)] — the customers-last window where v03's
+    // routing edge exists (server open can fetch it) but v03 is not yet customer-visible.
+    const raw: RawRegistry = {
+      version: 1,
+      dnas: [
+        {
+          dna_hash: v01,
+          version: "alliance-v0.1.0",
+          upgrade_targets: [v02, v03],
+          notaries: [{ url: "https://n1", api: "v1" }],
+        },
+        {
+          dna_hash: v02,
+          version: "alliance-v0.2.0",
+          upgrades_from: v01,
+          upgrade_targets: [v03],
+          published: true,
+          notaries: [{ url: "https://n2", api: "v1" }],
+        },
+        {
+          dna_hash: v03,
+          version: "alliance-v0.3.0",
+          upgrades_from: v02,
+          published: false,
+          notaries: [{ url: "https://n3", api: "v1" }],
+        },
+      ],
+    };
+    const r = Registry.load(raw);
+    // Falls back past the unpublished v03 to the published v02 (not undefined, not v03).
+    expect(r.furthestTargetOf(v01)?.dna_hash).toBe(v02);
+    // And v02's only proven target (v03) is unpublished → v02 sees no upgrade.
+    expect(r.furthestTargetOf(v02)).toBeUndefined();
+  });
+
+  it("reaches IGNORES published — an unpublished target is still reachable (migrate serves it)", () => {
+    const r = Registry.load(gated(false));
+    expect(r.reaches(v01, v02)).toBe(true);
+  });
+
+  it("sourcesReaching IGNORES published — an unpublished target still lists its sources", () => {
+    const r = Registry.load(gated(false));
+    expect(r.sourcesReaching(v02).map((d) => d.dna_hash)).toEqual([v01]);
+  });
+
+  it("load accepts published:true and published:false", () => {
+    expect(Registry.load(gated(true)).get(v02)?.published).toBe(true);
+    expect(Registry.load(gated(false)).get(v02)?.published).toBe(false);
+  });
+
+  it("load rejects a non-boolean published", () => {
+    const raw = gated(true);
+    // @ts-expect-error intentionally wrong type
+    raw.dnas[1].published = "yes";
+    expect(() => Registry.load(raw)).toThrow(/published must be a boolean/);
   });
 });

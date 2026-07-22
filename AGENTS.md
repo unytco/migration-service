@@ -8,14 +8,14 @@
 
 ## Stack
 
-- **`router/`** — Cloudflare Worker, TypeScript. `wrangler` + `vitest` + `tsc`. Payload-opaque, no `rave_engine` dependency. Self-contained, no private deps.
+- **`migration-router/`** — Cloudflare Worker, TypeScript. `wrangler` + `vitest` + `tsc`. Payload-opaque, no `rave_engine` dependency. Self-contained, no private deps.
 - **`notary-daemon/`** — Rust crate, `axum` + [`ham`](https://github.com/unytco/ham). Depends on the **published** `rave_engine` release for the migration wire types (no git pins — see the spec's § Versioning). Ships a build-only `flake.nix` providing the musl cross-toolchain for the static deploy binary (`automation/setup-migration-notary.sh` builds the daemon inside it); CI's `cargo build` / `cargo test` use the ambient toolchain.
 - **`headless-migrator/`** — Rust crate (standalone sibling of `notary-daemon`, same `ham` + published-`rave_engine` pins), `clap` CLI. Four modes (`status` · `close-service` · `open-service` · `verify`) run as supervised systemd services (`Restart=on-failure`, probe-first + idempotent, exit 0 only on success — no overall deadline). The close service collects M-of-N notary signatures and closes the old chain; the open service is the new server's install step (waits out gossip for the package, requests a fresh membrane proof for the carried key, installs with the package as `init_properties` so the DNA's `init` opens the chain, verifies). Operates on an already-carried agent key — the lair-version-aware key carry across droplets is `automation/`'s `migrate-carry-key.sh`. Shares the repo's musl `flake.nix`/toolchain; the gated `tests/live_roundtrip.rs` is release-time (live conductors + a `wrangler dev` router).
 
 ## Build
 
 ```bash
-cd router && npm ci
+cd migration-router && npm ci
 cd notary-daemon && cargo build --release
 cd headless-migrator && cargo build --release
 # Static deploy binaries (what automation/ ships to the non-Nix droplets):
@@ -34,7 +34,7 @@ cd headless-migrator && cargo fmt && cargo fmt --check
 ## Test
 
 ```bash
-cd router && npm run typecheck && npm test    # vitest — registry, handlers, shuffled failover, dna_hash guard
+cd migration-router && npm run typecheck && npm test    # vitest — registry, handlers, shuffled failover, dna_hash guard
 cd notary-daemon && cargo test                # mocked Conductor — /v1/fetch-close variants, two-check /healthz, bad_request
 cd headless-migrator && cargo test              # mocked Conductor — M-of-N policy, probe→next-step (incl. partial close), close/open idempotency, verify
 ```
@@ -45,7 +45,7 @@ All three suites mock their downstream (daemon `fetch` / the zome `Conductor` / 
 
 ## Deploy
 
-- **Router** — auto-deploys to the Cloudflare Worker on push to `main` via `.github/workflows/deploy.yml` (`cloudflare/wrangler-action`). The registry is bundled (`router/registry.json`); editing it + redeploying adds a DNA version or notary. Runtime secrets (`MIGRATION_NOTARY_BEARER_TOKEN`, CF Access service token) are set once via `wrangler secret put`.
+- **Router** — auto-deploys to the Cloudflare Worker on push to `main` via `.github/workflows/deploy.yml` (`cloudflare/wrangler-action`). The registry is bundled (`migration-router/registry.json`); editing it + redeploying adds a DNA version or notary. Runtime secrets (`MIGRATION_NOTARY_BEARER_TOKEN`, CF Access service token) are set once via `wrangler secret put`.
 - **Notary daemon** — CI-tested here, but ships to HEART conductor droplets through unyt's deployment-automation hub (binary + systemd + a Cloudflare Tunnel), not auto-deployed. The host shape lives in unyt's internal `notary-host.md` spec.
 
 ## Repo-specific rules

@@ -27,6 +27,14 @@ export interface DnaEntry {
   release_url?: string;
   /** 1..N notary daemons serving this DNA (redundancy / failover). */
   notaries: NotaryEntry[];
+  /** Customer-visibility gate for this DNA as a migration TARGET (customers-last, Stage 7.1).
+   * HONORED by /v1/update-check (`furthestTargetOf`): an unpublished successor is invisible, so
+   * the app shows no upgrade banner. IGNORED by /v1/migrate + /v1/migration-options
+   * (`reaches` / `sourcesReaching`): the close-package is served regardless, so the headless
+   * server open can fetch the successor BEFORE it is surfaced to customers. Absent = unpublished
+   * (the safe default): the routing phase registers a target `false`, the publish phase flips it
+   * `true` once the whole fleet has migrated. */
+  published?: boolean;
 }
 
 export interface RawRegistry {
@@ -80,6 +88,8 @@ export class Registry {
       seen.add(d.dna_hash);
       if (!d.version)
         throw new Error(`registry entry ${d.dna_hash} missing version`);
+      if (d.published !== undefined && typeof d.published !== "boolean")
+        throw new Error(`registry entry ${d.dna_hash}: published must be a boolean`);
       if (!Array.isArray(d.notaries))
         throw new Error(`registry entry ${d.dna_hash} missing notaries`);
       for (const n of d.notaries) {
@@ -182,16 +192,20 @@ export class Registry {
     return out;
   }
 
-  /** The furthest proven target of `currentDnaHash`: the deepest entry in its
-   * forward chain that is also listed in its `upgrade_targets`. A multi-version
-   * skip lands here in one hop. `undefined` when there is no proven target. */
+  /** The furthest proven, PUBLISHED target of `currentDnaHash`: the deepest entry in its
+   * forward chain that is both listed in its `upgrade_targets` and `published` (customer-visible).
+   * A multi-version skip lands here in one hop. An unpublished target is skipped as if absent, so
+   * this falls back to the nearest published proven target (and returns `undefined` when none is
+   * published yet) — the customers-last gate that keeps a routable-but-unpublished successor out of
+   * the /v1/update-check banner. `undefined` when there is no proven target. */
   furthestTargetOf(currentDnaHash: string): DnaEntry | undefined {
     const current = this.byHash.get(currentDnaHash);
     if (!current?.upgrade_targets?.length) return undefined;
     const targets = new Set(current.upgrade_targets);
     const chain = this.forwardChain(currentDnaHash);
     for (let i = chain.length - 1; i >= 0; i--) {
-      if (targets.has(chain[i].dna_hash)) return chain[i];
+      if (targets.has(chain[i].dna_hash) && chain[i].published === true)
+        return chain[i];
     }
     return undefined;
   }

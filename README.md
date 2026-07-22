@@ -4,7 +4,7 @@ Off-chain pipeline for unyt DNA migration. Lets an app fetch its committed closi
 
 Two components:
 
-- **`router/`** — a Cloudflare Worker (TypeScript). Public HTTP entry point. Reads a bundled registry (version chain + per-DNA notary endpoints, each pinned to a daemon API version), validates the `(from_dna_hash, to_dna_hash)` pair against the `upgrades_from` chain, tries the from-DNA's notary daemons in per-request random order (transient failures fail over; hard stops return immediately), calls the chosen daemon's `/{api}/fetch-close`, and returns the closing-summary package `{ payload, notary_signatures, close_action }` verbatim to the app. Holds no keys and never interprets the payload.
+- **`migration-router/`** — a Cloudflare Worker (TypeScript). Public HTTP entry point. Reads a bundled registry (version chain + per-DNA notary endpoints, each pinned to a daemon API version), validates the `(from_dna_hash, to_dna_hash)` pair against the `upgrades_from` chain, tries the from-DNA's notary daemons in per-request random order (transient failures fail over; hard stops return immediately), calls the chosen daemon's `/{api}/fetch-close`, and returns the closing-summary package `{ payload, notary_signatures, close_action }` verbatim to the app. Holds no keys and never interprets the payload.
 
 - **`notary-daemon/`** — a Rust `axum` + [`ham`](https://github.com/unytco/ham) service. Runs co-located with a Holochain conductor that keeps serving the old (from-DNA) network. Its `/v1/fetch-close` calls the alliance `read_predecessor_close` zome fn — a pure read of the agent's committed close; the M-of-N notary signatures *inside* the package carry the trust, collected on-chain before the close. The daemon has **no signing capability of any kind**. Exposed to the router via a Cloudflare Tunnel; healthy only when both the conductor and its app cell answer.
 
@@ -17,7 +17,7 @@ Full design + protocol contracts are maintained in unyt's internal version-migra
 ## Layout
 
 ```text
-router/          Cloudflare Worker (TS) — wrangler + vitest
+migration-router/ Cloudflare Worker (TS) — wrangler + vitest
 notary-daemon/   Rust crate — axum + ham
 headless-migrator/ Rust crate — clap + ham (headless server-agent close/open services)
 .github/workflows/  ci.yml (test on develop) + deploy.yml (router → CF on main)
@@ -25,7 +25,7 @@ headless-migrator/ Rust crate — clap + ham (headless server-agent close/open s
 
 ## Build / test
 
-- **router/** — `npm ci && npm run typecheck && npm test`. Self-contained, no private deps.
+- **migration-router/** — `npm ci && npm run typecheck && npm test`. Self-contained, no private deps.
 - **notary-daemon/** — `cd notary-daemon && cargo test`. The migration wire types come from the **published `rave_engine`** release (crates.io — no unyt-repo access needed); `ham` is a public git dep ([`unytco/ham`](https://github.com/unytco/ham) — fetched anonymously, no token). The HTTP↔zome mapping tests mock the conductor, so they need no Holochain conductor.
 - **headless-migrator/** — `cd headless-migrator && cargo test`. Same public deps as the daemon. The M-of-N policy, the probe→next-step state machine (incl. partial close), close/open idempotency, and the verify comparison are all tested against a scripted mock conductor — no Holochain conductor needed.
 - **Real-conductor round-trips (gated):** `cd notary-daemon && cargo test --test live_roundtrip -- --ignored` (a live conductor with a closed agent — locks the package ⇄ `MigrationInitRequest` serde round-trip) and `cd headless-migrator && cargo test --test live_roundtrip -- --ignored` (live old+new conductors + a `wrangler dev` router — the full close → carry → open → verify arc + restart drills). Env vars + fixture notes in each test's file header.

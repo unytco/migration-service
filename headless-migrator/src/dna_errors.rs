@@ -13,7 +13,7 @@
 //!     successor GlobalDefinition at init") + the GD lookup's "No Global
 //!     Definition found" (`.../progenitor_calls/global_definition.rs`),
 //!   * transport / conductor errors that never came from a validator, and
-//!   * the router's wire error codes (`migration-service/router`) — a separate
+//!   * the router's wire error codes (`migration-service/migration-router`) — a separate
 //!     string namespace that shares this home, unchanged.
 //!
 //! Any change to an UNTAGGED message must still be mirrored here; tagged
@@ -133,12 +133,28 @@ fn is_successor_gd_not_in_effect(r_lower: &str) -> bool {
         || r_lower.contains("no global definition found")
 }
 
-/// Terminal `Invalid` verdicts from the opening-summary validator + the notary
-/// threshold check — an unfixable payload/key/signature problem. Mirrors the
-/// exact `ValidateCallbackResult::Invalid(...)` strings in the integrity zome.
-/// Each token is anchored to the fuller, distinctive validator phrase so a
-/// short, ambiguous fragment can't shadow a transient error.
+/// Terminal `Invalid` verdicts from the opening-summary validator, the notary
+/// threshold check, and `genesis_self_check`'s membrane-proof gate — an unfixable
+/// payload/key/signature problem. Mirrors the exact
+/// `ValidateCallbackResult::Invalid(...)` strings in the integrity zome. Each
+/// token is anchored to the fuller, distinctive validator phrase so a short,
+/// ambiguous fragment can't shadow a transient error.
 fn is_migration_init_hard_failure(r_lower: &str) -> bool {
+    // `genesis_self_check` → `check_membrane_proof` (alliance integrity zome,
+    // `mem_proof.rs`). These became REACHABLE on this path only once the install
+    // started applying the network's DNA properties: the gate is skipped entirely
+    // while `joining_server_signer` is None, which is exactly what a
+    // property-less (isolated) install produced. A rejected proof is terminal —
+    // the joining service must issue a new one — so it must never land on the
+    // unbounded transient retry, which would spin forever emitting nothing but
+    // "transient failure, retrying".
+    if r_lower.contains("membrane proof required")
+        || r_lower.contains("signer is not the authorized progenitor")
+        || r_lower.contains("membrane proof is not for this agent")
+        || r_lower.contains("membrane proof signature is invalid")
+    {
+        return true;
+    }
     // `validate_opening_state_summary`: the carried key isn't the notarized agent.
     r_lower.contains("does not match the notarized agent")
         // `verify_notary_threshold`: not enough valid signatures. The full
@@ -238,7 +254,7 @@ pub fn is_recognized_close_state_response(rendered: &str) -> bool {
 
 /// Whether a router error `code` is a genuine hard stop for the migration —
 /// a fault no amount of retrying will fix. Mirrors the router's wire codes (the
-/// `ErrorCode` union in `migration-service/router/src/errors.ts`; a different
+/// `ErrorCode` union in `migration-service/migration-router/src/errors.ts`; a different
 /// namespace from the DNA validator strings above, but the same fragile string
 /// contract, so it shares this home). Keep this set + [`router_code_is_retryable`]
 /// in sync with that union: every code is exactly one of the two.
@@ -362,6 +378,30 @@ mod tests {
             ),
             InitErrorClass::HardFailure
         );
+    }
+
+    /// `genesis_self_check`'s membrane-proof verdicts must be TERMINAL. This path
+    /// only became reachable once the install started applying the network's DNA
+    /// properties (the gate is skipped while `joining_server_signer` is None), and
+    /// a rejected proof is unfixable by retrying — classed transient it would spin
+    /// the supervised loop forever with no diagnosis. Strings mirrored verbatim
+    /// from the alliance integrity zome's `mem_proof.rs`.
+    #[test]
+    fn rejected_membrane_proofs_are_hard_failures_not_infinite_retries() {
+        for verdict in [
+            "Membrane proof required",
+            "Signer is not the authorized progenitor",
+            "Membrane proof is not for this agent",
+            "Membrane proof signature is invalid",
+        ] {
+            assert_eq!(
+                classify_migration_init_error(&format!(
+                    "wasm error: Guest(\"InvalidCommit: {verdict}\")"
+                )),
+                InitErrorClass::HardFailure,
+                "a rejected membrane proof must hard-stop, never retry forever: {verdict}"
+            );
+        }
     }
 
     #[test]

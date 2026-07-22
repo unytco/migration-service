@@ -43,12 +43,14 @@ function registry(): Registry {
         upgrade_targets: [v03],
         release_url:
           "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+        published: true,
         notaries: [{ url: "https://n2", api: "v1" }],
       },
       {
         dna_hash: v03,
         version: "alliance-v0.3.0",
         upgrades_from: v02,
+        published: true,
         notaries: [{ url: "https://n3", api: "v1" }],
       },
     ],
@@ -205,6 +207,7 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
           version: "b",
           upgrades_from: a,
           release_url: "https://example/b",
+          published: true,
           notaries: [{ url: "https://nb", api: "v1" }],
         },
       ],
@@ -243,6 +246,72 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
       await updateCheck(registry(), v03, "nightly", noGh, ENV),
     );
     expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
+  });
+});
+
+// The customers-last split, end to end through the handlers: the SAME registry entry is served by
+// /v1/migrate (the headless server open) while being invisible to /v1/update-check (the customer
+// banner), until the publish phase flips `published`. This is the whole point of the visibility gate.
+describe("updateCheck ⟂ migrate — the published (customers-last) split", () => {
+  const noGh = mockFetch({}); // update-check's no-version path must reach no network
+
+  /** A single-step chain v01 → v02, with v02's customer-visibility parameterised. */
+  function gated(published: boolean): Registry {
+    return Registry.load({
+      version: 1,
+      dnas: [
+        {
+          dna_hash: v01,
+          version: "alliance-v0.1.0",
+          upgrade_targets: [v02],
+          notaries: [{ url: "https://n1", api: "v1" }],
+        },
+        {
+          dna_hash: v02,
+          version: "alliance-v0.2.0",
+          upgrades_from: v01,
+          release_url:
+            "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+          published,
+          notaries: [{ url: "https://n2", api: "v1" }],
+        },
+      ],
+    });
+  }
+
+  it("update-check HIDES an unpublished successor (no banner, has_upgrade:false)", async () => {
+    const b = await body(await updateCheck(gated(false), v01, null, noGh, ENV));
+    expect(b).toEqual({ current_dna_hash: v01, has_upgrade: false });
+  });
+
+  it("migrate SERVES that same unpublished successor's close package (server open works pre-publish)", async () => {
+    const f = mockFetch({ "https://n1": () => packageResp(v01, v02, "srv") });
+    const resp = await migrate(
+      gated(false),
+      { from_dna_hash: v01, to_dna_hash: v02, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
+    expect(resp.status).toBe(200);
+    expect(await body(resp)).toEqual({
+      payload: { source_dna_hash: v01, target_dna_hash: v02, closing_state: {} },
+      notary_signatures: [{ notary: "uhCAk_notary", signature: "srv" }],
+      close_action: "close-srv",
+    });
+  });
+
+  it("publishing the successor FLIPS the banner on (has_upgrade:true) — nothing else changed", async () => {
+    const b = await body(await updateCheck(gated(true), v01, null, noGh, ENV));
+    expect(b).toEqual({
+      current_dna_hash: v01,
+      has_upgrade: true,
+      target: {
+        to_dna_hash: v02,
+        to_version: "alliance-v0.2.0",
+        release_url:
+          "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+      },
+    });
   });
 });
 
@@ -330,6 +399,7 @@ describe("updateCheck — build axis (app_version present)", () => {
           upgrades_from: from,
           release_url:
             "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          published: true,
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],
@@ -363,6 +433,7 @@ describe("updateCheck — build axis (app_version present)", () => {
           upgrades_from: from,
           release_url:
             "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          published: true,
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],

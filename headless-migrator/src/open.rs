@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
+use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash, DnaHashB64};
+use holochain_types::prelude::CellId;
 use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
 
 use crate::conductor::{
@@ -280,6 +281,11 @@ pub async fn run_with(
 /// The remaining branches each fetch the package up front (the install applies
 /// it as `init_properties`, opening the chain at `init`; the not-yet-verified
 /// opened path verifies against it), preserving the fetch-before-install rule.
+// Like `install` below, one pass genuinely threads the config pair, the router /
+// join params, the joining-service I/O, the connector, the shutdown handle and
+// the run's state — a struct around them would be indirection for a single
+// caller.
+#[allow(clippy::too_many_arguments)]
 async fn attempt(
     connector: &dyn Connector,
     cfg: &Config,
@@ -318,6 +324,35 @@ async fn attempt(
                     "already migrated and previously verified (persisted) — no fetch needed"
                 );
                 return OpenOutcome::Done;
+            }
+            // Hold an ALREADY-installed app to the target too. The install-time
+            // check below only sees apps this run installed — a node a pre-fix
+            // binary (or an earlier pass) put on the wrong DNA arrives here, and
+            // without this would get the old symptom instead: a bounded wait on a
+            // GD that can never resolve, then a hard stop blaming the GD.
+            // `None` means the cell can't be read — the app is absent, or it is
+            // present with no readable provisioned cell for the role. That
+            // is UNKNOWN, not proof of a mismatch, so it stays lenient and skips
+            // the guard rather than hard-stopping a possibly-correct node; it is
+            // logged because a skipped guard is the case worth noticing. (It is
+            // deliberately not an `Err`: the present-but-unreadable state is
+            // permanent, and raising it here would spin the supervised loop.)
+            match admin.installed_cell_id(&cfg.app_id, &cfg.role_name).await {
+                Ok(Some(installed)) => {
+                    if let Some(why) = cell_target_mismatch(&installed, cfg, open_cfg, params) {
+                        return OpenOutcome::HardStop(why);
+                    }
+                    tracing::info!(
+                        dna = %DnaHashB64::from(installed.dna_hash().clone()),
+                        "installed app is on the migration target DNA, for the carried agent"
+                    );
+                }
+                Ok(None) => tracing::warn!(
+                    app_id = %cfg.app_id,
+                    role = %cfg.role_name,
+                    "could not read the installed cell's DNA — skipping the target-DNA check"
+                ),
+                Err(e) => return OpenOutcome::Transient(e.context("reading the installed DNA")),
             }
             // Installed but not yet verified — either the chain is already open (a
             // restart mid-verify) or `init` hasn't been driven yet (a restart
@@ -480,13 +515,81 @@ async fn install(
         network_seed: provision
             .network_seed
             .or_else(|| open_cfg.network_seed.clone()),
+        // The target release's joining service is the only source for the
+        // network's DNA properties — they are per-release (the progenitor key is
+        // minted at deploy) and hashed into the DNA hash, so the carried key must
+        // install with exactly the ones every other agent on the network used.
+        properties: provision.properties,
         membrane_proof,
         migration_package: Some(package.clone()),
     };
-    if let Err(e) = admin.install_app(&spec).await {
-        return Err(install_error_outcome(e));
+    let installed_cell = match admin.install_app(&spec).await {
+        Ok(cell_id) => cell_id,
+        Err(e) => return Err(install_error_outcome(e)),
+    };
+    match cell_target_mismatch(&installed_cell, cfg, open_cfg, params) {
+        Some(why) => Err(OpenOutcome::HardStop(why)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Hold the app's cell to what this migration is FOR — the target DNA and the
+/// carried agent — returning the hard-stop reason when it isn't. The install
+/// applies the network's DNA modifiers (seed + properties) precisely so the
+/// carried key lands on the SAME DNA as everyone else on the target network;
+/// anything else means this cell sits alone on an empty DHT — no peers, no
+/// gossip, and an `init` that can never resolve the successor GD. Caught here it
+/// is one clear line naming both hashes; uncaught it reads as a GD that never
+/// arrives, hours later. The AGENT half matters on a node running two migrating
+/// apps off ONE shared carried lair (the bridging node's `bridging-app` +
+/// `hh-pricing-oracle`): crossed keys give the right DNA under the wrong agent,
+/// which the DNA check alone waves through, to resurface later as the misleading
+/// "init_properties were not applied". Pure, so the fresh-install and the
+/// already-installed paths share one message.
+fn cell_target_mismatch(
+    installed: &CellId,
+    cfg: &Config,
+    open_cfg: &OpenConfig,
+    params: &OpenParams,
+) -> Option<String> {
+    if *installed.agent_pubkey() != params.agent_key {
+        // A different remedy from a DNA mismatch: the cell is on the right
+        // network, but installed FOR the wrong key — the carried key never
+        // migrates, and this app's chain would be a stranger's.
+        return Some(format!(
+            "app '{}' was installed for agent {} but this migration carries {} — the cell is on \
+             the right DNA under the WRONG key, so the carried chain would never be opened. \
+             Check this app's `agent_key` in the node's `.migrate.apps[]` config (a node running \
+             several migrating apps off one shared lair can cross them) and that the carried key \
+             was imported into this node's lair.",
+            cfg.app_id,
+            AgentPubKeyB64::from(installed.agent_pubkey().clone()),
+            AgentPubKeyB64::from(params.agent_key.clone()),
+        ));
+    }
+    if *installed.dna_hash() == DnaHash::from(params.to_dna.clone()) {
+        return None;
+    }
+    let installed = installed.dna_hash();
+    // Three inputs decide the resulting DNA hash, and any of them can be the
+    // wrong one — name them all rather than blaming the modifiers alone. The
+    // remedy is deliberately ordered diagnose-then-act: if the wrong input is the
+    // TARGET, the installed cell is the correct one (and may already hold an
+    // opened chain), so "uninstall" must never be the first instruction.
+    Some(format!(
+        "app '{}' is on DNA {} but the migration target is {} — this cell would sit alone on an \
+         empty DHT, never reaching the network. First identify which of three inputs is wrong: \
+         the DNA modifiers (network seed / properties) served by {}, the happ bundle at {} (a \
+         stale build hashes differently), or the target DNA itself (the router registry entry / \
+         --to-dna). Correct that input; only if the INSTALL is the wrong one, uninstall app '{}' \
+         on this node before re-running the open.",
+        cfg.app_id,
+        DnaHashB64::from(installed.clone()),
+        params.to_dna,
+        open_cfg.joining_url,
+        open_cfg.happ_path.display(),
+        cfg.app_id,
+    ))
 }
 
 /// Map an `install_app` (install + enable) failure onto the open outcome. The

@@ -14,6 +14,7 @@ use headless_migrator::config::{Config, OpenConfig};
 use headless_migrator::open::{self, OpenParams};
 use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{State, Step};
+use holochain_types::prelude::CellId;
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -185,6 +186,156 @@ async fn gd_wait_exhaustion_reports_a_config_fault_not_a_raw_genesis_error() {
     assert!(
         mock.calls().contains(&Call::VerifyIfMigrated),
         "the loop drove init via verify_if_migrated: {:?}",
+        mock.calls()
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// A node an earlier (pre-fix) install put on the WRONG DNA takes the
+/// already-installed path, so the install-time target check never sees it. Without
+/// a check here it would spend the whole GD budget on a definition that can never
+/// resolve, then blame the GD. The loop reads the installed cell's DNA (admin-only,
+/// no zome call) and hard-stops immediately, naming both hashes and the three
+/// inputs that decide them.
+#[tokio::test]
+async fn an_already_installed_app_on_the_wrong_dna_hard_stops_immediately() {
+    let state_file = tmp_state("wrong-dna");
+
+    let mock = Arc::new(MockConductor::default());
+    // TWO scripted passes, though a working guard stops on the first: with the
+    // guard removed the loop falls through to the (unroutable) router and retries,
+    // and the second entry keeps that retry from panicking on an exhausted mock —
+    // so this test then fails on its own assertions, naming what broke, rather
+    // than on an unrelated "no scripted response" panic.
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    // Installed on dna(9) for the right agent; the migration target below is dna(2).
+    *mock.installed_cell.lock().unwrap() = Some(CellId::new(dna(9), agent(3)));
+
+    let happ = tmp_state("dummy-happ-wrong-dna");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: "http://127.0.0.1:1".into(),
+        network_seed: None,
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        // An unroutable router: the check must fire BEFORE any package fetch, so
+        // this is never reached.
+        router_url: "http://127.0.0.1:1".into(),
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+        lair_url: "unix:///nonexistent".into(),
+        lair_passphrase: "x".into(),
+    };
+
+    let mut sd = never_shutdown();
+    let err = open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd)
+        .await
+        .expect_err("an app on the wrong DNA must hard-stop the open service")
+        .to_string();
+
+    assert!(
+        err.contains(&dna_b64(9).to_string()) && err.contains(&dna_b64(2).to_string()),
+        "the hard stop names the installed DNA and the target: {err}"
+    );
+    assert!(
+        err.contains("alone on an empty DHT"),
+        "the hard stop explains the consequence: {err}"
+    );
+
+    // It stopped at the DNA check — never drove init, never fetched.
+    assert!(
+        !mock.calls().contains(&Call::VerifyIfMigrated),
+        "the loop must not drive init on a cell that is on the wrong DNA: {:?}",
+        mock.calls()
+    );
+
+    let state = State::read(&state_file).unwrap();
+    assert_eq!(state.step, Step::Failed);
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// The bridging node runs TWO migrating apps off one shared carried lair, each
+/// with its own `agent_key` — the shape where a config slip lands a cell on the
+/// RIGHT DNA under the WRONG agent. The DNA check alone waves that through; the
+/// carried chain then never opens, and it resurfaces as the misleading
+/// "init_properties were not applied". The guard compares the whole CellId.
+#[tokio::test]
+async fn an_installed_app_for_the_wrong_agent_hard_stops() {
+    let state_file = tmp_state("wrong-agent");
+
+    let mock = Arc::new(MockConductor::default());
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Installed));
+    // Right DNA (the target below is dna(2)), but installed for agent(8) while
+    // this migration carries agent(3).
+    *mock.installed_cell.lock().unwrap() = Some(CellId::new(dna(2), agent(8)));
+
+    let happ = tmp_state("dummy-happ-wrong-agent");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: "http://127.0.0.1:1".into(),
+        network_seed: None,
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: "http://127.0.0.1:1".into(),
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+        lair_url: "unix:///nonexistent".into(),
+        lair_passphrase: "x".into(),
+    };
+
+    let mut sd = never_shutdown();
+    let err = open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd)
+        .await
+        .expect_err("an app installed for the wrong agent must hard-stop")
+        .to_string();
+
+    assert!(
+        err.contains("WRONG key"),
+        "the hard stop names the crossed-key fault rather than a DNA mismatch: {err}"
+    );
+    assert!(
+        err.contains("agent_key"),
+        "the hard stop points at the `.migrate.apps[]` agent_key config: {err}"
+    );
+    assert!(
+        !mock.calls().contains(&Call::VerifyIfMigrated),
+        "the loop must not drive init for the wrong agent: {:?}",
+        mock.calls()
+    );
+    // The guard genuinely ran (rather than the run failing earlier).
+    assert!(
+        mock.calls().contains(&Call::InstalledCellId),
+        "the loop read the installed cell: {:?}",
         mock.calls()
     );
 
