@@ -9,4 +9,4 @@
 
 name = "migration-router-local"
 main = "src/index.local.ts"
-compatibility_date = "2024-09-23"
+compatibility_date = "2024-12-30"

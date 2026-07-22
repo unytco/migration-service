@@ -20,7 +20,7 @@ Full design + protocol contracts are maintained in unyt's internal version-migra
 migration-router/ Cloudflare Worker (TS) — wrangler + vitest
 notary-daemon/   Rust crate — axum + ham
 headless-migrator/ Rust crate — clap + ham (headless server-agent close/open services)
-.github/workflows/  ci.yml (test on develop) + deploy.yml (router → CF on main)
+.github/workflows/  ci.yml (test on push/PR to develop + main) + deploy.yml (router → CF on main)
 ```
 
 ## Build / test

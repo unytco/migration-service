@@ -73,12 +73,25 @@ const FETCH_CLOSE_TIMEOUT_MS = 10_000;
  * string ("uhC0k…") OR as a raw HoloHash byte array — the notary relays the
  * zome's close payload verbatim, and holo_hash serializes to bytes there. The
  * router compares these against the registry's b64 DNA hashes, so it must accept
- * both. Returns the b64 form, or `undefined` for null / an unrecognized shape.
- * (A 39-byte HoloHash → `"u"` + unpadded base64url, matching `encodeHashToBase64`.)
+ * both. Returns the b64 form, or `undefined` for anything that is not a b64
+ * string or a well-formed HoloHash byte array.
+ *
+ * A HoloHash is EXACTLY 39 unsigned bytes (3-byte prefix + 32-byte hash + 4-byte
+ * location), so only a 39-element array of integers in 0..=255 is accepted. A
+ * wrong-length or out-of-range array is malformed and yields `undefined` rather
+ * than a bogus b64 (`String.fromCharCode` would silently wrap/truncate a bad
+ * value). (A 39-byte HoloHash → `"u"` + unpadded base64url, matching
+ * `encodeHashToBase64`.)
  */
 export function normalizeDnaHashB64(value: unknown): string | undefined {
   if (typeof value === "string") return value;
-  if (Array.isArray(value) && value.length > 0 && value.every((b) => typeof b === "number")) {
+  if (
+    Array.isArray(value) &&
+    value.length === 39 &&
+    value.every(
+      (b) => typeof b === "number" && Number.isInteger(b) && b >= 0 && b <= 255,
+    )
+  ) {
     const bin = String.fromCharCode(...(value as number[]));
     return "u" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
@@ -138,22 +151,24 @@ export async function fetchClose(
     ) {
       return { kind: "transient", code: "unable_to_verify" };
     }
-    // B2: the daemon serves exactly one DNA, so a wrong `source_dna_hash` is a
-    // misconfigured notary (registry URL ↔ daemon mismatch) — reject as `internal`.
-    // Normalize first: the hash may be a b64 string or a raw byte array, and a
-    // non-string used to SKIP this check (fail-open) — normalizing closes that.
+    // B2 / fail-closed: the daemon serves exactly one DNA, and a well-formed close
+    // ALWAYS binds a `source_dna_hash` (a required field of rave_engine's
+    // SummaryStatePayload). So anything other than the source we queried — a
+    // mismatch, a missing field, or a malformed hash that normalizes to `undefined`
+    // — can't be proven to belong here; reject as `internal` rather than forward an
+    // unbound package. Normalize first: the hash may be a b64 string or a byte array.
     const payloadSourceDna = normalizeDnaHashB64(
       (body.payload as { source_dna_hash?: unknown } | undefined)?.source_dna_hash,
     );
-    if (payloadSourceDna !== undefined && payloadSourceDna !== expectedDnaHash) {
+    if (payloadSourceDna !== expectedDnaHash) {
       return {
         kind: "hard_stop",
         status: 500,
         code: "internal",
-        message: "notary returned a payload for a different source DNA",
+        message: "notary returned a payload for a different or missing source DNA",
         details: {
           expected_dna_hash: expectedDnaHash,
-          got_dna_hash: payloadSourceDna,
+          got_dna_hash: payloadSourceDna ?? null,
         },
       };
     }

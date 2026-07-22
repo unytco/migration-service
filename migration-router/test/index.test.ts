@@ -86,14 +86,29 @@ describe("worker.fetch — CORS preflight", () => {
 });
 
 describe("worker.fetch — unknown route", () => {
-  it("GET /nope → 404 internal", async () => {
+  it("GET /nope → 404 bad_request (client error, not internal)", async () => {
     const resp = await get("/nope");
     expect(resp.status).toBe(404);
-    expect((await body(resp)).error.code).toBe("internal");
+    expect((await body(resp)).error.code).toBe("bad_request");
   });
 
   it("404 response also carries CORS", async () => {
     const resp = await get("/nope");
     expect(resp.headers.get("access-control-allow-origin")).toBe("*");
+  });
+});
+
+describe("worker.fetch — POST /v1/migrate with a malformed body", () => {
+  it("non-JSON body → 400 bad_request (client error, not internal)", async () => {
+    const resp = await worker.fetch(
+      new Request(`${BASE}/v1/migrate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "not json{",
+      }),
+      ENV,
+    );
+    expect(resp.status).toBe(400);
+    expect((await body(resp)).error.code).toBe("bad_request");
   });
 });

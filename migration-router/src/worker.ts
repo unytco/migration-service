@@ -88,7 +88,7 @@ export function createWorker(registry: Registry) {
             body = (await request.json()) as MigrateBody;
           } catch {
             return withCors(
-              errorJson(400, "internal", "request body must be JSON"),
+              errorJson(400, "bad_request", "request body must be JSON"),
             );
           }
           return withCors(await migrate(registry, body, env, fetch));
@@ -96,7 +96,7 @@ export function createWorker(registry: Registry) {
         return withCors(
           errorJson(
             404,
-            "internal",
+            "bad_request",
             `no route for ${request.method} ${pathname}`,
           ),
         );

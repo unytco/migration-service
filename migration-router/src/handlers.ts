@@ -35,6 +35,12 @@ export function migrationOptions(
       "to_dna_hash query parameter is required",
     );
   }
+  // An unregistered target is a client error, not an empty result: mirror
+  // /v1/migrate's `unknown_to_dna` so an unknown hash never reads as "known, but
+  // no sources reach it" (which `options: []` would imply).
+  if (!registry.get(toDnaHash)) {
+    return errorJson(400, "unknown_to_dna", `unknown to_dna_hash ${toDnaHash}`);
+  }
   // Any source with a proven path to `to` (direct skip, not just the immediate
   // predecessor) — the app may have closed on any of them.
   const options = registry

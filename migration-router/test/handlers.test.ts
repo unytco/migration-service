@@ -128,14 +128,16 @@ describe("migrationOptions", () => {
     ]);
   });
 
-  it("chain root returns empty options", async () => {
-    const b = await body(migrationOptions(registry(), v01));
-    expect(b.options).toEqual([]);
+  it("chain root (registered, no sources) returns empty options", async () => {
+    const resp = migrationOptions(registry(), v01);
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).options).toEqual([]);
   });
 
-  it("unknown DNA returns empty options", async () => {
-    const b = await body(migrationOptions(registry(), "uhC0k_unknown"));
-    expect(b.options).toEqual([]);
+  it("unknown DNA errors like migrate (400 unknown_to_dna, not empty options)", async () => {
+    const resp = migrationOptions(registry(), "uhC0k_unknown");
+    expect(resp.status).toBe(400);
+    expect((await body(resp)).error.code).toBe("unknown_to_dna");
   });
 
   it("missing to_dna_hash errors", async () => {
@@ -750,6 +752,90 @@ describe("migrate — notary dispatch + failover", () => {
     expect(b.error.code).toBe("internal");
     expect(b.error.details.expected_dna_hash).toBe(v01);
     expect(b.error.details.got_dna_hash).toBe(v02);
+  });
+
+  // Fail-closed: a well-formed close ALWAYS binds a source_dna_hash (rave_engine's
+  // SummaryStatePayload.source_dna_hash is a required field), so a package that omits
+  // it is unbound and must NOT be forwarded — reject as internal, surfacing got=null.
+  it("a package missing source_dna_hash → 500 internal (unbound, not forwarded)", async () => {
+    const noSource = () =>
+      jsonResp(200, {
+        payload: { target_dna_hash: v02, closing_state: {} }, // no source_dna_hash
+        notary_signatures: [{ notary: "x", signature: "s" }],
+        close_action: "c",
+      });
+    const f = mockFetch({ "https://n1a": noSource, "https://n1b": noSource });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    const b = await body(resp);
+    expect(resp.status).toBe(500);
+    expect(b.error.code).toBe("internal");
+    expect(b.error.details.expected_dna_hash).toBe(v01);
+    expect(b.error.details.got_dna_hash).toBe(null);
+  });
+
+  // A malformed source_dna_hash (not a 39-byte HoloHash array) normalizes to
+  // undefined and is rejected the same way — never forwarded.
+  it("a malformed byte-array source_dna_hash → 500 internal (not forwarded)", async () => {
+    const badArray = () =>
+      jsonResp(200, {
+        payload: {
+          source_dna_hash: [1, 2, 3], // too short to be a 39-byte HoloHash
+          target_dna_hash: v02,
+          closing_state: {},
+        },
+        notary_signatures: [{ notary: "x", signature: "s" }],
+        close_action: "c",
+      });
+    const f = mockFetch({ "https://n1a": badArray, "https://n1b": badArray });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(500);
+    expect((await body(resp)).error.code).toBe("internal");
+  });
+
+  // The raw-byte-array hash path still works end to end after the 39-byte tightening:
+  // a source delivered as a 39-byte HoloHash array normalizes to the registry b64 and
+  // is accepted. Node's base64url is an independent oracle for the expected b64.
+  it("accepts a source_dna_hash delivered as a raw 39-byte HoloHash array", async () => {
+    const srcBytes = [0x84, 0x2d, 0x24, ...Array(32).fill(7), 0, 0, 0, 0]; // 3+32+4 = 39
+    const srcB64 = "u" + Buffer.from(srcBytes).toString("base64url");
+    const to = "uhC0k_to_bytes";
+    const r = Registry.load({
+      version: 1,
+      dnas: [
+        {
+          dna_hash: srcB64,
+          version: "src",
+          upgrade_targets: [to],
+          notaries: [{ url: "https://nb", api: "v1" }],
+        },
+        {
+          dna_hash: to,
+          version: "to",
+          upgrades_from: srcB64,
+          notaries: [{ url: "https://nt", api: "v1" }],
+        },
+      ],
+    });
+    const f = mockFetch({
+      "https://nb": () =>
+        jsonResp(200, {
+          payload: {
+            source_dna_hash: srcBytes,
+            target_dna_hash: to,
+            closing_state: {},
+          },
+          notary_signatures: [{ notary: "x", signature: "bytes-ok" }],
+          close_action: "c",
+        }),
+    });
+    const resp = await migrate(
+      r,
+      { from_dna_hash: srcB64, to_dna_hash: to, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).notary_signatures[0].signature).toBe("bytes-ok");
   });
 
   // A source-specific fault must NOT abort discovery of the OTHER candidate sources

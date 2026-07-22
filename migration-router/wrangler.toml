@@ -1,6 +1,6 @@
 name = "migration-router"
 main = "src/index.ts"
-compatibility_date = "2024-09-23"
+compatibility_date = "2024-12-30"
 
 # Bundled registry (registry.json) is imported by src/index.ts — no extra config.
 # JSON module imports are supported by the default bundler.
