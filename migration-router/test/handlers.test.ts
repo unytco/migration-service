@@ -114,6 +114,11 @@ describe("shuffled", () => {
   });
 });
 
+// Every 200 below asserts the echoed `to_dna_hash`. The spec § Test expectations
+// pins it ("every answer echoes the queried `to_dna_hash`") because the field is
+// load-bearing, not decorative: the app rejects an answer echoing a different hash
+// (an intermediary caching this response across query strings), and a rejected
+// answer lands on the same retry card as an unreachable router.
 describe("migrationOptions", () => {
   it("returns the immediate predecessor mid-chain", () => {
     const resp = migrationOptions(registry(), v03);
@@ -122,6 +127,7 @@ describe("migrationOptions", () => {
 
   it("v0.3 returns all sources that reach it (skip: v0.1 and v0.2)", async () => {
     const b = await body(migrationOptions(registry(), v03));
+    expect(b.to_dna_hash).toBe(v03);
     expect(b.options).toEqual([
       { from_dna_hash: v01, from_version: "alliance-v0.1.0" },
       { from_dna_hash: v02, from_version: "alliance-v0.2.0" },
@@ -131,13 +137,23 @@ describe("migrationOptions", () => {
   it("chain root (registered, no sources) returns empty options", async () => {
     const resp = migrationOptions(registry(), v01);
     expect(resp.status).toBe(200);
-    expect((await body(resp)).options).toEqual([]);
+    const b = await body(resp);
+    expect(b.to_dna_hash).toBe(v01);
+    expect(b.options).toEqual([]);
   });
 
-  it("unknown DNA errors like migrate (400 unknown_to_dna, not empty options)", async () => {
+  // Source of truth: the version-migration `migration-router.md` spec § Endpoints —
+  // "Chain root / unknown DNA → `{ options: [] }` (not an error; an empty array is
+  // the definitive 'no predecessor' the app is allowed to join fresh on)". The app
+  // reads any non-2xx here as "router unreachable" and shows a retry card, so a 4xx
+  // would strand a fresh installer.
+  it("unknown DNA returns 200 empty options, never an error (fresh-install contract)", async () => {
     const resp = migrationOptions(registry(), "uhC0k_unknown");
-    expect(resp.status).toBe(400);
-    expect((await body(resp)).error.code).toBe("unknown_to_dna");
+    expect(resp.status).toBe(200);
+    const b = await body(resp);
+    expect(b.to_dna_hash).toBe("uhC0k_unknown");
+    expect(b.options).toEqual([]);
+    expect(b.error).toBeUndefined();
   });
 
   it("missing to_dna_hash errors", async () => {
