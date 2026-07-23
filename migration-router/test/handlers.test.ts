@@ -43,12 +43,14 @@ function registry(): Registry {
         upgrade_targets: [v03],
         release_url:
           "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+        published: true,
         notaries: [{ url: "https://n2", api: "v1" }],
       },
       {
         dna_hash: v03,
         version: "alliance-v0.3.0",
         upgrades_from: v02,
+        published: true,
         notaries: [{ url: "https://n3", api: "v1" }],
       },
     ],
@@ -112,6 +114,11 @@ describe("shuffled", () => {
   });
 });
 
+// Every 200 below asserts the echoed `to_dna_hash`. The spec § Test expectations
+// pins it ("every answer echoes the queried `to_dna_hash`") because the field is
+// load-bearing, not decorative: the app rejects an answer echoing a different hash
+// (an intermediary caching this response across query strings), and a rejected
+// answer lands on the same retry card as an unreachable router.
 describe("migrationOptions", () => {
   it("returns the immediate predecessor mid-chain", () => {
     const resp = migrationOptions(registry(), v03);
@@ -120,20 +127,33 @@ describe("migrationOptions", () => {
 
   it("v0.3 returns all sources that reach it (skip: v0.1 and v0.2)", async () => {
     const b = await body(migrationOptions(registry(), v03));
+    expect(b.to_dna_hash).toBe(v03);
     expect(b.options).toEqual([
       { from_dna_hash: v01, from_version: "alliance-v0.1.0" },
       { from_dna_hash: v02, from_version: "alliance-v0.2.0" },
     ]);
   });
 
-  it("chain root returns empty options", async () => {
-    const b = await body(migrationOptions(registry(), v01));
+  it("chain root (registered, no sources) returns empty options", async () => {
+    const resp = migrationOptions(registry(), v01);
+    expect(resp.status).toBe(200);
+    const b = await body(resp);
+    expect(b.to_dna_hash).toBe(v01);
     expect(b.options).toEqual([]);
   });
 
-  it("unknown DNA returns empty options", async () => {
-    const b = await body(migrationOptions(registry(), "uhC0k_unknown"));
+  // Source of truth: the version-migration `migration-router.md` spec § Endpoints —
+  // "Chain root / unknown DNA → `{ options: [] }` (not an error; an empty array is
+  // the definitive 'no predecessor' the app is allowed to join fresh on)". The app
+  // reads any non-2xx here as "router unreachable" and shows a retry card, so a 4xx
+  // would strand a fresh installer.
+  it("unknown DNA returns 200 empty options, never an error (fresh-install contract)", async () => {
+    const resp = migrationOptions(registry(), "uhC0k_unknown");
+    expect(resp.status).toBe(200);
+    const b = await body(resp);
+    expect(b.to_dna_hash).toBe("uhC0k_unknown");
     expect(b.options).toEqual([]);
+    expect(b.error).toBeUndefined();
   });
 
   it("missing to_dna_hash errors", async () => {
@@ -205,6 +225,7 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
           version: "b",
           upgrades_from: a,
           release_url: "https://example/b",
+          published: true,
           notaries: [{ url: "https://nb", api: "v1" }],
         },
       ],
@@ -243,6 +264,72 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
       await updateCheck(registry(), v03, "nightly", noGh, ENV),
     );
     expect(b).toEqual({ current_dna_hash: v03, has_upgrade: false });
+  });
+});
+
+// The customers-last split, end to end through the handlers: the SAME registry entry is served by
+// /v1/migrate (the headless server open) while being invisible to /v1/update-check (the customer
+// banner), until the publish phase flips `published`. This is the whole point of the visibility gate.
+describe("updateCheck ⟂ migrate — the published (customers-last) split", () => {
+  const noGh = mockFetch({}); // update-check's no-version path must reach no network
+
+  /** A single-step chain v01 → v02, with v02's customer-visibility parameterised. */
+  function gated(published: boolean): Registry {
+    return Registry.load({
+      version: 1,
+      dnas: [
+        {
+          dna_hash: v01,
+          version: "alliance-v0.1.0",
+          upgrade_targets: [v02],
+          notaries: [{ url: "https://n1", api: "v1" }],
+        },
+        {
+          dna_hash: v02,
+          version: "alliance-v0.2.0",
+          upgrades_from: v01,
+          release_url:
+            "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+          published,
+          notaries: [{ url: "https://n2", api: "v1" }],
+        },
+      ],
+    });
+  }
+
+  it("update-check HIDES an unpublished successor (no banner, has_upgrade:false)", async () => {
+    const b = await body(await updateCheck(gated(false), v01, null, noGh, ENV));
+    expect(b).toEqual({ current_dna_hash: v01, has_upgrade: false });
+  });
+
+  it("migrate SERVES that same unpublished successor's close package (server open works pre-publish)", async () => {
+    const f = mockFetch({ "https://n1": () => packageResp(v01, v02, "srv") });
+    const resp = await migrate(
+      gated(false),
+      { from_dna_hash: v01, to_dna_hash: v02, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
+    expect(resp.status).toBe(200);
+    expect(await body(resp)).toEqual({
+      payload: { source_dna_hash: v01, target_dna_hash: v02, closing_state: {} },
+      notary_signatures: [{ notary: "uhCAk_notary", signature: "srv" }],
+      close_action: "close-srv",
+    });
+  });
+
+  it("publishing the successor FLIPS the banner on (has_upgrade:true) — nothing else changed", async () => {
+    const b = await body(await updateCheck(gated(true), v01, null, noGh, ENV));
+    expect(b).toEqual({
+      current_dna_hash: v01,
+      has_upgrade: true,
+      target: {
+        to_dna_hash: v02,
+        to_version: "alliance-v0.2.0",
+        release_url:
+          "https://github.com/unytco/unyt-sandbox/releases/tag/v0.2.0",
+      },
+    });
   });
 });
 
@@ -330,6 +417,7 @@ describe("updateCheck — build axis (app_version present)", () => {
           upgrades_from: from,
           release_url:
             "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          published: true,
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],
@@ -363,6 +451,7 @@ describe("updateCheck — build axis (app_version present)", () => {
           upgrades_from: from,
           release_url:
             "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
+          published: true,
           notaries: [{ url: "https://nt", api: "v1" }],
         },
       ],
@@ -679,6 +768,90 @@ describe("migrate — notary dispatch + failover", () => {
     expect(b.error.code).toBe("internal");
     expect(b.error.details.expected_dna_hash).toBe(v01);
     expect(b.error.details.got_dna_hash).toBe(v02);
+  });
+
+  // Fail-closed: a well-formed close ALWAYS binds a source_dna_hash (rave_engine's
+  // SummaryStatePayload.source_dna_hash is a required field), so a package that omits
+  // it is unbound and must NOT be forwarded — reject as internal, surfacing got=null.
+  it("a package missing source_dna_hash → 500 internal (unbound, not forwarded)", async () => {
+    const noSource = () =>
+      jsonResp(200, {
+        payload: { target_dna_hash: v02, closing_state: {} }, // no source_dna_hash
+        notary_signatures: [{ notary: "x", signature: "s" }],
+        close_action: "c",
+      });
+    const f = mockFetch({ "https://n1a": noSource, "https://n1b": noSource });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    const b = await body(resp);
+    expect(resp.status).toBe(500);
+    expect(b.error.code).toBe("internal");
+    expect(b.error.details.expected_dna_hash).toBe(v01);
+    expect(b.error.details.got_dna_hash).toBe(null);
+  });
+
+  // A malformed source_dna_hash (not a 39-byte HoloHash array) normalizes to
+  // undefined and is rejected the same way — never forwarded.
+  it("a malformed byte-array source_dna_hash → 500 internal (not forwarded)", async () => {
+    const badArray = () =>
+      jsonResp(200, {
+        payload: {
+          source_dna_hash: [1, 2, 3], // too short to be a 39-byte HoloHash
+          target_dna_hash: v02,
+          closing_state: {},
+        },
+        notary_signatures: [{ notary: "x", signature: "s" }],
+        close_action: "c",
+      });
+    const f = mockFetch({ "https://n1a": badArray, "https://n1b": badArray });
+    const resp = await migrate(registry(), goodPair, ENV, f);
+    expect(resp.status).toBe(500);
+    expect((await body(resp)).error.code).toBe("internal");
+  });
+
+  // The raw-byte-array hash path still works end to end after the 39-byte tightening:
+  // a source delivered as a 39-byte HoloHash array normalizes to the registry b64 and
+  // is accepted. Node's base64url is an independent oracle for the expected b64.
+  it("accepts a source_dna_hash delivered as a raw 39-byte HoloHash array", async () => {
+    const srcBytes = [0x84, 0x2d, 0x24, ...Array(32).fill(7), 0, 0, 0, 0]; // 3+32+4 = 39
+    const srcB64 = "u" + Buffer.from(srcBytes).toString("base64url");
+    const to = "uhC0k_to_bytes";
+    const r = Registry.load({
+      version: 1,
+      dnas: [
+        {
+          dna_hash: srcB64,
+          version: "src",
+          upgrade_targets: [to],
+          notaries: [{ url: "https://nb", api: "v1" }],
+        },
+        {
+          dna_hash: to,
+          version: "to",
+          upgrades_from: srcB64,
+          notaries: [{ url: "https://nt", api: "v1" }],
+        },
+      ],
+    });
+    const f = mockFetch({
+      "https://nb": () =>
+        jsonResp(200, {
+          payload: {
+            source_dna_hash: srcBytes,
+            target_dna_hash: to,
+            closing_state: {},
+          },
+          notary_signatures: [{ notary: "x", signature: "bytes-ok" }],
+          close_action: "c",
+        }),
+    });
+    const resp = await migrate(
+      r,
+      { from_dna_hash: srcB64, to_dna_hash: to, agent_pubkey: AGENT },
+      ENV,
+      f,
+    );
+    expect(resp.status).toBe(200);
+    expect((await body(resp)).notary_signatures[0].signature).toBe("bytes-ok");
   });
 
   // A source-specific fault must NOT abort discovery of the OTHER candidate sources

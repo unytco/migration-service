@@ -20,10 +20,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use holo_hash::{AgentPubKey, DnaHash};
-use holochain_client::{AdminWebsocket, WebsocketConfig};
+use holochain_client::{AdminWebsocket, AppInfo, CellInfo, WebsocketConfig};
 use holochain_types::app::{AppBundleSource, InstallAppPayload, RoleSettings, RoleSettingsMap};
 use holochain_types::prelude::{
-    DnaModifiersOpt, InitProperties, MembraneProof, SerializedBytes, UnsafeBytes, YamlProperties,
+    CellId, DnaModifiersOpt, InitProperties, MembraneProof, SerializedBytes, UnsafeBytes,
+    YamlProperties,
 };
 use rave_engine::types::entries::migration::v0_1::{
     CloseRequest, CommittedClose, MigrationInitRequest, NotarySignature, PrepareCloseResponse,
@@ -49,6 +50,12 @@ pub struct InstallSpec {
     pub agent_key: AgentPubKey,
     pub happ_path: std::path::PathBuf,
     pub network_seed: Option<String>,
+    /// The network's DNA properties for the role, as the target release's joining
+    /// service serves them ([`crate::joining::Provision::properties`]). Hashed
+    /// into the DNA hash alongside the network seed, so an install that omits
+    /// them lands the cell on a DIFFERENT DNA than the network — its own empty
+    /// DHT, no peers, no gossip, and an `init` that can never resolve the GD.
+    pub properties: Option<YamlProperties>,
     /// Base64-decoded membrane proof for the role, fetched fresh from the target
     /// joining service for the carried key (`None` ⇒ no proof required).
     pub membrane_proof: Option<Vec<u8>>,
@@ -69,10 +76,22 @@ pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
         .membrane_proof
         .as_ref()
         .map(|bytes| Arc::new(SerializedBytes::from(UnsafeBytes::from(bytes.clone()))));
-    let modifiers = spec
-        .network_seed
-        .clone()
-        .map(|seed| DnaModifiersOpt::<YamlProperties>::default().with_network_seed(seed));
+    // Both DNA modifiers are hashed into the DNA hash, so the role override
+    // carries whatever the joining service gave us for BOTH — the properties in
+    // particular, since the happ manifest declares none (`properties: ~`) and
+    // every fleet installer supplies the network's from the release config. An
+    // override that set only the seed would leave the cell on a property-less
+    // DNA — a different hash from the network's, hence its own empty DHT. The
+    // conductor applies only the `Some` fields (`AppManifestV0::override_modifiers`),
+    // so a field we don't have leaves the manifest's value untouched; when we have
+    // neither, no override is sent at all.
+    let modifiers = match (&spec.network_seed, &spec.properties) {
+        (None, None) => None,
+        (network_seed, properties) => Some(DnaModifiersOpt::<YamlProperties> {
+            network_seed: network_seed.clone(),
+            properties: properties.clone(),
+        }),
+    };
     // A migrating install carries the fetched package as the role's
     // `init_properties`; the DNA's `init` reads it and opens the chain at genesis
     // (driven by the open service's first zome call). A fresh, non-migrating
@@ -170,8 +189,27 @@ pub trait Conductor: Send + Sync {
     /// Whether an app with `app_id` is installed on the conductor.
     async fn app_presence(&self, app_id: &str) -> Result<AppPresence>;
 
-    /// Install the app for the carried key and enable it.
-    async fn install_app(&self, spec: &InstallSpec) -> Result<()>;
+    /// The `CellId` the installed app's provisioned cell for `role_name` sits on
+    /// (DNA + agent), or `None` when the app isn't installed — or is installed but
+    /// has no readable provisioned cell for the role. Read-only — admin
+    /// `list_apps`, never a zome call, so it is safe on an `init_properties` cell
+    /// whose first zome call would drive `init`. Lets the open service hold an
+    /// ALREADY-installed app to the migration target, not just one it installed
+    /// itself.
+    ///
+    /// `None` deliberately conflates "absent" with "present but unreadable": both
+    /// are UNKNOWN, and the caller treats unknown as "skip the check" rather than
+    /// "mismatch". The alternative — `Err` for present-but-unreadable — turns a
+    /// PERMANENT condition into an unbounded transient retry, which is the worse
+    /// failure. The caller logs the skip instead.
+    async fn installed_cell_id(&self, app_id: &str, role_name: &str) -> Result<Option<CellId>>;
+
+    /// Install the app for the carried key and enable it, returning the `CellId`
+    /// the provisioned cell actually landed on — the caller holds it to the
+    /// migration target (DNA *and* carried agent), so a modifiers or key mismatch
+    /// fails loudly here instead of surfacing much later as an `init` that can
+    /// never resolve the GD.
+    async fn install_app(&self, spec: &InstallSpec) -> Result<CellId>;
 }
 
 /// Real conductor connection: `ham` for app-cell zome calls + a separate
@@ -346,9 +384,22 @@ impl Conductor for HamConductor {
         })
     }
 
-    async fn install_app(&self, spec: &InstallSpec) -> Result<()> {
+    async fn installed_cell_id(&self, app_id: &str, role_name: &str) -> Result<Option<CellId>> {
+        let apps = self
+            .admin
+            .list_apps(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("list_apps: {e}"))?;
+        Ok(apps
+            .iter()
+            .find(|a| a.installed_app_id == app_id)
+            .and_then(|info| provisioned_cell_id(info, role_name).ok()))
+    }
+
+    async fn install_app(&self, spec: &InstallSpec) -> Result<CellId> {
         let payload = build_install_payload(spec)?;
-        self.admin
+        let info = self
+            .admin
             .install_app(payload)
             .await
             .map_err(|e| anyhow::anyhow!("install_app: {e}"))?;
@@ -356,8 +407,30 @@ impl Conductor for HamConductor {
             .enable_app(spec.app_id.clone())
             .await
             .map_err(|e| anyhow::anyhow!("enable_app: {e}"))?;
-        Ok(())
+        provisioned_cell_id(&info, &spec.role_name)
     }
+}
+
+/// The `CellId` the app's provisioned cell for `role_name` landed on, read from
+/// the install response. The conductor hands this back at install, so the open
+/// service can check the carried key joined the DNA it is migrating TO rather
+/// than discovering an isolated cell later, via an `init` that never resolves the
+/// successor GD. It is the CellId rather than the DNA hash alone because the pair
+/// is what identifies the cell: a node running two migrating apps off one shared
+/// carried lair can land the right DNA under the WRONG agent, and the hash alone
+/// would wave that through.
+fn provisioned_cell_id(info: &AppInfo, role_name: &str) -> Result<CellId> {
+    info.cell_info
+        .get(role_name)
+        .and_then(|cells| {
+            cells.iter().find_map(|cell| match cell {
+                CellInfo::Provisioned(p) => Some(p.cell_id.clone()),
+                _ => None,
+            })
+        })
+        .with_context(|| {
+            format!("the install response carried no provisioned cell for role '{role_name}'")
+        })
 }
 
 /// Decode a base64 membrane-proof string (the joining service's wire form) into

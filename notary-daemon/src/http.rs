@@ -24,7 +24,7 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["v0_1"];
 
 /// Machine-readable error codes — the daemon half of the cross-service contract.
 /// These MUST stay in sync with the router's `ErrorCode` union in
-/// `router/src/errors.ts`, which switches on these exact strings. Defined once
+/// `migration-router/src/errors.ts`, which switches on these exact strings. Defined once
 /// here rather than as scattered literals so a code can't silently drift.
 mod codes {
     pub const AUTH_FAILED: &str = "auth_failed";

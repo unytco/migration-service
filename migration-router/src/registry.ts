@@ -27,6 +27,14 @@ export interface DnaEntry {
   release_url?: string;
   /** 1..N notary daemons serving this DNA (redundancy / failover). */
   notaries: NotaryEntry[];
+  /** Customer-visibility gate for this DNA as a migration TARGET (customers-last, Stage 7.1).
+   * HONORED by /v1/update-check (`furthestTargetOf`): an unpublished successor is invisible, so
+   * the app shows no upgrade banner. IGNORED by /v1/migrate + /v1/migration-options
+   * (`reaches` / `sourcesReaching`): the close-package is served regardless, so the headless
+   * server open can fetch the successor BEFORE it is surfaced to customers. Absent = unpublished
+   * (the safe default): the routing phase registers a target `false`, the publish phase flips it
+   * `true` once the whole fleet has migrated. */
+  published?: boolean;
 }
 
 export interface RawRegistry {
@@ -36,6 +44,17 @@ export interface RawRegistry {
 }
 
 export const SUPPORTED_REGISTRY_VERSION = 1;
+
+/** Options for [`Registry.load`]. */
+export interface RegistryLoadOptions {
+  /**
+   * Local-testnet mode ONLY (documentation/specs/local-testnet/): admit `http://` notary URLs so a
+   * local registry can name plain-http daemons on container IPs. The deployed Worker entry point
+   * (`index.ts`) never passes this — it exists solely for the local entry point (`index.local.ts`),
+   * so the relaxation is structurally absent from a deployed bundle rather than merely defaulted off.
+   */
+  allowHttpNotaries?: boolean;
+}
 
 export class Registry {
   private byHash: Map<string, DnaEntry>;
@@ -52,27 +71,39 @@ export class Registry {
   }
 
   /** Parse + validate. Throws on any invariant violation (caller fails the Worker health). */
-  static load(raw: RawRegistry): Registry {
+  static load(raw: RawRegistry, opts?: RegistryLoadOptions): Registry {
     if (raw.version !== SUPPORTED_REGISTRY_VERSION) {
       throw new Error(
         `unsupported registry version ${raw.version} (expected ${SUPPORTED_REGISTRY_VERSION})`,
       );
     }
-    if (!Array.isArray(raw.dnas)) throw new Error("registry.dnas must be an array");
+    if (!Array.isArray(raw.dnas))
+      throw new Error("registry.dnas must be an array");
 
     const seen = new Set<string>();
     for (const d of raw.dnas) {
       if (!d.dna_hash) throw new Error("registry entry missing dna_hash");
-      if (seen.has(d.dna_hash)) throw new Error(`duplicate dna_hash ${d.dna_hash}`);
+      if (seen.has(d.dna_hash))
+        throw new Error(`duplicate dna_hash ${d.dna_hash}`);
       seen.add(d.dna_hash);
-      if (!d.version) throw new Error(`registry entry ${d.dna_hash} missing version`);
-      if (!Array.isArray(d.notaries)) throw new Error(`registry entry ${d.dna_hash} missing notaries`);
+      if (!d.version)
+        throw new Error(`registry entry ${d.dna_hash} missing version`);
+      if (d.published !== undefined && typeof d.published !== "boolean")
+        throw new Error(`registry entry ${d.dna_hash}: published must be a boolean`);
+      if (!Array.isArray(d.notaries))
+        throw new Error(`registry entry ${d.dna_hash} missing notaries`);
       for (const n of d.notaries) {
-        if (!n.url?.startsWith("https://")) {
-          throw new Error(`registry entry ${d.dna_hash}: notary url must be https`);
+        const httpAdmitted =
+          opts?.allowHttpNotaries === true && n.url?.startsWith("http://");
+        if (!n.url?.startsWith("https://") && !httpAdmitted) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: notary url must be https`,
+          );
         }
         if (!SUPPORTED_DAEMON_APIS.has(n.api)) {
-          throw new Error(`registry entry ${d.dna_hash}: unsupported notary api ${n.api}`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: unsupported notary api ${n.api}`,
+          );
         }
       }
     }
@@ -81,7 +112,9 @@ export class Registry {
     for (const d of raw.dnas) {
       if (d.upgrades_from) {
         if (!seen.has(d.upgrades_from)) {
-          throw new Error(`upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`);
+          throw new Error(
+            `upgrades_from ${d.upgrades_from} (on ${d.dna_hash}) does not resolve`,
+          );
         }
         const existing = successorOfHash.get(d.upgrades_from);
         if (existing) {
@@ -118,14 +151,20 @@ export class Registry {
       const seenTargets = new Set<string>();
       for (const t of d.upgrade_targets) {
         if (seenTargets.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: duplicate upgrade_target ${t}`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: duplicate upgrade_target ${t}`,
+          );
         }
         seenTargets.add(t);
         if (!byHash.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} does not resolve`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: upgrade_target ${t} does not resolve`,
+          );
         }
         if (!descendants.has(t)) {
-          throw new Error(`registry entry ${d.dna_hash}: upgrade_target ${t} is not a forward descendant`);
+          throw new Error(
+            `registry entry ${d.dna_hash}: upgrade_target ${t} is not a forward descendant`,
+          );
         }
       }
     }
@@ -153,16 +192,20 @@ export class Registry {
     return out;
   }
 
-  /** The furthest proven target of `currentDnaHash`: the deepest entry in its
-   * forward chain that is also listed in its `upgrade_targets`. A multi-version
-   * skip lands here in one hop. `undefined` when there is no proven target. */
+  /** The furthest proven, PUBLISHED target of `currentDnaHash`: the deepest entry in its
+   * forward chain that is both listed in its `upgrade_targets` and `published` (customer-visible).
+   * A multi-version skip lands here in one hop. An unpublished target is skipped as if absent, so
+   * this falls back to the nearest published proven target (and returns `undefined` when none is
+   * published yet) — the customers-last gate that keeps a routable-but-unpublished successor out of
+   * the /v1/update-check banner. `undefined` when there is no proven target. */
   furthestTargetOf(currentDnaHash: string): DnaEntry | undefined {
     const current = this.byHash.get(currentDnaHash);
     if (!current?.upgrade_targets?.length) return undefined;
     const targets = new Set(current.upgrade_targets);
     const chain = this.forwardChain(currentDnaHash);
     for (let i = chain.length - 1; i >= 0; i--) {
-      if (targets.has(chain[i].dna_hash)) return chain[i];
+      if (targets.has(chain[i].dna_hash) && chain[i].published === true)
+        return chain[i];
     }
     return undefined;
   }
@@ -179,6 +222,9 @@ export class Registry {
 
   /** Is `toDnaHash` a proven upgrade target of `fromDnaHash`? */
   reaches(fromDnaHash: string, toDnaHash: string): boolean {
-    return this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ?? false;
+    return (
+      this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ??
+      false
+    );
   }
 }

@@ -10,11 +10,13 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
+use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
+use holochain_types::prelude::CellId;
 use rave_engine::types::entries::migration::v0_1::{
     AgreementCarryForward, CommittedClose, MigrationInitRequest, NotarySignature,
     PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryState, SummaryStatePayload,
@@ -42,6 +44,7 @@ pub enum Call {
     GetMigrationCloseState,
     VerifyIfMigrated,
     AppPresence,
+    InstalledCellId,
     InstallApp,
 }
 
@@ -61,7 +64,13 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
-    pub install_result: Mutex<VecDeque<anyhow::Result<()>>>,
+    /// The `CellId` each scripted install reports the provisioned cell landed on
+    /// — the open service checks it against the migration target (DNA + agent).
+    pub install_result: Mutex<VecDeque<anyhow::Result<CellId>>>,
+    /// The `CellId` an ALREADY-installed app reports. `None` (the default) means
+    /// "can't be read", which the open service treats as unknown rather than a
+    /// mismatch — so the existing already-installed tests are unaffected.
+    pub installed_cell: Mutex<Option<CellId>>,
 }
 
 impl MockConductor {
@@ -160,9 +169,52 @@ impl Conductor for MockConductor {
         Self::pop(&self.presence, "app_presence")
     }
 
-    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<()> {
+    async fn installed_cell_id(
+        &self,
+        _app_id: &str,
+        _role_name: &str,
+    ) -> anyhow::Result<Option<CellId>> {
+        self.record(Call::InstalledCellId);
+        Ok(self.installed_cell.lock().unwrap().clone())
+    }
+
+    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<CellId> {
         self.record(Call::InstallApp);
         Self::pop(&self.install_result, "install_app")
+    }
+}
+
+/// A [`Connector`] that hands the open loop a scripted [`MockConductor`] for
+/// both the admin-only and the `ham` connection, so `open::run_with` drives the
+/// whole flow with no live conductor. `admin` and `ham` are `Arc`s the test also
+/// holds, so it can inspect the recorded calls after the run. The common case
+/// (`shared`) points both at ONE mock — the flow's admin-probe and post-install
+/// ham calls then land in a single call log.
+pub struct MockConnector {
+    pub admin: Arc<MockConductor>,
+    pub ham: Arc<MockConductor>,
+}
+
+impl MockConnector {
+    /// Both connections resolve to the SAME mock.
+    pub fn shared(mock: Arc<MockConductor>) -> Self {
+        Self {
+            admin: mock.clone(),
+            ham: mock,
+        }
+    }
+}
+
+#[async_trait]
+impl Connector for MockConnector {
+    async fn connect_admin_only(&self) -> anyhow::Result<Arc<dyn Conductor>> {
+        let c: Arc<dyn Conductor> = self.admin.clone();
+        Ok(c)
+    }
+
+    async fn connect_ham(&self, _shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>> {
+        let c: Arc<dyn Conductor> = self.ham.clone();
+        Some(c)
     }
 }
 

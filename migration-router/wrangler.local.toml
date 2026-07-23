@@ -1,0 +1,12 @@
+# LOCAL-TESTNET wrangler config (documentation/specs/local-testnet/): builds the
+# Worker from the local entry point, which loads registry.local.json with http://
+# notary URLs admitted. Never deployed — deploys use wrangler.toml (src/index.ts,
+# strict https-only validation).
+#
+#   npm run dev:local        # wrangler dev -c wrangler.local.toml, serves :8787
+#
+# Runtime env comes from .dev.vars (gitignored) — copy .dev.vars.example.
+
+name = "migration-router-local"
+main = "src/index.local.ts"
+compatibility_date = "2024-12-30"

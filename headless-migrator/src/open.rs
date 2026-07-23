@@ -8,10 +8,13 @@
 //! in effect) is re-driven under a bounded deadline. There is no post-install
 //! `migration_init` call and no first-zome-call ordering window to guard.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
+use async_trait::async_trait;
+use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash, DnaHashB64};
+use holochain_types::prelude::CellId;
 use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
 
 use crate::conductor::{
@@ -42,6 +45,43 @@ pub struct OpenParams {
     pub lair_passphrase: String,
 }
 
+/// Supplies the two conductor connections the open loop needs, so the loop is
+/// mock-drivable without a live conductor (mirroring `close::run`'s injected
+/// `&dyn Conductor`). The open service is two-phase — it connects ADMIN-ONLY
+/// first (the app cell doesn't exist yet, so `ham` can't attach) to probe +
+/// install, then reconnects with `ham` AFTER the install to drive `init` +
+/// verify — so a single conductor can't model it; this factory does. Production
+/// supplies [`HamConnector`]; tests supply a mock that hands back a scripted
+/// conductor for both.
+#[async_trait]
+pub trait Connector: Send + Sync {
+    /// Admin-only connection for the pre-install probe + install.
+    async fn connect_admin_only(&self) -> Result<Arc<dyn Conductor>>;
+    /// `ham`-attached connection once the app cell is provisioned; `None` on
+    /// shutdown / unreachable (mapped to a transient retry by the caller).
+    async fn connect_ham(&self, shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>>;
+}
+
+/// The production [`Connector`]: real `HamConductor` connections against the
+/// local conductor described by [`Config`].
+struct HamConnector<'a> {
+    cfg: &'a Config,
+}
+
+#[async_trait]
+impl Connector for HamConnector<'_> {
+    async fn connect_admin_only(&self) -> Result<Arc<dyn Conductor>> {
+        let c: Arc<dyn Conductor> = Arc::new(HamConductor::connect_admin_only(self.cfg).await?);
+        Ok(c)
+    }
+
+    async fn connect_ham(&self, shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>> {
+        let ham = HamConductor::connect(self.cfg, shutdown).await?;
+        let c: Arc<dyn Conductor> = Arc::new(ham);
+        Some(c)
+    }
+}
+
 /// One open attempt's outcome.
 enum OpenOutcome {
     /// New chain open + verified. Exit 0.
@@ -63,14 +103,49 @@ fn gd_wait_expired(started_us: i64, now_us: i64, timeout: Duration) -> bool {
     Duration::from_micros(now_us.saturating_sub(started_us).max(0) as u64) >= timeout
 }
 
-/// Run the open service to completion (or a hard stop). The `shutdown` receiver
-/// is installed ONCE by the caller (`main.rs`) and threaded all the way down
-/// into every conductor (re)connect and sleep — the helpers never install their
-/// own handler (that would leak a task + watch channel each pass and detach the
+/// The exhaustion message stamped into the state file (which the `automation`
+/// rail cats out) and returned as the failing error when the successor-GD wait
+/// runs out. The LEADING text is an actionable CONFIG-FAULT diagnosis, not a
+/// bare genesis error: after the full budget the likeliest cause is a wrong
+/// successor DNA hash / registry entry or a target Holochain+network
+/// misconfiguration, so point the operator there. The raw `init` cause rides
+/// along as a trailing detail. Pure (no loop / no I/O) so it is unit-testable.
+fn gd_wait_exhausted_message(
+    from: &DnaHashB64,
+    to: &DnaHashB64,
+    timeout: Duration,
+    cause: &anyhow::Error,
+) -> String {
+    format!(
+        "v2 GD never gossiped to the target within {}s — check the successor DNA hash / \
+         registry and the target's Holochain+network config (from={from} to={to}). \
+         Last init error: {cause:#}",
+        timeout.as_secs()
+    )
+}
+
+/// Run the open service to completion (or a hard stop), against the real local
+/// conductor. Thin wrapper over [`run_with`] that supplies the production
+/// [`HamConnector`]; `main.rs` calls this.
+pub async fn run(
+    cfg: &Config,
+    open_cfg: &OpenConfig,
+    params: &OpenParams,
+    shutdown: &mut ham::ShutdownRx,
+) -> Result<()> {
+    run_with(&HamConnector { cfg }, cfg, open_cfg, params, shutdown).await
+}
+
+/// [`run`] with the conductor factory injected. The `shutdown` receiver is
+/// installed ONCE by the caller (`main.rs`) and threaded all the way down into
+/// every conductor (re)connect and sleep — the helpers never install their own
+/// handler (that would leak a task + watch channel each pass and detach the
 /// helpers from the real signal). The `ham`-backed conductor is rebuilt AFTER an
 /// install (it cannot attach until the app cell exists), reusing this same
-/// receiver.
-pub async fn run(
+/// receiver. Tests supply a mock [`Connector`] to drive the whole loop with no
+/// live conductor.
+pub async fn run_with(
+    connector: &dyn Connector,
     cfg: &Config,
     open_cfg: &OpenConfig,
     params: &OpenParams,
@@ -107,7 +182,11 @@ pub async fn run(
         if *shutdown.borrow() {
             return shutdown_before_complete();
         }
-        match attempt(cfg, open_cfg, params, &http, &signer, shutdown, &mut state).await {
+        match attempt(
+            connector, cfg, open_cfg, params, &http, &signer, shutdown, &mut state,
+        )
+        .await
+        {
             OpenOutcome::Done => {
                 persist(cfg, &mut state, |s| {
                     s.step = Step::Done;
@@ -136,17 +215,20 @@ pub async fn run(
                 let now = crate::state_file::now_us();
                 let started = *state.gd_wait_started_us.get_or_insert(now);
                 if gd_wait_expired(started, now, open_cfg.gd_wait_timeout) {
+                    // Budget spent: stamp + fail with the actionable config-fault
+                    // diagnosis (NOT the raw genesis error), so the rail's
+                    // state-file cat points the operator at the likely cause.
+                    let msg = gd_wait_exhausted_message(
+                        &params.from_dna,
+                        &params.to_dna,
+                        open_cfg.gd_wait_timeout,
+                        &e,
+                    );
                     persist(cfg, &mut state, |s| {
                         s.step = Step::Failed;
-                        s.message = format!(
-                            "successor GD never came into effect within {}s: {e:#}",
-                            open_cfg.gd_wait_timeout.as_secs()
-                        );
+                        s.message = msg.clone();
                     });
-                    bail!(
-                        "gave up waiting for the successor GD to come into effect after {}s: {e:#}",
-                        open_cfg.gd_wait_timeout.as_secs()
-                    );
+                    bail!("{msg}");
                 }
                 // Clamp the backoff to the remaining budget so the wait never
                 // overshoots the deadline by a full interval.
@@ -199,7 +281,13 @@ pub async fn run(
 /// The remaining branches each fetch the package up front (the install applies
 /// it as `init_properties`, opening the chain at `init`; the not-yet-verified
 /// opened path verifies against it), preserving the fetch-before-install rule.
+// Like `install` below, one pass genuinely threads the config pair, the router /
+// join params, the joining-service I/O, the connector, the shutdown handle and
+// the run's state — a struct around them would be indirection for a single
+// caller.
+#[allow(clippy::too_many_arguments)]
 async fn attempt(
+    connector: &dyn Connector,
     cfg: &Config,
     open_cfg: &OpenConfig,
     params: &OpenParams,
@@ -213,11 +301,11 @@ async fn attempt(
         s.step = Step::Probing;
         s.message = "probing new-server open state".into();
     });
-    let admin = match HamConductor::connect_admin_only(cfg).await {
+    let admin = match connector.connect_admin_only().await {
         Ok(c) => c,
         Err(e) => return OpenOutcome::Transient(e.context("admin connect for probe")),
     };
-    let open_state = match probe_open_state(&admin, &cfg.app_id).await {
+    let open_state = match probe_open_state(admin.as_ref(), &cfg.app_id).await {
         Ok(s) => s,
         Err(e) => return OpenOutcome::Transient(e.context("probing open state")),
     };
@@ -237,6 +325,35 @@ async fn attempt(
                 );
                 return OpenOutcome::Done;
             }
+            // Hold an ALREADY-installed app to the target too. The install-time
+            // check below only sees apps this run installed — a node a pre-fix
+            // binary (or an earlier pass) put on the wrong DNA arrives here, and
+            // without this would get the old symptom instead: a bounded wait on a
+            // GD that can never resolve, then a hard stop blaming the GD.
+            // `None` means the cell can't be read — the app is absent, or it is
+            // present with no readable provisioned cell for the role. That
+            // is UNKNOWN, not proof of a mismatch, so it stays lenient and skips
+            // the guard rather than hard-stopping a possibly-correct node; it is
+            // logged because a skipped guard is the case worth noticing. (It is
+            // deliberately not an `Err`: the present-but-unreadable state is
+            // permanent, and raising it here would spin the supervised loop.)
+            match admin.installed_cell_id(&cfg.app_id, &cfg.role_name).await {
+                Ok(Some(installed)) => {
+                    if let Some(why) = cell_target_mismatch(&installed, cfg, open_cfg, params) {
+                        return OpenOutcome::HardStop(why);
+                    }
+                    tracing::info!(
+                        dna = %DnaHashB64::from(installed.dna_hash().clone()),
+                        "installed app is on the migration target DNA, for the carried agent"
+                    );
+                }
+                Ok(None) => tracing::warn!(
+                    app_id = %cfg.app_id,
+                    role = %cfg.role_name,
+                    "could not read the installed cell's DNA — skipping the target-DNA check"
+                ),
+                Err(e) => return OpenOutcome::Transient(e.context("reading the installed DNA")),
+            }
             // Installed but not yet verified — either the chain is already open (a
             // restart mid-verify) or `init` hasn't been driven yet (a restart
             // right after install). Fetch the package, connect ham, drive `init`
@@ -247,11 +364,11 @@ async fn attempt(
                 Ok(p) => p,
                 Err(outcome) => return outcome,
             };
-            let conductor = match connect_ham(cfg, shutdown).await {
+            let conductor = match connect_ham(connector, shutdown).await {
                 Ok(c) => c,
                 Err(o) => return o,
             };
-            drive_open_and_verify(cfg, &conductor, &package, state).await
+            drive_open_and_verify(cfg, conductor.as_ref(), &package, state).await
         }
         OpenState::NotInstalled => {
             // Fetch BEFORE installing (the spec's hard ordering rule), then
@@ -262,16 +379,25 @@ async fn attempt(
                 Ok(p) => p,
                 Err(outcome) => return outcome,
             };
-            if let Err(outcome) =
-                install(cfg, open_cfg, params, http, signer, &admin, &package, state).await
+            if let Err(outcome) = install(
+                cfg,
+                open_cfg,
+                params,
+                http,
+                signer,
+                admin.as_ref(),
+                &package,
+                state,
+            )
+            .await
             {
                 return outcome;
             }
-            let conductor = match connect_ham(cfg, shutdown).await {
+            let conductor = match connect_ham(connector, shutdown).await {
                 Ok(c) => c,
                 Err(o) => return o,
             };
-            drive_open_and_verify(cfg, &conductor, &package, state).await
+            drive_open_and_verify(cfg, conductor.as_ref(), &package, state).await
         }
     }
 }
@@ -320,10 +446,10 @@ async fn fetch_or_outcome(
 /// `shutdown` receiver. The `None → Transient` mapping (shutdown / unreachable)
 /// lives here so every reconnect site is identical.
 async fn connect_ham(
-    cfg: &Config,
+    connector: &dyn Connector,
     shutdown: &mut ham::ShutdownRx,
-) -> std::result::Result<HamConductor, OpenOutcome> {
-    match HamConductor::connect(cfg, shutdown).await {
+) -> std::result::Result<Arc<dyn Conductor>, OpenOutcome> {
+    match connector.connect_ham(shutdown).await {
         Some(c) => Ok(c),
         None => Err(OpenOutcome::Transient(anyhow::anyhow!(
             "ham could not attach to the installed app cell (shutdown or unreachable)"
@@ -347,7 +473,7 @@ async fn install(
     params: &OpenParams,
     http: &reqwest::Client,
     signer: &dyn NonceSigner,
-    admin: &HamConductor,
+    admin: &dyn Conductor,
     package: &MigrationInitRequest,
     state: &mut State,
 ) -> std::result::Result<(), OpenOutcome> {
@@ -389,13 +515,81 @@ async fn install(
         network_seed: provision
             .network_seed
             .or_else(|| open_cfg.network_seed.clone()),
+        // The target release's joining service is the only source for the
+        // network's DNA properties — they are per-release (the progenitor key is
+        // minted at deploy) and hashed into the DNA hash, so the carried key must
+        // install with exactly the ones every other agent on the network used.
+        properties: provision.properties,
         membrane_proof,
         migration_package: Some(package.clone()),
     };
-    if let Err(e) = admin.install_app(&spec).await {
-        return Err(install_error_outcome(e));
+    let installed_cell = match admin.install_app(&spec).await {
+        Ok(cell_id) => cell_id,
+        Err(e) => return Err(install_error_outcome(e)),
+    };
+    match cell_target_mismatch(&installed_cell, cfg, open_cfg, params) {
+        Some(why) => Err(OpenOutcome::HardStop(why)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Hold the app's cell to what this migration is FOR — the target DNA and the
+/// carried agent — returning the hard-stop reason when it isn't. The install
+/// applies the network's DNA modifiers (seed + properties) precisely so the
+/// carried key lands on the SAME DNA as everyone else on the target network;
+/// anything else means this cell sits alone on an empty DHT — no peers, no
+/// gossip, and an `init` that can never resolve the successor GD. Caught here it
+/// is one clear line naming both hashes; uncaught it reads as a GD that never
+/// arrives, hours later. The AGENT half matters on a node running two migrating
+/// apps off ONE shared carried lair (the bridging node's `bridging-app` +
+/// `hh-pricing-oracle`): crossed keys give the right DNA under the wrong agent,
+/// which the DNA check alone waves through, to resurface later as the misleading
+/// "init_properties were not applied". Pure, so the fresh-install and the
+/// already-installed paths share one message.
+fn cell_target_mismatch(
+    installed: &CellId,
+    cfg: &Config,
+    open_cfg: &OpenConfig,
+    params: &OpenParams,
+) -> Option<String> {
+    if *installed.agent_pubkey() != params.agent_key {
+        // A different remedy from a DNA mismatch: the cell is on the right
+        // network, but installed FOR the wrong key — the carried key never
+        // migrates, and this app's chain would be a stranger's.
+        return Some(format!(
+            "app '{}' was installed for agent {} but this migration carries {} — the cell is on \
+             the right DNA under the WRONG key, so the carried chain would never be opened. \
+             Check this app's `agent_key` in the node's `.migrate.apps[]` config (a node running \
+             several migrating apps off one shared lair can cross them) and that the carried key \
+             was imported into this node's lair.",
+            cfg.app_id,
+            AgentPubKeyB64::from(installed.agent_pubkey().clone()),
+            AgentPubKeyB64::from(params.agent_key.clone()),
+        ));
+    }
+    if *installed.dna_hash() == DnaHash::from(params.to_dna.clone()) {
+        return None;
+    }
+    let installed = installed.dna_hash();
+    // Three inputs decide the resulting DNA hash, and any of them can be the
+    // wrong one — name them all rather than blaming the modifiers alone. The
+    // remedy is deliberately ordered diagnose-then-act: if the wrong input is the
+    // TARGET, the installed cell is the correct one (and may already hold an
+    // opened chain), so "uninstall" must never be the first instruction.
+    Some(format!(
+        "app '{}' is on DNA {} but the migration target is {} — this cell would sit alone on an \
+         empty DHT, never reaching the network. First identify which of three inputs is wrong: \
+         the DNA modifiers (network seed / properties) served by {}, the happ bundle at {} (a \
+         stale build hashes differently), or the target DNA itself (the router registry entry / \
+         --to-dna). Correct that input; only if the INSTALL is the wrong one, uninstall app '{}' \
+         on this node before re-running the open.",
+        cfg.app_id,
+        DnaHashB64::from(installed.clone()),
+        params.to_dna,
+        open_cfg.joining_url,
+        open_cfg.happ_path.display(),
+        cfg.app_id,
+    ))
 }
 
 /// Map an `install_app` (install + enable) failure onto the open outcome. The
@@ -437,7 +631,7 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
 /// retry.
 async fn drive_open_and_verify(
     cfg: &Config,
-    conductor: &HamConductor,
+    conductor: &dyn Conductor,
     package: &MigrationInitRequest,
     state: &mut State,
 ) -> OpenOutcome {
@@ -491,7 +685,7 @@ async fn drive_open_and_verify(
 /// The shared verify: new-chain ledger vs the carried close summary.
 async fn verify_after_open_with(
     cfg: &Config,
-    conductor: &HamConductor,
+    conductor: &dyn Conductor,
     package: &MigrationInitRequest,
     state: &mut State,
 ) -> OpenOutcome {
@@ -598,11 +792,37 @@ pub async fn probe_for_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{gd_wait_expired, install_error_outcome, OpenOutcome};
+    use super::{gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, OpenOutcome};
     use crate::state_file::now_us;
+    use holo_hash::{DnaHash, DnaHashB64};
     use std::time::Duration;
 
     const BUDGET: Duration = Duration::from_secs(1800);
+
+    #[test]
+    fn gd_wait_exhausted_message_is_a_config_fault_diagnosis() {
+        // The exhaustion message must LEAD with the actionable config-fault
+        // diagnosis (successor DNA hash / registry / target config), carry both
+        // DNAs, and keep the raw init error as a trailing detail — NOT a bare
+        // genesis error. It is stamped into the state file the rail cats out.
+        let from = DnaHashB64::from(DnaHash::from_raw_36(vec![1; 36]));
+        let to = DnaHashB64::from(DnaHash::from_raw_36(vec![2; 36]));
+        let cause = anyhow::anyhow!("wasm error: No Global Definition found");
+        let msg = gd_wait_exhausted_message(&from, &to, BUDGET, &cause);
+        assert!(
+            msg.contains("check the successor DNA hash / registry"),
+            "leads with the config-fault diagnosis: {msg}"
+        );
+        assert!(
+            msg.contains(&from.to_string()) && msg.contains(&to.to_string()),
+            "carries both DNAs: {msg}"
+        );
+        assert!(msg.contains("1800s"), "carries the elapsed budget: {msg}");
+        assert!(
+            msg.contains("No Global Definition found"),
+            "keeps the raw init cause as a trailing detail: {msg}"
+        );
+    }
 
     #[test]
     fn gd_wait_not_expired_within_budget() {

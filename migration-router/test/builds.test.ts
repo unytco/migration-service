@@ -139,6 +139,41 @@ describe("publishedBuilds", () => {
     expect(newestOnLineage(builds, "0.93")?.version).toBe("0.93.7"); // found on page 2
   });
 
+  it("fetches from the GitHub releases API by default", async () => {
+    const seen: string[] = [];
+    const fetch = (async (input: RequestInfo | URL) => {
+      seen.push(typeof input === "string" ? input : input.toString());
+      return releasesResp([]);
+    }) as FetchLike;
+    await publishedBuilds(fetch, ENV);
+    expect(seen[0]).toMatch(
+      /^https:\/\/api\.github\.com\/repos\/unytco\/unyt-sandbox\/releases\?/,
+    );
+  });
+
+  it("GITHUB_RELEASES_URL points the build axis at a local artifact server", async () => {
+    // Local-testnet seam (an env the deployed Worker never sets): the override must
+    // speak the GitHub releases JSON shape — everything downstream is unchanged.
+    const seen: string[] = [];
+    const fetch = (async (input: RequestInfo | URL) => {
+      seen.push(typeof input === "string" ? input : input.toString());
+      return releasesResp([{ tag: "v0.93.1" }]);
+    }) as FetchLike;
+    const builds = await publishedBuilds(fetch, {
+      ...ENV,
+      GITHUB_RELEASES_URL: "http://localhost:8788/releases",
+    });
+    expect(seen[0]).toMatch(/^http:\/\/localhost:8788\/releases\?/);
+    expect(builds).toEqual([
+      {
+        version: "0.93.1",
+        release_url:
+          "https://github.com/unytco/unyt-sandbox/releases/tag/v0.93.1",
+        assets: [],
+      },
+    ]);
+  });
+
   it("returns [] on a non-2xx upstream (never throws)", async () => {
     expect(
       await publishedBuilds(

@@ -28,12 +28,28 @@ export function migrationOptions(
   registry: Registry,
   toDnaHash: string | null,
 ): Response {
+  // Missing param only, and deliberately still `unknown_to_dna`. Since an unregistered
+  // target is a 200 (below), this is the sole path to that code HERE — whereas
+  // `/v1/migrate` keeps emitting it for a hash that isn't in the registry. Same code,
+  // two disjoint conditions; don't read one endpoint's meaning from the other. The
+  // spec's § Wire format & errors table documents both, so this is the as-built
+  // contract, not drift: the router's convention for a missing GET query param is a
+  // dedicated per-endpoint code (`/v1/update-check` does the same with
+  // `unknown_current_dna`), not the body-scoped `bad_request`.
   if (!toDnaHash) {
     return errorJson(
       400,
       "unknown_to_dna",
       "to_dna_hash query parameter is required",
     );
+  }
+  // An unregistered target is NOT an error — the spec (version-migration
+  // `migration-router.md` § Endpoints) contracts "chain root / unknown DNA →
+  // `{ options: [] }`", and the app relies on it: it distinguishes "no migration
+  // path, join fresh" from "router errored, show a retry card". A 4xx here would
+  // strand a fresh installer on the retry card instead of letting them join.
+  if (!registry.get(toDnaHash)) {
+    return ok({ to_dna_hash: toDnaHash, options: [] });
   }
   // Any source with a proven path to `to` (direct skip, not just the immediate
   // predecessor) — the app may have closed on any of them.

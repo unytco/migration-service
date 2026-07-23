@@ -15,7 +15,7 @@
 //!   * an OLD-DNA conductor hosting the `alliance` app for a stateful agent,
 //!     with notary cells on the old DNA (so close-time signing works);
 //!   * a `wrangler dev` router whose registry maps the old DNA → new DNA and
-//!     lists the local notary daemon(s) (see `migration-service/router`);
+//!     lists the local notary daemon(s) (see `migration-service/migration-router`);
 //!   * a NEW-DNA conductor (admin reachable) with the carried key imported into
 //!     its lair (the shell's `migrate-carry-key.sh` step) + `lair-sign` on PATH;
 //!   * the target release's joining service reachable for a fresh membrane proof.

@@ -19,24 +19,27 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     defaults:
       run:
-        working-directory: router
+        working-directory: migration-router
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           # Deploy exactly the commit CI validated, not whatever main is now.
           ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: actions/setup-node@v4
+      # Deliberately UNCACHED. `cache: npm` would key this secrets-bearing job's
+      # ~/.npm on the same lockfile hash as ci.yml's `router` job, letting a less
+      # privileged run seed the cache a Cloudflare-credentialed `npm ci` then
+      # reads (zizmor: cache-poisoning). A cold `npm ci` here costs seconds.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: router/package-lock.json
       - run: npm ci
       - name: Deploy to Cloudflare
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: router
+          workingDirectory: migration-router
         # Runtime Worker secrets (MIGRATION_NOTARY_BEARER_TOKEN,
         # CF_ACCESS_CLIENT_ID/SECRET) are set once via `wrangler secret put`,
         # independent of this deploy token.

@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:local": "node -e \"const fs=require('fs');fs.existsSync('registry.local.json')||fs.copyFileSync('registry.local.example.json','registry.local.json');fs.existsSync('.dev.vars')||fs.copyFileSync('.dev.vars.example','.dev.vars')\" && wrangler dev -c wrangler.local.toml",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
