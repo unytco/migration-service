@@ -43,7 +43,23 @@
           "api": "v1"
         }
       ],
-      "published": true
+      "published": true,
+      "upgrade_targets": [
+        "uhC0kuFGOovGmmQbKLxaEGZJT6KuU0UuVwf98Rk_l7fXoiik_JKck"
+      ]
+    },
+    {
+      "dna_hash": "uhC0kuFGOovGmmQbKLxaEGZJT6KuU0UuVwf98Rk_l7fXoiik_JKck",
+      "version": "alliance-v0.97.0",
+      "upgrades_from": "uhC0kOLOyaJ5ZVB6eD6Ucc5fSN0FSYu0I6zTfc9GcakWGRpEMeRQ0",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.97.0",
+      "notaries": [
+        {
+          "url": "https://notary-1-v0-97-0.unyt.dev",
+          "api": "v1"
+        }
+      ],
+      "published": false
     }
   ]
 }
