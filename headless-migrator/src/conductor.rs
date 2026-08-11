@@ -121,6 +121,11 @@ pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
         network_seed: spec.network_seed.clone(),
         roles_settings: Some(roles),
         ignore_genesis_failure: false,
+        // The carried agent has no prior chain on the SUCCESSOR DNA — the open
+        // ceremony depends on genesis running so `init` reads the package out of
+        // `init_properties` and opens the chain. Restoring from the DHT would
+        // suppress exactly that.
+        restore_from_dht: false,
     })
 }
 

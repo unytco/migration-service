@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop, develop-0.7, main]
   pull_request:
-    branches: [develop, main]
+    branches: [develop, develop-0.7, main]
 
 # One run per branch under test: `head_ref` is the PR's source branch, `ref` the
-# pushed branch (push only fires on develop/main, so the two never collide).
+# pushed branch (push only fires on the base branches, so the two never collide).
 # Superseded runs are cancelled — on main that just means the newest commit's CI
 # is the one deploy.yml gates on.
 concurrency:
