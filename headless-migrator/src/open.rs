@@ -24,7 +24,10 @@ use crate::config::{Config, OpenConfig};
 // The migration-init error classification lives in `dna_errors` (the one home
 // for the fragile DNA error-substring contract); re-exported below so callers
 // and tests can still reach it via `open::`.
-pub use crate::dna_errors::{classify_migration_init_error, InitErrorClass};
+pub use crate::dna_errors::{
+    classify_migration_init_error, is_agent_key_not_in_keystore, is_successor_gd_not_in_effect,
+    InitErrorClass,
+};
 use crate::fetch::{self, FetchOutcome};
 use crate::joining::{self, LairSigner, NonceSigner};
 use crate::probe::{probe_open_state, OpenState};
@@ -103,25 +106,90 @@ fn gd_wait_expired(started_us: i64, now_us: i64, timeout: Duration) -> bool {
     Duration::from_micros(now_us.saturating_sub(started_us).max(0) as u64) >= timeout
 }
 
+/// Which precondition a bounded [`OpenOutcome::TooEarly`] is waiting on. Both
+/// share ONE retry path and ONE deadline, but they are different faults in
+/// different subsystems — reporting either as the other sends the operator to
+/// the wrong place for the whole window. Derived from the cause once, at the
+/// point the outcome is reported, so every operator-facing surface (the backoff
+/// warn, the per-pass state-file message, the exhaustion message) is consistent
+/// by construction instead of re-sniffing the error string at each site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPrecondition {
+    /// The successor `GlobalDefinition` `init` needs hasn't gossiped in / isn't
+    /// in effect yet.
+    SuccessorGd,
+    /// Holochain 0.7+ refuses an install whose `agent_key` the local lair
+    /// doesn't hold — the carried key isn't visible (yet).
+    CarriedKey,
+    /// Bounded, but not one of the causes above. Kept as an explicit variant so
+    /// a future third bounded cause reports the RAW error instead of silently
+    /// inheriting one of these diagnoses — the same misattribution the
+    /// `CarriedKey` split exists to prevent, and the same "fail loud instead of
+    /// hanging" doctrine as `dna_errors`' deliberate allowlists.
+    Unrecognized,
+}
+
+impl PendingPrecondition {
+    /// Both known causes are matched POSITIVELY — neither is the other's
+    /// fallback — so an unrecognized bounded cause lands on `Unrecognized`
+    /// rather than being reported as whichever happened to be the default.
+    fn of(cause: &anyhow::Error) -> Self {
+        let rendered = format!("{cause:#}");
+        if is_agent_key_not_in_keystore(&rendered) {
+            Self::CarriedKey
+        } else if is_successor_gd_not_in_effect(&rendered) {
+            Self::SuccessorGd
+        } else {
+            Self::Unrecognized
+        }
+    }
+
+    /// The short label for the backoff warn and the per-pass state-file message.
+    fn waiting_label(self) -> &'static str {
+        match self {
+            Self::SuccessorGd => "successor GD not yet in effect",
+            Self::CarriedKey => "carried agent key not yet visible to the local lair",
+            Self::Unrecognized => "an install precondition is unmet (see the error)",
+        }
+    }
+}
+
 /// The exhaustion message stamped into the state file (which the `automation`
-/// rail cats out) and returned as the failing error when the successor-GD wait
-/// runs out. The LEADING text is an actionable CONFIG-FAULT diagnosis, not a
-/// bare genesis error: after the full budget the likeliest cause is a wrong
-/// successor DNA hash / registry entry or a target Holochain+network
-/// misconfiguration, so point the operator there. The raw `init` cause rides
-/// along as a trailing detail. Pure (no loop / no I/O) so it is unit-testable.
+/// rail cats out) and returned as the failing error when the bounded wait runs
+/// out. The LEADING text is an actionable CONFIG-FAULT diagnosis, not a bare
+/// genesis error: after the full budget the likeliest cause is a wrong successor
+/// DNA hash / registry entry or a target Holochain+network misconfiguration (or,
+/// for a carried key, a key carry that never ran), so point the operator at the
+/// right subsystem. The raw cause rides along as a trailing detail. Pure (no
+/// loop / no I/O) so it is unit-testable.
 fn gd_wait_exhausted_message(
     from: &DnaHashB64,
     to: &DnaHashB64,
     timeout: Duration,
     cause: &anyhow::Error,
 ) -> String {
-    format!(
-        "v2 GD never gossiped to the target within {}s — check the successor DNA hash / \
-         registry and the target's Holochain+network config (from={from} to={to}). \
-         Last init error: {cause:#}",
-        timeout.as_secs()
-    )
+    match PendingPrecondition::of(cause) {
+        PendingPrecondition::CarriedKey => format!(
+            "the carried agent key never became visible to the local lair within {}s — check \
+             that the key carry ran for this app and that lair is serving it on the target \
+             (from={from} to={to}). Last install error: {cause:#}",
+            timeout.as_secs()
+        ),
+        PendingPrecondition::SuccessorGd => format!(
+            "v2 GD never gossiped to the target within {}s — check the successor DNA hash / \
+             registry and the target's Holochain+network config (from={from} to={to}). \
+             Last init error: {cause:#}",
+            timeout.as_secs()
+        ),
+        // No subsystem is named: guessing one would send the operator to the
+        // wrong place, so the raw cause IS the diagnosis here.
+        PendingPrecondition::Unrecognized => format!(
+            "an install precondition stayed unmet for {}s (from={from} to={to}) — this cause \
+             is not one the migrator recognizes, so read the error directly. \
+             Last install error: {cause:#}",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Run the open service to completion (or a hard stop), against the real local
@@ -206,7 +274,8 @@ pub async fn run_with(
                 bail!("open hard-stopped: {why}");
             }
             OpenOutcome::TooEarly(e) => {
-                // Bounded retry: the successor GD `init` needs isn't in effect yet.
+                // Bounded retry: a precondition the open needs (the successor GD,
+                // or the carried key being visible to lair) isn't satisfied yet.
                 // Re-drive after a backoff, but give up once it has stayed
                 // unresolved past the deadline (it may never come). The deadline is
                 // measured from the FIRST too-early and PERSISTED to the state file,
@@ -236,12 +305,13 @@ pub async fn run_with(
                 let remaining = open_cfg.gd_wait_timeout.saturating_sub(elapsed);
                 let delay =
                     Duration::from_millis(ham::compute_delay_ms(attempts, &backoff)).min(remaining);
+                let pending = PendingPrecondition::of(&e);
                 tracing::warn!(error = %format!("{e:#}"), delay_ms = delay.as_millis() as u64,
-                    "successor GD not yet in effect; backing off (bounded)");
+                    "{}; backing off (bounded)", pending.waiting_label());
                 // Persist carries the first-too-early stamp (set above) so the
                 // budget survives the restart.
                 persist(cfg, &mut state, |s| {
-                    s.message = format!("waiting for the successor GD to come into effect: {e:#}");
+                    s.message = format!("waiting: {} ({e:#})", pending.waiting_label());
                 });
                 if sleep_or_shutdown(delay, shutdown).await {
                     return shutdown_before_complete();
@@ -611,8 +681,13 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
         InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
             "unexpected non-fresh chain surfaced at install: {rendered}"
         )),
+        // Bounded: either the successor GD isn't in effect yet, or (Holochain
+        // 0.7+) the carried key isn't visible to lair yet. WHICH one is derived
+        // from the cause by `PendingPrecondition`, which owns every
+        // operator-facing message — so this context stays neutral about the
+        // cause and records only where it surfaced.
         InitErrorClass::TooEarly => {
-            OpenOutcome::TooEarly(e.context("successor GD not yet in effect (surfaced at install)"))
+            OpenOutcome::TooEarly(e.context("bounded precondition unmet (surfaced at install)"))
         }
         InitErrorClass::AlreadyMigrated | InitErrorClass::Transient => {
             OpenOutcome::Transient(e.context("install_app for the carried key"))
@@ -792,7 +867,10 @@ pub async fn probe_for_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, OpenOutcome};
+    use super::{
+        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, OpenOutcome,
+        PendingPrecondition,
+    };
     use crate::state_file::now_us;
     use holo_hash::{DnaHash, DnaHashB64};
     use std::time::Duration;
@@ -821,6 +899,76 @@ mod tests {
         assert!(
             msg.contains("No Global Definition found"),
             "keeps the raw init cause as a trailing detail: {msg}"
+        );
+    }
+
+    /// Holochain 0.7+ shares the bounded deadline with a second cause: a carried
+    /// key the local lair doesn't hold. Exhausting on THAT must blame the key
+    /// carry, not GD gossip — blaming the registry would send the operator to
+    /// the wrong system for the whole window.
+    #[test]
+    fn gd_wait_exhausted_on_a_missing_carried_key_blames_the_key_carry() {
+        let from = DnaHashB64::from(DnaHash::from_raw_36(vec![1; 36]));
+        let to = DnaHashB64::from(DnaHash::from_raw_36(vec![2; 36]));
+        // Wrapped in the SAME context the install path attaches, so this pins
+        // the real production shape: the cause must still be recoverable from
+        // `{e:#}` through the `.context()` layer, not just from a bare error.
+        let cause = anyhow::anyhow!(
+            "Agent key AgentPubKey(uhCAk…) is not present in the local Lair keystore"
+        )
+        .context("bounded precondition unmet (surfaced at install)");
+        let msg = gd_wait_exhausted_message(&from, &to, BUDGET, &cause);
+        assert!(
+            msg.contains("carried agent key never became visible to the local lair"),
+            "blames the key carry: {msg}"
+        );
+        assert!(
+            !msg.contains("check the successor DNA hash / registry"),
+            "must NOT misdiagnose this as a GD/registry fault: {msg}"
+        );
+        assert!(msg.contains("1800s"), "carries the elapsed budget: {msg}");
+    }
+
+    /// The backoff warn and the per-pass state-file message both label the wait
+    /// from this one derivation, so it must name the right subsystem for each
+    /// cause — an operator watching the rail sees this string, not the class.
+    #[test]
+    fn pending_precondition_labels_each_cause_distinctly() {
+        let gd = anyhow::anyhow!("wasm error: No Global Definition found");
+        let key = anyhow::anyhow!(
+            "Agent key AgentPubKey(uhCAk…) is not present in the local Lair keystore"
+        );
+        assert_eq!(
+            PendingPrecondition::of(&gd),
+            PendingPrecondition::SuccessorGd
+        );
+        assert_eq!(
+            PendingPrecondition::of(&key),
+            PendingPrecondition::CarriedKey
+        );
+        assert!(PendingPrecondition::of(&gd).waiting_label().contains("GD"));
+        assert!(PendingPrecondition::of(&key)
+            .waiting_label()
+            .contains("carried agent key"));
+        // Both causes are matched positively, so a cause that is neither must
+        // NOT inherit one of their diagnoses — that misattribution is exactly
+        // what the CarriedKey split exists to prevent, and a future third
+        // bounded cause would otherwise reintroduce it silently.
+        let other = anyhow::anyhow!("some future bounded precondition nobody has seen yet");
+        assert_eq!(
+            PendingPrecondition::of(&other),
+            PendingPrecondition::Unrecognized
+        );
+        let msg = gd_wait_exhausted_message(
+            &DnaHashB64::from(DnaHash::from_raw_36(vec![1; 36])),
+            &DnaHashB64::from(DnaHash::from_raw_36(vec![2; 36])),
+            BUDGET,
+            &other,
+        );
+        assert!(
+            !msg.contains("check the successor DNA hash / registry")
+                && !msg.contains("carried agent key never became visible"),
+            "an unrecognized cause must name no subsystem: {msg}"
         );
     }
 

@@ -2,7 +2,7 @@
   description = "Flake for the unyt migration notary daemon — static-musl cross-build toolchain for deploy";
 
   inputs = {
-    holonix.url = "github:holochain/holonix?ref=main-0.6";
+    holonix.url = "github:holochain/holonix?ref=main-0.7";
 
     nixpkgs.follows = "holonix/nixpkgs";
     flake-parts.follows = "holonix/flake-parts";
