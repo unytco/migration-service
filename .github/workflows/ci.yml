@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [develop, develop-0.7, main]
+    branches: [develop, develop-0.7, main, main-0.6]
   pull_request:
-    branches: [develop, develop-0.7, main]
+    branches: [develop, develop-0.7, main, main-0.6]
 
 # One run per branch under test: `head_ref` is the PR's source branch, `ref` the
 # pushed branch (push only fires on the base branches, so the two never collide).
