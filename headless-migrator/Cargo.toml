@@ -47,7 +47,7 @@ dotenvy = "0.15"
 # the whole migration-service repo). EXACT `=` pins on the 0.7 line: the app/DNA
 # pin `=0.9.0` (src-tauri), and a caret would resolve *ahead* of the deployed
 # DNA — breaking notary-signature / init_properties byte parity.
-ham = { git = "https://github.com/unytco/ham.git", branch = "main-0.7" }
+ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
 holochain_client = "=0.9.0"
 holo_hash = { version = "=0.7.0", features = ["encoding"] }
 # App-install payloads for the open service (install / uninstall / enable for
