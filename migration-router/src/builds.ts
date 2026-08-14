@@ -62,7 +62,7 @@ export interface CacheLike {
   set(key: string, value: Build[], ttlSeconds: number): Promise<void>;
 }
 
-/** A build tag is exactly `vMAJOR.MINOR.PATCH` — anchored, so `-rc.*` and test tags never match. */
+/** A build tag is exactly `vMAJOR.MINOR.PATCH` — anchored, so `-dev.*` and test tags never match. */
 const TAG_RE = /^v(\d+)\.(\d+)\.(\d+)$/;
 
 /** major.minor of a version-ish string ("0.93.0" | "0.93" | "v0.93.1" → "0.93"); null if unparseable. */

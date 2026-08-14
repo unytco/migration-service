@@ -380,7 +380,7 @@ describe("updateCheck — build axis (app_version present)", () => {
       ghReleases([
         { tag: "v0.3.9", draft: true },
         { tag: "v0.3.8", prerelease: true },
-        { tag: "v0.3.7-rc.1" },
+        { tag: "v0.3.7-dev.1" },
         { tag: "v0.3.5" },
       ]),
     );
