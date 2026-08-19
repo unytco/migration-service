@@ -3,6 +3,9 @@
 target/
 **/*.rs.bk
 
+# Release assets staged by .github/workflows/release.yml
+release/
+
 # Node / Worker
 node_modules/
 migration-router/node_modules/

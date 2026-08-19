@@ -1,0 +1,197 @@
+name: Release
+
+# Cut a release by pushing a semver tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Both binaries ship from one tag, so a release is always a tested pairing of
+# the close-side and open-side halves of a migration.
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Split out so a bad tag fails in seconds rather than after a full compile of
+  # the Holochain client stack.
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      # Tag globs cannot express semver, so the glob above is loose and this is
+      # the real gate. No checkout: the tag name is all this job reads.
+      - name: Validate tag is semver
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # semver.org's official regex, with a leading "v".
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+
+          if [[ ! "$TAG" =~ $semver ]]; then
+            echo "::error::Tag '$TAG' is not semver. Expected vMAJOR.MINOR.PATCH[-prerelease][+build], e.g. v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+
+          version="${TAG#v}"
+
+          # Drop build metadata first, so v1.2.3+build-7 is not read as a prerelease.
+          if [[ "${version%%+*}" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease: $prerelease)"
+
+  build:
+    name: Build ${{ matrix.bin }}
+    needs: version
+    # Matches the droplet image the fleet provisions (ubuntu-24-04-x64), so the
+    # binary cannot require a newer glibc than the target has.
+    runs-on: ubuntu-24.04
+    strategy:
+      # The two crates carry the same version, so when they disagree with the
+      # tag it is usually both. Report both in one run instead of cancelling the
+      # sibling leg.
+      fail-fast: false
+      matrix:
+        include:
+          - crate: headless-migrator
+            package: headless-migrator
+            bin: headless-migrator
+          - crate: notary-daemon
+            package: migration-notary
+            bin: migration-notary
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Asset names carry no version, so `--version` identifies a build -- and
+      # that comes from Cargo.toml. Also the first cargo call, which is what
+      # installs the toolchain rust-toolchain.toml pins.
+      - name: Verify Cargo.toml matches tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+
+          manifest="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .version')"
+
+          if [[ "$manifest" != "$VERSION" ]]; then
+            echo "::error::Tag says $VERSION but $PACKAGE's Cargo.toml says $manifest. Both crates must be bumped and committed before tagging."
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      # --locked: `ham` tracks a branch, so Cargo.lock is the only record of
+      # which commit a release was built against.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+          cp "target/release/$BIN" release/
+
+          # Here rather than in publish: the artifact round-trip drops the
+          # executable bit.
+          reported="$("./release/$BIN" --version | awk '{print $NF}')"
+          if [[ "$reported" != "$VERSION" ]]; then
+            echo "::error::Built $BIN reports version '$reported', expected '$VERSION'."
+            exit 1
+          fi
+
+          # Bare filename in the digest, so `sha256sum -c` works as-is beside
+          # the downloaded binary.
+          ( cd release && sha256sum "$BIN" > "$BIN.sha256" )
+
+          ls -lh release/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.bin }}
+          path: ${{ matrix.crate }}/release/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Separate job so that compiling the Holochain client stack, and the actions
+  # around it, never run with a token that can write releases.
+  publish:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # A tag can be moved between the build starting and this job running,
+          # and an old run can be re-run. Never publish assets built from a
+          # commit the tag no longer points at.
+          tag_sha="$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Tag $TAG points at $tag_sha but these assets were built from $GITHUB_SHA."
+            exit 1
+          fi
+
+          # Listed rather than globbed, so a missing asset fails the release
+          # instead of publishing a half-complete one.
+          assets=(
+            release/headless-migrator
+            release/headless-migrator.sha256
+            release/migration-notary
+            release/migration-notary.sha256
+          )
+
+          # Converge rather than fail when re-running a partially failed release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            args=(--title "$TAG" --generate-notes)
+            if [[ "$PRERELEASE" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$TAG" "${args[@]}" "${assets[@]}"
+          fi
