@@ -391,11 +391,11 @@ async fn verify_gate_fails_when_opened_chain_ledger_mismatches() {
 
     // New-chain ledger DISAGREES (balance 1, not 100) — an unverified open.
     let mock = MockConductor::default();
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 1),
         CarryForwardUnits::new(),
         UnitMap::new(),
-    ));
+    )));
 
     let client = headless_migrator::fetch::http_client_for_status().unwrap();
     let report = fetch_and_compare(&mock, &client, &base, &dna_b64(1), &dna_b64(2), "uhCAk")

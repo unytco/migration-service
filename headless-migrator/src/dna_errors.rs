@@ -14,6 +14,7 @@
 //!     Definition found" (`.../progenitor_calls/global_definition.rs`),
 //!   * the conductor's own install preconditions (Holochain 0.7's
 //!     `AgentKeyNotInKeystore`), which are not validator verdicts at all,
+//!   * `ham`'s response-decode failure ([`is_response_decode_failure`]),
 //!   * transport / conductor errors that never came from a validator, and
 //!   * the router's wire error codes (`migration-service/migration-router`) — a separate
 //!     string namespace that shares this home, unchanged.
@@ -238,6 +239,28 @@ pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     r.contains("is not in this network's upgrade_targets")
         // close validator: "Close target is not in this DNA's upgrade_targets".
         || r.contains("close target is not in this dna's upgrade_targets")
+}
+
+/// Whether a zome call failed at DECODING the response rather than at making it,
+/// i.e. this binary's `rave_engine` and the deployed DNA's disagree. Anchored to
+/// `ham`'s `call_zome` decode context (`ham/src/client.rs`), which `ham` exposes
+/// no predicate for. Narrow on purpose, since promoting a recoverable failure to
+/// a terminal one costs an operator: the bare `"failed to deserialize"` token is
+/// the alliance DNA's own entry decodes, and `ham` returns on the call error
+/// BEFORE reaching the decode, so a chain carrying both contexts quoted the
+/// phrase in guest text. Lowercases internally.
+pub fn is_response_decode_failure(rendered: &str) -> bool {
+    let r = rendered.to_lowercase();
+    r.contains("failed to deserialize response") && !r.contains("failed to call zome")
+}
+
+/// The operator-facing text for a schema mismatch, carrying the only remedy
+/// there is. Shared, so the diagnosis reads the same wherever it surfaces.
+pub fn schema_mismatch_message(ctx: &str, rendered: &str) -> String {
+    format!(
+        "{ctx}: the response did not decode, so this binary's rave_engine does not match the \
+         deployed DNA's. Rebuild the migrator against the DNA's version. Cause: {rendered}"
+    )
 }
 
 /// Whether an error is the validator's out-of-window `GlobalDefinition` verdict.
@@ -467,6 +490,30 @@ mod tests {
             ),
             InitErrorClass::TooEarly
         );
+    }
+
+    /// Strings mirrored from `ham::call_zome` and the alliance DNA. The
+    /// negatives are the design: a widened needle hard-stops a migration a
+    /// retry would have completed.
+    #[test]
+    fn only_hams_own_decode_context_is_a_decode_failure() {
+        assert!(is_response_decode_failure(
+            "get_ledger zome call failed: Failed to deserialize response: \
+             invalid type: string \"5\", expected a map"
+        ));
+        // A call that never returned a body.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: Websocket error: Websocket closed: No connection"
+        ));
+        // The DNA's own entry decode, quoted through the call error.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: Guest(\"Failed to deserialize DocDef: Error(...)\")"
+        ));
+        // Guest text quoting the anchor verbatim still arrives under the call
+        // error, so it is not this binary's decode.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: RibosomeError(\"Failed to deserialize response\")"
+        ));
     }
 
     /// A deliberate divergence from the variant's own `rave_engine` doc, which

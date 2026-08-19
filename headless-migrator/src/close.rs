@@ -124,7 +124,13 @@ async fn attempt(
     });
     let close_state = match probe_close_state(conductor).await {
         Ok(s) => s,
-        Err(e) => return CloseOutcome::Transient(e.context("probing close state")),
+        // The probe raises `Err` for one thing: a response that did not decode.
+        Err(e) => {
+            return CloseOutcome::HardStop(crate::dna_errors::schema_mismatch_message(
+                "probing close state",
+                &format!("{e:#}"),
+            ))
+        }
     };
 
     if let CloseState::PartialClose = close_state {
@@ -185,7 +191,7 @@ async fn prepare_collect_close(
                 }
             }
         }
-        Err(e) => return CloseOutcome::Transient(e.context("reading ledger for fee check")),
+        Err(e) => return classify_close_read_failure(e, "reading ledger for fee check"),
     }
 
     persist(cfg, state, |s| {
@@ -195,7 +201,7 @@ async fn prepare_collect_close(
     let prepared: PrepareCloseResponse =
         match conductor.prepare_closing_summary(target.clone()).await {
             Ok(p) => p,
-            Err(e) => return classify_close_failure(e, "prepare_closing_summary"),
+            Err(e) => return classify_close_read_failure(e, "prepare_closing_summary"),
         };
     let agent_b64 = AgentPubKeyB64::from(prepared.payload.agent_pubkey.clone()).to_string();
     persist(cfg, state, |s| {
@@ -237,7 +243,7 @@ async fn prepare_collect_close(
         Err(e @ PolicyError::Exhausted { .. }) => {
             return CloseOutcome::Transient(anyhow::anyhow!("{e}"))
         }
-        Err(e @ PolicyError::Fatal(_)) => return CloseOutcome::Transient(anyhow::anyhow!("{e}")),
+        Err(PolicyError::Fatal(why)) => return CloseOutcome::HardStop(why),
     };
 
     persist(cfg, state, |s| {
@@ -255,15 +261,27 @@ async fn prepare_collect_close(
 }
 
 /// Classify a close-side zome-call failure. A target-binding fault (the configured
-/// `to_dna` is not in this DNA's `upgrade_targets`) is a HARD stop — retrying can
-/// never fix a misconfigured target, so the close service must exit nonzero rather
-/// than loop forever. Everything else (gossip lag, a websocket blip) stays
-/// transient and is retried.
+/// `to_dna` is not in this DNA's `upgrade_targets`) is a HARD stop: retrying can
+/// never fix a misconfigured target. Everything else (gossip lag, a websocket
+/// blip) stays transient.
 fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     if crate::dna_errors::is_close_target_hard_failure(&format!("{e:#}")) {
         CloseOutcome::HardStop(format!("{ctx}: {e:#}"))
     } else {
         CloseOutcome::Transient(e.context(ctx))
+    }
+}
+
+/// [`classify_close_failure`] for a call whose RESPONSE VALUE the close needs.
+/// A response that did not decode is a second hard stop here and nowhere else:
+/// for a read the state cannot be learned, while for a write it says nothing
+/// about whether the write landed, which the next pass's probe reads back.
+fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
+    let rendered = format!("{e:#}");
+    if crate::dna_errors::is_response_decode_failure(&rendered) {
+        CloseOutcome::HardStop(crate::dna_errors::schema_mismatch_message(ctx, &rendered))
+    } else {
+        classify_close_failure(e, ctx)
     }
 }
 
@@ -287,7 +305,18 @@ impl Signer for ConductorSigner<'_> {
         match tokio::time::timeout(self.request_timeout, call).await {
             Err(_elapsed) => Ok(SignOutcome::TimedOut),
             Ok(Err(e)) => {
-                tracing::warn!(notary = %notary, error = %format!("{e:#}"),
+                let rendered = format!("{e:#}");
+                // Not the notary's fault: substituting reports an exhausted
+                // N-list for this binary's schema mismatch.
+                if crate::dna_errors::is_response_decode_failure(&rendered) {
+                    return Err(PolicyError::Fatal(
+                        crate::dna_errors::schema_mismatch_message(
+                            "request_closing_signature",
+                            &rendered,
+                        ),
+                    ));
+                }
+                tracing::warn!(notary = %notary, error = %rendered,
                     "request_closing_signature errored");
                 Ok(SignOutcome::Errored)
             }

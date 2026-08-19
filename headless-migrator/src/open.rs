@@ -24,10 +24,12 @@ use crate::config::{Config, OpenConfig};
 // The migration-init error classification lives in `dna_errors` (the one home
 // for the fragile DNA error-substring contract); re-exported below so callers
 // and tests can still reach it via `open::`.
-use crate::dna_errors::is_global_definition_out_of_window;
 pub use crate::dna_errors::{
     classify_migration_init_error, is_agent_key_not_in_keystore, is_successor_gd_not_in_effect,
     InitErrorClass,
+};
+use crate::dna_errors::{
+    is_global_definition_out_of_window, is_response_decode_failure, schema_mismatch_message,
 };
 use crate::fetch::{self, FetchOutcome};
 use crate::joining::{self, LairSigner, NonceSigner};
@@ -770,6 +772,18 @@ async fn drive_open_and_verify(
     }
 }
 
+/// Classify a failed read of a `rave_engine`-typed zome response: a HARD stop on
+/// a schema mismatch, which the unbounded transient retry can never resolve, and
+/// the usual blip otherwise.
+fn zome_read_outcome(e: anyhow::Error, ctx: &'static str) -> OpenOutcome {
+    let rendered = format!("{e:#}");
+    if is_response_decode_failure(&rendered) {
+        OpenOutcome::HardStop(schema_mismatch_message(ctx, &rendered))
+    } else {
+        OpenOutcome::Transient(e.context(ctx))
+    }
+}
+
 /// The shared verify: new-chain ledger vs the carried close summary.
 async fn verify_after_open_with(
     cfg: &Config,
@@ -789,14 +803,12 @@ async fn verify_after_open_with(
     });
     let ledger = match conductor.get_ledger().await {
         Ok(l) => l,
-        Err(e) => return OpenOutcome::Transient(e.context("reading new-chain ledger for verify")),
+        Err(e) => return zome_read_outcome(e, "reading new-chain ledger for verify"),
     };
     let opened = match conductor.get_opened_agreement_state().await {
         Ok(o) => o,
         Err(e) => {
-            return OpenOutcome::Transient(
-                e.context("reading new-chain opened agreement state for verify"),
-            )
+            return zome_read_outcome(e, "reading new-chain opened agreement state for verify")
         }
     };
     let mut report: VerifyReport = verify_against_ledger(&package.payload.closing_state, &ledger);
@@ -881,8 +893,8 @@ pub async fn probe_for_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, OpenOutcome,
-        PendingPrecondition,
+        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, zome_read_outcome,
+        OpenOutcome, PendingPrecondition,
     };
     use crate::state_file::now_us;
     use holo_hash::{DnaHash, DnaHashB64};
@@ -940,6 +952,30 @@ mod tests {
             "must NOT misdiagnose this as a GD/registry fault: {msg}"
         );
         assert!(msg.contains("1800s"), "carries the elapsed budget: {msg}");
+    }
+
+    /// The whole point of the class: a response that did not decode exits
+    /// nonzero, where the unbounded transient retry would spin forever on a
+    /// fault only a rebuilt binary clears. Strings mirrored from
+    /// `ham::call_zome`.
+    #[test]
+    fn an_undecodable_read_hard_stops_and_a_blip_still_retries() {
+        let decode = anyhow::anyhow!(
+            "get_ledger zome call failed: Failed to deserialize response: \
+             invalid type: string \"5\", expected a map"
+        );
+        let OpenOutcome::HardStop(why) = zome_read_outcome(decode, "reading ledger") else {
+            panic!("a schema mismatch must hard-stop the open service");
+        };
+        assert!(
+            why.contains("Rebuild the migrator"),
+            "the hard stop names the only remedy: {why}"
+        );
+        let blip = anyhow::anyhow!("Failed to call zome: Websocket error: Websocket closed");
+        assert!(matches!(
+            zome_read_outcome(blip, "reading ledger"),
+            OpenOutcome::Transient(_)
+        ));
     }
 
     /// An out-of-window GD is the third bounded cause, and it must NOT land on
