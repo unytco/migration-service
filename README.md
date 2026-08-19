@@ -21,6 +21,7 @@ migration-router/ Cloudflare Worker (TS) — wrangler + vitest
 notary-daemon/   Rust crate — axum + ham
 headless-migrator/ Rust crate — clap + ham (headless server-agent close/open services)
 .github/workflows/  ci.yml (test on push/PR to develop + main) + deploy.yml (router → CF on main)
+                    + release.yml (binaries → GitHub release on tag)
 ```
 
 ## Build / test
@@ -30,8 +31,56 @@ headless-migrator/ Rust crate — clap + ham (headless server-agent close/open s
 - **headless-migrator/** — `cd headless-migrator && cargo test`. Same public deps as the daemon. The M-of-N policy, the probe→next-step state machine (incl. partial close), close/open idempotency, and the verify comparison are all tested against a scripted mock conductor — no Holochain conductor needed.
 - **Real-conductor round-trips (gated):** `cd notary-daemon && cargo test --test live_roundtrip -- --ignored` (a live conductor with a closed agent — locks the package ⇄ `MigrationInitRequest` serde round-trip) and `cd headless-migrator && cargo test --test live_roundtrip -- --ignored` (live old+new conductors + a `wrangler dev` router — the full close → carry → open → verify arc + restart drills). Env vars + fixture notes in each test's file header.
 
+## Releases
+
+Cut a release by pushing a semver tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Both binaries ship from one tag, so the workflow checks it against the version in **both** crates' `Cargo.toml` — bump and commit both before tagging. Tags run the workflow as it exists in the tagged commit, so merge first.
+
+Assets have **fixed names**, so a provisioning script can hardcode the URL:
+
+| Asset | Description |
+|---|---|
+| `headless-migrator` | Stripped release binary — the close/open services |
+| `migration-notary` | Stripped release binary — the notary daemon |
+| `<name>.sha256` | Digest of each, bare filename inside |
+
+```text
+https://github.com/unytco/migration-service/releases/download/v0.1.0/migration-notary
+https://github.com/unytco/migration-service/releases/latest/download/migration-notary
+```
+
+`releases/latest/download/` resolves to the newest non-prerelease, so a droplet pointed at `latest` will not pick up an `-rc` tag.
+
+### Installing from cloud-init
+
+```bash
+VERSION=v0.1.0
+BIN=migration-notary          # or headless-migrator
+INSTALL_DIR=/opt/migration-service
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+for asset in "$BIN" "$BIN.sha256"; do
+  curl -fsSL -o "$asset" \
+    "https://github.com/unytco/migration-service/releases/download/${VERSION}/${asset}"
+done
+
+sha256sum -c "$BIN.sha256"
+chmod 755 "$BIN"
+```
+
+The binaries are built on the same Ubuntu release the fleet droplets run, so a target needs no toolchain and no extra packages: they link nothing beyond glibc, and their TLS roots are compiled in. Neither is configured by file — the daemon reads its config from the environment, `headless-migrator` from flags plus the environment.
+
+The asset names carry no version, so `--version` on either binary is how a deployed build identifies itself.
+
 ## Branching / CI
 
 - Integrate on `develop`; release by merging `develop → main`.
 - CI runs `cargo test` (daemon + headless-migrator) + `vitest` (router) on push/PR.
-- The **router Worker auto-deploys to Cloudflare on push to `main`**. The daemon and headless-migrator are CI-tested but ship to HEART droplets via unyt's deployment-automation hub (not auto-deployed).
+- The **router Worker auto-deploys to Cloudflare on push to `main`**. The daemon and headless-migrator are CI-tested and published as release assets on a tag (see [Releases](#releases)); they reach HEART droplets from there via unyt's deployment-automation hub (not auto-deployed).
