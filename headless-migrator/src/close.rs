@@ -29,7 +29,6 @@ use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash};
 use rave_engine::types::entries::migration::v0_1::{
     NotarySignature, PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryStatePayload,
 };
-use zfuel::fuel::ZFuel;
 
 use crate::conductor::Conductor;
 use crate::config::Config;
@@ -176,7 +175,7 @@ async fn prepare_collect_close(
     // signatures (the staleness pin), so it must precede prepare.
     match conductor.get_ledger().await {
         Ok(ledger) => {
-            if ledger.fees_owed != ZFuel::zero() {
+            if !ledger.fees_owed.is_zero() {
                 persist(cfg, state, |s| {
                     s.step = Step::DroppingFees;
                     s.message = "fees owed — dropping before prepare".into();

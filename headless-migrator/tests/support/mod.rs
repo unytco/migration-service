@@ -25,7 +25,6 @@ use rave_engine::types::entries::migration::v0_1::{
 use rave_engine::types::ledger::CarryForwardUnits;
 use rave_engine::types::ledger::Ledger;
 use rave_engine::types::units::UnitMap;
-use zfuel::fuel::ZFuel;
 
 /// Every interaction the mock records, so a test can assert ordering (e.g.
 /// `drop_off_fees` precedes `prepare_closing_summary`).
@@ -237,8 +236,8 @@ pub fn dna_b64(seed: u8) -> holo_hash::DnaHashB64 {
     holo_hash::DnaHashB64::from(dna(seed))
 }
 
-/// A ledger with the given balance/CFU and zero fees.
-pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: ZFuel) -> Ledger {
+/// A ledger with the given balance/CFU and per-unit fees owed.
+pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: UnitMap) -> Ledger {
     Ledger {
         balance,
         carry_forward_units: cfu,

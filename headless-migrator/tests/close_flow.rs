@@ -14,8 +14,8 @@ use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{Phase, State, Step};
 use rave_engine::types::entries::migration::v0_1::SignClosingResponse;
 use rave_engine::types::ledger::CarryForwardUnits;
+use rave_engine::types::units::UnitMap;
 use support::*;
-use zfuel::fuel::ZFuel;
 
 /// A `Config` pointing at a unique temp state file, with snappy retries so the
 /// supervised loop's backoff doesn't slow the test.
@@ -55,6 +55,35 @@ fn tmp_state(name: &str) -> std::path::PathBuf {
 fn never_shutdown() -> ham::ShutdownRx {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     rx
+}
+
+/// Drive one close over an open chain whose ledger owes `fees_owed`, returning
+/// the calls the conductor saw. Everything but the fee gate is held fixed.
+async fn close_with_fees_owed(name: &str, fees_owed: UnitMap) -> Vec<Call> {
+    let tmp = tmp_state(name);
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    *mock.ledger.lock().unwrap() =
+        Some(ledger(unit_map(0, 10), CarryForwardUnits::new(), fees_owed));
+    *mock.drop_fees.lock().unwrap() = Some(Ok("Fees dropped off".into()));
+    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+    *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
+    mock.sign_responses
+        .lock()
+        .unwrap()
+        .push_back(Ok(SignClosingResponse::Signed {
+            signature: hdi::prelude::Signature([2u8; 64]),
+        }));
+
+    let mut sd = never_shutdown();
+    close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .expect("close run Ok");
+    let _ = std::fs::remove_file(&tmp);
+    mock.calls()
 }
 
 #[tokio::test]
@@ -130,7 +159,7 @@ async fn bad_to_dna_hard_stops_instead_of_looping() {
     *mock.ledger.lock().unwrap() = Some(ledger(
         unit_map(0, 0),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
+        UnitMap::new(),
     ));
     // Prepare errors with the extern's target pre-check rejection.
     *mock.prepare.lock().unwrap() = Some(Err(anyhow::anyhow!(
@@ -213,7 +242,7 @@ async fn fees_owed_drops_before_prepare() {
     *mock.ledger.lock().unwrap() = Some(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::from(5i64),
+        unit_map(0, 5),
     ));
     *mock.drop_fees.lock().unwrap() = Some(Ok("Fees dropped off".into()));
     // Prepare: one notary, threshold 1.
@@ -256,38 +285,41 @@ async fn fees_owed_drops_before_prepare() {
 }
 
 #[tokio::test]
-async fn no_fee_drop_when_none_owed() {
-    let tmp = tmp_state("no-fee-drop");
-    let mock = MockConductor::default();
-    mock.close_state
-        .lock()
-        .unwrap()
-        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
-    // Zero fees → no drop.
-    *mock.ledger.lock().unwrap() = Some(ledger(
-        unit_map(0, 10),
-        CarryForwardUnits::new(),
-        ZFuel::zero(),
-    ));
-    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
-    *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
-    mock.sign_responses
-        .lock()
-        .unwrap()
-        .push_back(Ok(SignClosingResponse::Signed {
-            signature: hdi::prelude::Signature([2u8; 64]),
-        }));
-
-    let mut sd = never_shutdown();
-    close::run(&mock, &cfg(&tmp), &mut sd)
-        .await
-        .expect("close run Ok");
+async fn fees_owed_on_a_non_base_unit_also_drops_before_prepare() {
+    // The behavioural gain of the per-unit shape: under a single `ZFuel` a
+    // service-unit debt was unrepresentable, so a chain owing only those would
+    // have prepared its summary with the fees still outstanding.
+    let calls = close_with_fees_owed("fees-non-base-unit", unit_map(3, 5)).await;
+    let drop_idx = calls.iter().position(|c| *c == Call::DropOffFees);
+    let prep_idx = calls
+        .iter()
+        .position(|c| matches!(c, Call::PrepareClosingSummary { .. }));
+    assert!(drop_idx.is_some(), "the debt must be dropped: {calls:?}");
+    assert!(prep_idx.is_some(), "the summary is prepared: {calls:?}");
     assert!(
-        !mock.calls().contains(&Call::DropOffFees),
-        "no fee drop when none owed: {:?}",
-        mock.calls()
+        drop_idx < prep_idx,
+        "drop_off_fees must precede prepare_closing_summary: {calls:?}"
     );
-    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn no_fee_drop_when_none_owed() {
+    // Both shapes of "owes nothing": the empty map the DNA keeps (it strips zero
+    // entries), and an explicit zero, so the gate does not rest on that invariant.
+    for (name, owed) in [
+        ("no-fee-drop-empty", UnitMap::new()),
+        ("no-fee-drop-zero", unit_map(0, 0)),
+    ] {
+        let calls = close_with_fees_owed(name, owed).await;
+        assert!(
+            !calls.contains(&Call::DropOffFees),
+            "{name}: no fee drop when none owed: {calls:?}"
+        );
+        assert!(
+            calls.contains(&Call::CloseAgentChain),
+            "{name}: the close still runs: {calls:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -307,7 +339,7 @@ async fn closed_state_retains_agent_and_signature_progress() {
     *mock.ledger.lock().unwrap() = Some(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
+        UnitMap::new(),
     ));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(
@@ -416,7 +448,7 @@ async fn warranted_notary_hard_stops_the_close() {
     *mock.ledger.lock().unwrap() = Some(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
+        UnitMap::new(),
     ));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));

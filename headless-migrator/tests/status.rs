@@ -26,10 +26,10 @@ use headless_migrator::status::{
 };
 use headless_migrator::verify::fetch_and_compare;
 use rave_engine::types::ledger::CarryForwardUnits;
+use rave_engine::types::units::UnitMap;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use zfuel::fuel::ZFuel;
 
 /// A `Config` whose conductor ports point nowhere (no conductor) and whose state
 /// file is the given temp path, with a tiny status connect budget so the bounded
@@ -394,7 +394,7 @@ async fn verify_gate_fails_when_opened_chain_ledger_mismatches() {
     *mock.ledger.lock().unwrap() = Some(ledger(
         unit_map(0, 1),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
+        UnitMap::new(),
     ));
 
     let client = headless_migrator::fetch::http_client_for_status().unwrap();

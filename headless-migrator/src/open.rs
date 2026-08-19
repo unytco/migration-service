@@ -24,6 +24,7 @@ use crate::config::{Config, OpenConfig};
 // The migration-init error classification lives in `dna_errors` (the one home
 // for the fragile DNA error-substring contract); re-exported below so callers
 // and tests can still reach it via `open::`.
+use crate::dna_errors::is_global_definition_out_of_window;
 pub use crate::dna_errors::{
     classify_migration_init_error, is_agent_key_not_in_keystore, is_successor_gd_not_in_effect,
     InitErrorClass,
@@ -121,6 +122,10 @@ enum PendingPrecondition {
     /// Holochain 0.7+ refuses an install whose `agent_key` the local lair
     /// doesn't hold — the carried key isn't visible (yet).
     CarriedKey,
+    /// The GD resolved, but the action's timestamp falls outside its validity
+    /// window. Distinct from `SuccessorGd`: nothing is missing, the dates are
+    /// wrong, and half of this cause (an expired window) never clears.
+    GdWindow,
     /// Bounded, but not one of the causes above. Kept as an explicit variant so
     /// a future third bounded cause reports the RAW error instead of silently
     /// inheriting one of these diagnoses — the same misattribution the
@@ -139,6 +144,8 @@ impl PendingPrecondition {
             Self::CarriedKey
         } else if is_successor_gd_not_in_effect(&rendered) {
             Self::SuccessorGd
+        } else if is_global_definition_out_of_window(&rendered) {
+            Self::GdWindow
         } else {
             Self::Unrecognized
         }
@@ -149,6 +156,7 @@ impl PendingPrecondition {
         match self {
             Self::SuccessorGd => "successor GD not yet in effect",
             Self::CarriedKey => "carried agent key not yet visible to the local lair",
+            Self::GdWindow => "successor GD outside its validity window",
             Self::Unrecognized => "an install precondition is unmet (see the error)",
         }
     }
@@ -179,6 +187,12 @@ fn gd_wait_exhausted_message(
             "v2 GD never gossiped to the target within {}s — check the successor DNA hash / \
              registry and the target's Holochain+network config (from={from} to={to}). \
              Last init error: {cause:#}",
+            timeout.as_secs()
+        ),
+        PendingPrecondition::GdWindow => format!(
+            "the successor GD stayed outside its validity window for {}s: check its effective \
+             and expiry dates against this deploy's timing (from={from} to={to}). An expired \
+             window never opens. Last init error: {cause:#}",
             timeout.as_secs()
         ),
         // No subsystem is named: guessing one would send the operator to the
@@ -745,11 +759,10 @@ async fn drive_open_and_verify(
                 InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
                     "unexpected non-fresh chain at init (no call should precede it): {rendered}"
                 )),
-                // The successor GD is not yet in effect — re-drive `init` once it
-                // syncs, but bounded by the run loop's deadline.
-                InitErrorClass::TooEarly => {
-                    OpenOutcome::TooEarly(e.context("successor GD not yet in effect"))
-                }
+                // A precondition that may still arrive: re-drive `init`, bounded
+                // by the run loop's deadline. Which one is named by
+                // `PendingPrecondition`, so no diagnosis is asserted here.
+                InitErrorClass::TooEarly => OpenOutcome::TooEarly(e),
                 // Any other blip: back off and re-probe.
                 InitErrorClass::Transient => OpenOutcome::Transient(e.context("driving init")),
             }
@@ -927,6 +940,39 @@ mod tests {
             "must NOT misdiagnose this as a GD/registry fault: {msg}"
         );
         assert!(msg.contains("1800s"), "carries the elapsed budget: {msg}");
+    }
+
+    /// An out-of-window GD is the third bounded cause, and it must NOT land on
+    /// `Unrecognized`, whose report tells the operator the migrator does not know
+    /// the cause, for the whole budget, on the surface `automation` cats out.
+    /// Verdict mirrored from the alliance open validator.
+    #[test]
+    fn an_out_of_window_gd_is_named_not_reported_as_unrecognized() {
+        let cause = anyhow::anyhow!(
+            "[MIGERR:MIG_GD_OUT_OF_WINDOW] the referenced GlobalDefinition is outside its \
+             validity window — not yet effective or expired — so the open is refused"
+        );
+        assert_eq!(
+            PendingPrecondition::of(&cause),
+            PendingPrecondition::GdWindow
+        );
+        assert!(PendingPrecondition::of(&cause)
+            .waiting_label()
+            .contains("validity window"));
+        let msg = gd_wait_exhausted_message(
+            &DnaHashB64::from(DnaHash::from_raw_36(vec![1; 36])),
+            &DnaHashB64::from(DnaHash::from_raw_36(vec![2; 36])),
+            Duration::from_secs(1800),
+            &cause,
+        );
+        assert!(
+            msg.contains("effective and expiry dates"),
+            "points at the window, not at gossip: {msg}"
+        );
+        assert!(
+            !msg.contains("not one the migrator recognizes"),
+            "a cause the migrator DOES classify must not report as unrecognized: {msg}"
+        );
     }
 
     /// The backoff warn and the per-pass state-file message both label the wait

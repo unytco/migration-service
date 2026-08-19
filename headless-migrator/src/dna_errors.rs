@@ -43,6 +43,10 @@ fn init_class_of(code: MigrationError) -> InitErrorClass {
         | NotaryThresholdNotMet => InitErrorClass::HardFailure,
         AlreadyMigrated => InitErrorClass::AlreadyMigrated,
         NonFreshChain => InitErrorClass::NonFreshChain,
+        // Deliberately NOT the HardFailure `rave_engine`'s own doc calls for:
+        // the window check reads the ACTION's timestamp, so a re-driven `init`
+        // carries a fresh one and a not-yet-effective window clears.
+        GlobalDefinitionOutOfWindow => InitErrorClass::TooEarly,
         ClosingSummaryUpdateForbidden
         | CloseAuthorMismatch
         | CloseSourceDnaMismatch
@@ -234,6 +238,18 @@ pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     r.contains("is not in this network's upgrade_targets")
         // close validator: "Close target is not in this DNA's upgrade_targets".
         || r.contains("close target is not in this dna's upgrade_targets")
+}
+
+/// Whether an error is the validator's out-of-window `GlobalDefinition` verdict.
+/// Matched positively so it never inherits the successor-GD diagnosis: the GD
+/// resolved fine, its validity window is wrong.
+pub fn is_global_definition_out_of_window(rendered: &str) -> bool {
+    if let Some(code) = MigrationError::from_rendered(rendered) {
+        return code == MigrationError::GlobalDefinitionOutOfWindow;
+    }
+    rendered
+        .to_lowercase()
+        .contains("outside its validity window")
 }
 
 /// The non-closed close states the close-side probe must distinguish from a
@@ -451,6 +467,28 @@ mod tests {
             ),
             InitErrorClass::TooEarly
         );
+    }
+
+    /// A deliberate divergence from the variant's own `rave_engine` doc, which
+    /// calls it terminal. Pinned so the arm cannot drift into the neighbouring
+    /// `HardFailure` chain.
+    #[test]
+    fn an_out_of_window_gd_waits_under_the_deadline() {
+        let tagged = "[MIGERR:MIG_GD_OUT_OF_WINDOW] the referenced GlobalDefinition is \
+                      outside its validity window";
+        assert_eq!(
+            classify_migration_init_error(tagged),
+            InitErrorClass::TooEarly
+        );
+        assert!(is_global_definition_out_of_window(tagged));
+        // Untagged, from the validator's own wording.
+        assert!(is_global_definition_out_of_window(
+            "the referenced GlobalDefinition is outside its validity window"
+        ));
+        // The other bounded cause must not answer to this predicate.
+        assert!(!is_global_definition_out_of_window(
+            "wasm error: No Global Definition found"
+        ));
     }
 
     #[test]
