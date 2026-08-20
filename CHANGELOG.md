@@ -46,6 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **headless-migrator: the migrating install now decodes the joining-service's real `roles`-keyed provision shape.** The old top-level `membrane_proofs`/`dna_modifiers` struct silently decoded the new `GET /v1/join/:session/provision` response to empty defaults, installing without the network's DNA properties and landing the agent alone on an isolated DHT; a response with no entry for the migrating role now errors by name instead (B139).
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.
 - **headless-migrator: a rejected membrane proof is now terminal, not an infinite retry** — `genesis_self_check`'s four verdicts join the init hard-failure table instead of falling through to the unbounded transient arm.

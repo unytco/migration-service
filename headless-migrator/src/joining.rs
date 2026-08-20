@@ -18,14 +18,16 @@ use holo_hash::{AgentPubKey, AgentPubKeyB64};
 use holochain_types::prelude::YamlProperties;
 use serde::Deserialize;
 
-/// What the joining service returns from `provision`: per-role membrane proofs
-/// (base64) and the network's DNA modifiers. The seed takes precedence over any
-/// configured one at install; the properties have no configured counterpart —
-/// this is their ONLY source, and the install applies them verbatim.
+/// What the joining service returns from `provision` for THIS migration's
+/// configured role: its membrane proof (base64) and the network's DNA
+/// modifiers. The seed takes precedence over any configured one at install;
+/// the properties have no configured counterpart — this is their ONLY source,
+/// and the install applies them verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct Provision {
-    /// Role name → base64 membrane proof.
-    pub membrane_proofs: std::collections::HashMap<String, String>,
+    /// Base64 membrane proof for the role, or `None` if the role needs none —
+    /// the joining service omits it for a role with no configured DNA hash.
+    pub membrane_proof: Option<String>,
     pub network_seed: Option<String>,
     /// The network's DNA properties (`progenitor_pubkey` / `joining_server_signer`
     /// on our fleet). Both modifiers are hashed into the DNA hash, so the install
@@ -137,7 +139,13 @@ struct VerifyResponse {
 #[derive(Deserialize)]
 struct ProvisionResponse {
     #[serde(default)]
-    membrane_proofs: std::collections::HashMap<String, String>,
+    roles: std::collections::HashMap<String, RoleProvision>,
+}
+
+#[derive(Deserialize)]
+struct RoleProvision {
+    #[serde(default)]
+    membrane_proof: Option<String>,
     #[serde(default)]
     dna_modifiers: Option<DnaModifiers>,
 }
@@ -150,14 +158,41 @@ struct DnaModifiers {
     properties: Option<YamlProperties>,
 }
 
+/// Pull `role_name`'s provisioning data out of the decoded response, erroring
+/// by name rather than defaulting when the role is missing. A response shaped
+/// for a different wire contract — e.g. the retired top-level
+/// `membrane_proofs`/`dna_modifiers` keys — decodes to an EMPTY `roles` map
+/// here, so this must fail rather than let an absent role's data flow to the
+/// install as `None`.
+fn provision_for_role(mut response: ProvisionResponse, role_name: &str) -> Result<Provision> {
+    let role = response.roles.remove(role_name).with_context(|| {
+        format!(
+            "joining-service provision response has no entry for role '{role_name}' in its \
+             roles map (roles present: {:?}) — its membrane proof and DNA modifiers are unknown",
+            response.roles.keys().collect::<Vec<_>>()
+        )
+    })?;
+    let (network_seed, properties) = match role.dna_modifiers {
+        Some(m) => (m.network_seed, m.properties),
+        None => (None, None),
+    };
+    Ok(Provision {
+        membrane_proof: role.membrane_proof,
+        network_seed,
+        properties,
+    })
+}
+
 /// Run the full join + provision flow against `joining_url` for `agent_key`,
-/// signing the challenge nonce with `signer`. Returns the per-role membrane
-/// proofs + modifiers for the install.
+/// signing the challenge nonce with `signer`. Returns `role_name`'s membrane
+/// proof + modifiers for the install, erroring if the response's `roles` map
+/// carries no entry for it.
 pub async fn join_and_provision(
     client: &reqwest::Client,
     joining_url: &str,
     agent_key: &AgentPubKey,
     signer: &dyn NonceSigner,
+    role_name: &str,
 ) -> Result<Provision> {
     let base = joining_url.trim_end_matches('/');
     let agent_b64 = AgentPubKeyB64::from(agent_key.clone()).to_string();
@@ -232,15 +267,7 @@ pub async fn join_and_provision(
         .await
         .context("decoding provision response")?;
 
-    let (network_seed, properties) = match provision.dna_modifiers {
-        Some(m) => (m.network_seed, m.properties),
-        None => (None, None),
-    };
-    Ok(Provision {
-        membrane_proofs: provision.membrane_proofs,
-        network_seed,
-        properties,
-    })
+    provision_for_role(provision, role_name)
 }
 
 /// A `reqwest` client with a sane timeout for the joining-service calls.
@@ -256,26 +283,43 @@ mod tests {
     use super::*;
     use holochain_types::prelude::SerializedBytes;
 
-    /// The provision body's `dna_modifiers.properties` must survive the decode
-    /// with its map order intact: the properties are msgpack-encoded into the DNA
-    /// hash, so a re-ordered map is a DIFFERENT DNA than the network's. Asserted
-    /// at the byte level, since map equality alone is order-blind.
+    fn decode(body: &str) -> ProvisionResponse {
+        serde_json::from_str(body).expect("decode provision")
+    }
+
+    /// The decisive regression test: a payload shaped exactly like the real
+    /// `roles`-keyed endpoint round-trips a role's proof and properties through
+    /// to the `Provision` the install path consumes — proving the fix reaches
+    /// where the DNA hash is decided, not just the decode step.
     #[test]
-    fn provision_properties_decode_in_wire_order() {
+    fn a_real_roles_shaped_payload_reaches_the_install_path() {
         // Deliberately NOT alphabetical — a decode through a sorted map would
         // swap these two and silently change the hash.
         let body = r#"{
-            "membrane_proofs": { "alliance": "cHJvb2Y=" },
-            "dna_modifiers": {
-                "network_seed": "unyt-local-testnet-b",
-                "properties": {
-                    "progenitor_pubkey": "uhCAkfake",
-                    "joining_server_signer": "uhCAkalso"
+            "linker_urls": [],
+            "happ_bundle_url": "https://example/unyt.happ",
+            "network_config": { "auth_server_url": "https://auth.example" },
+            "roles": {
+                "alliance": {
+                    "membrane_proof": "cHJvb2Y=",
+                    "dna_modifiers": {
+                        "network_seed": "unyt-local-testnet-b",
+                        "properties": {
+                            "progenitor_pubkey": "uhCAkfake",
+                            "joining_server_signer": "uhCAkalso"
+                        }
+                    }
                 }
             }
         }"#;
-        let decoded: ProvisionResponse = serde_json::from_str(body).expect("decode provision");
-        let modifiers = decoded.dna_modifiers.expect("dna_modifiers present");
+        let provision =
+            provision_for_role(decode(body), "alliance").expect("alliance role present");
+
+        assert_eq!(provision.membrane_proof.as_deref(), Some("cHJvb2Y="));
+        assert_eq!(
+            provision.network_seed.as_deref(),
+            Some("unyt-local-testnet-b")
+        );
 
         // Hand-computed msgpack for that map in WIRE order — an INDEPENDENT
         // oracle. Re-encoding the same JSON through the same decoder would pass
@@ -289,8 +333,7 @@ mod tests {
         expected.extend_from_slice(b"joining_server_signer");
         expected.push(0xa9);
         expected.extend_from_slice(b"uhCAkalso");
-
-        let encoded = SerializedBytes::try_from(modifiers.properties.expect("properties present"))
+        let encoded = SerializedBytes::try_from(provision.properties.expect("properties present"))
             .expect("encode properties");
         assert_eq!(
             encoded.bytes(),
@@ -298,10 +341,57 @@ mod tests {
             "the network's properties must encode byte-identically to the wire order — \
              a sorted decode would put joining_server_signer first and change the DNA hash"
         );
-        assert_eq!(
-            modifiers.network_seed.as_deref(),
-            Some("unyt-local-testnet-b")
+    }
+
+    /// The regression this whole fix is for: the RETIRED top-level
+    /// `membrane_proofs`/`dna_modifiers` shape must not decode to an empty
+    /// `roles` map that then silently yields `None`s. Pointed at the old shape,
+    /// resolving any role must error, not install on absent modifiers.
+    #[test]
+    fn the_retired_top_level_shape_errors_instead_of_decoding_to_empty() {
+        let old_shape = r#"{
+            "membrane_proofs": { "alliance": "cHJvb2Y=" },
+            "dna_modifiers": {
+                "network_seed": "unyt-local-testnet-b",
+                "properties": { "progenitor_pubkey": "uhCAkfake" }
+            }
+        }"#;
+        let err = provision_for_role(decode(old_shape), "alliance")
+            .expect_err("the old shape carries no `roles` key and must not resolve a role");
+        assert!(
+            format!("{err:#}").contains("alliance"),
+            "the error must name the role that could not be resolved: {err:#}"
         );
+    }
+
+    /// A `roles` map present but missing the migrating role (e.g. the network
+    /// configured a different role name) must error by name, not silently hand
+    /// back `None`s for a role that in fact exists under a different key.
+    #[test]
+    fn a_roles_map_missing_the_configured_role_errors_by_name() {
+        let body = r#"{ "roles": { "some_other_role": { "membrane_proof": "cHJvb2Y=" } } }"#;
+        let err = provision_for_role(decode(body), "alliance")
+            .expect_err("alliance is not in the roles map");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("alliance"), "{msg}");
+        assert!(msg.contains("some_other_role"), "{msg}");
+    }
+
+    /// A `roles` map carrying MORE than one role must resolve the NAMED one, not
+    /// whichever entry a map iterator happens to yield first. With every other
+    /// fixture in this file a single-entry map, only this one would catch a
+    /// regression to an order-dependent lookup (e.g. `.values().next()`).
+    #[test]
+    fn provision_for_role_picks_the_named_role_out_of_several() {
+        let body = r#"{
+            "roles": {
+                "some_other_role": { "membrane_proof": "b3RoZXI=" },
+                "alliance": { "membrane_proof": "cHJvb2Y=" }
+            }
+        }"#;
+        let provision =
+            provision_for_role(decode(body), "alliance").expect("alliance role present");
+        assert_eq!(provision.membrane_proof.as_deref(), Some("cHJvb2Y="));
     }
 
     /// A provision body with no modifiers at all leaves both fields unset — the
@@ -311,29 +401,38 @@ mod tests {
         // Three shapes a joining service can legitimately send, all meaning "no
         // properties to apply" — the install must send no properties override for
         // each, leaving the manifest's value alone rather than overwriting it.
-        let no_modifiers: ProvisionResponse =
-            serde_json::from_str(r#"{ "membrane_proofs": {} }"#).expect("decode provision");
-        assert!(no_modifiers.dna_modifiers.is_none());
+        let no_modifiers =
+            provision_for_role(decode(r#"{ "roles": { "alliance": {} } }"#), "alliance")
+                .expect("alliance role present");
+        assert!(no_modifiers.properties.is_none());
 
-        let modifiers_without_properties: ProvisionResponse = serde_json::from_str(
-            r#"{ "membrane_proofs": {}, "dna_modifiers": { "network_seed": "s" } }"#,
+        let modifiers_without_properties = provision_for_role(
+            decode(r#"{ "roles": { "alliance": { "dna_modifiers": { "network_seed": "s" } } } }"#),
+            "alliance",
         )
-        .expect("decode provision");
-        assert!(modifiers_without_properties
-            .dna_modifiers
-            .expect("dna_modifiers present")
-            .properties
-            .is_none());
+        .expect("alliance role present");
+        assert!(modifiers_without_properties.properties.is_none());
 
-        let explicit_null: ProvisionResponse = serde_json::from_str(
-            r#"{ "membrane_proofs": {}, "dna_modifiers": { "properties": null } }"#,
+        let explicit_null = provision_for_role(
+            decode(r#"{ "roles": { "alliance": { "dna_modifiers": { "properties": null } } } }"#),
+            "alliance",
         )
-        .expect("decode provision");
-        assert!(explicit_null
-            .dna_modifiers
-            .expect("dna_modifiers present")
-            .properties
-            .is_none());
+        .expect("alliance role present");
+        assert!(explicit_null.properties.is_none());
+    }
+
+    /// A role present with no `membrane_proof` key is legitimate (the joining
+    /// service omits it for a role with no configured DNA hash) — it must carry
+    /// through as `None`, for the install-time validator to accept or reject,
+    /// rather than erroring at decode time.
+    #[test]
+    fn a_role_with_no_membrane_proof_carries_through_as_none() {
+        let provision = provision_for_role(
+            decode(r#"{ "roles": { "alliance": { "dna_modifiers": { "network_seed": "s" } } } }"#),
+            "alliance",
+        )
+        .expect("alliance role present, even with no proof");
+        assert!(provision.membrane_proof.is_none());
     }
 
     /// An EMPTY properties map is not the same as absent: it is a real value the
@@ -342,13 +441,12 @@ mod tests {
     /// collapsing it to `None`.
     #[test]
     fn an_empty_properties_map_is_carried_not_collapsed_to_none() {
-        let decoded: ProvisionResponse = serde_json::from_str(
-            r#"{ "membrane_proofs": {}, "dna_modifiers": { "properties": {} } }"#,
+        let provision = provision_for_role(
+            decode(r#"{ "roles": { "alliance": { "dna_modifiers": { "properties": {} } } } }"#),
+            "alliance",
         )
-        .expect("decode provision");
-        let props = decoded
-            .dna_modifiers
-            .expect("dna_modifiers present")
+        .expect("alliance role present");
+        let props = provision
             .properties
             .expect("an empty map is Some, not None");
         assert_eq!(

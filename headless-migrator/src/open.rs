@@ -552,18 +552,23 @@ async fn install(
         s.step = Step::Installing;
         s.message = "requesting fresh membrane proof for the carried key".into();
     });
-    let provision =
-        match joining::join_and_provision(http, &open_cfg.joining_url, &params.agent_key, signer)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(OpenOutcome::Transient(
-                    e.context("fresh membrane proof from target joining service"),
-                ))
-            }
-        };
-    let membrane_proof = match provision.membrane_proofs.get(&cfg.role_name) {
+    let provision = match joining::join_and_provision(
+        http,
+        &open_cfg.joining_url,
+        &params.agent_key,
+        signer,
+        &cfg.role_name,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(OpenOutcome::Transient(
+                e.context("fresh membrane proof from target joining service"),
+            ))
+        }
+    };
+    let membrane_proof = match provision.membrane_proof.as_deref() {
         Some(b64) => match decode_membrane_proof(b64) {
             Ok(bytes) => Some(bytes),
             Err(e) => return Err(OpenOutcome::Transient(e)),
