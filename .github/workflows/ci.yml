@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop, develop-0.7, main, main-0.6]
   pull_request:
-    branches: [develop, main]
+    branches: [develop, develop-0.7, main, main-0.6]
 
 # One run per branch under test: `head_ref` is the PR's source branch, `ref` the
-# pushed branch (push only fires on develop/main, so the two never collide).
+# pushed branch (push only fires on the base branches, so the two never collide).
 # Superseded runs are cancelled — on main that just means the newest commit's CI
 # is the one deploy.yml gates on.
 concurrency:
@@ -24,13 +24,13 @@ jobs:
       run:
         working-directory: notary-daemon
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: notary-daemon
       - name: fmt
@@ -49,13 +49,13 @@ jobs:
       run:
         working-directory: headless-migrator
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: headless-migrator
       - name: fmt
@@ -72,10 +72,10 @@ jobs:
       run:
         working-directory: migration-router
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm

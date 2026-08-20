@@ -101,13 +101,13 @@ describe("newestOnLineage", () => {
 });
 
 describe("publishedBuilds", () => {
-  it("keeps only published, anchored tags (drops draft, pre-release, rc, and garbage)", async () => {
+  it("keeps only published, anchored tags (drops draft, pre-release, dev, and garbage)", async () => {
     const fetch = ghFetch(() =>
       releasesResp([
         { tag: "v0.3.4" },
         { tag: "v0.3.3", draft: true },
         { tag: "v0.3.2", prerelease: true },
-        { tag: "v0.3.1-rc.2" },
+        { tag: "v0.3.1-dev.2" },
         { tag: "nightly" },
       ]),
     );

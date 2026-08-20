@@ -12,6 +12,8 @@
 //!   * the coordinator's untagged too-early wrapper ("Could not resolve a
 //!     successor GlobalDefinition at init") + the GD lookup's "No Global
 //!     Definition found" (`.../progenitor_calls/global_definition.rs`),
+//!   * the conductor's own install preconditions (Holochain 0.7's
+//!     `AgentKeyNotInKeystore`), which are not validator verdicts at all,
 //!   * transport / conductor errors that never came from a validator, and
 //!   * the router's wire error codes (`migration-service/migration-router`) — a separate
 //!     string namespace that shares this home, unchanged.
@@ -98,11 +100,34 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
         InitErrorClass::AlreadyMigrated
     } else if is_non_fresh_chain(&r) {
         InitErrorClass::NonFreshChain
-    } else if is_successor_gd_not_in_effect(&r) {
+    } else if is_successor_gd_not_in_effect_lower(&r) || is_agent_key_not_in_keystore(rendered) {
         InitErrorClass::TooEarly
     } else {
         InitErrorClass::Transient
     }
+}
+
+/// Holochain 0.7 rejects an install whose `agent_key` the local lair doesn't
+/// hold — a precondition that did not exist on 0.6, so it is new on the open
+/// service's critical path (`build_install_payload` always sets `agent_key`).
+/// BOUNDED, not terminal: `automation`'s key carry quiesces lair around the
+/// copy, so the key can legitimately be a moment away from visible; but a key
+/// that was never carried never appears, and the classifier can't tell those
+/// apart — the same "not yet vs never" bind the successor-GD wait is bounded
+/// for. Without this it lands on the unbounded `Transient` fallthrough and a
+/// mis-carried key spins the supervised loop forever with no diagnosis.
+///
+/// Public because it shares the bounded `TooEarly` class with the successor-GD
+/// wait but needs a DIFFERENT operator diagnosis — the open service branches on
+/// it so an exhausted deadline blames the key carry, not GD gossip. Lowercases
+/// internally, so callers may pass the raw rendered error.
+pub fn is_agent_key_not_in_keystore(rendered: &str) -> bool {
+    // Anchored to `ConductorError::AgentKeyNotInKeystore`'s distinctive phrase
+    // ("Agent key {0} is not present in the local Lair keystore"), minus the
+    // interpolated key so a reworded prefix still matches.
+    rendered
+        .to_lowercase()
+        .contains("is not present in the local lair keystore")
 }
 
 /// The open integrity validator rejects a chain that isn't fresh (non-zero
@@ -123,7 +148,16 @@ fn is_non_fresh_chain(r_lower: &str) -> bool {
 /// come). Mirrors the wrapper `apply_migration_init_properties` puts on the GD
 /// lookup ("Could not resolve a successor GlobalDefinition at init") plus the
 /// underlying "No Global Definition found".
-fn is_successor_gd_not_in_effect(r_lower: &str) -> bool {
+///
+/// Public alongside [`is_agent_key_not_in_keystore`] so the open service can
+/// tell the two bounded causes apart POSITIVELY — neither is the other's
+/// fallback, and an unrecognized bounded cause must not silently inherit either
+/// one's diagnosis.
+pub fn is_successor_gd_not_in_effect(rendered: &str) -> bool {
+    is_successor_gd_not_in_effect_lower(&rendered.to_lowercase())
+}
+
+fn is_successor_gd_not_in_effect_lower(r_lower: &str) -> bool {
     // Anchored to the two distinctive phrases (verified in the alliance DNA:
     // `migration/open.rs` wrapper + `progenitor_calls/global_definition.rs` lookup)
     // — NOT the bare `"successor globaldefinition"` token, which would also swallow
@@ -402,6 +436,21 @@ mod tests {
                 "a rejected membrane proof must hard-stop, never retry forever: {verdict}"
             );
         }
+    }
+
+    /// Holochain 0.7's new pre-install keystore check must land on the BOUNDED
+    /// retry, never the unbounded `Transient` fallthrough: the open service
+    /// always installs with an `agent_key`, so a key the carry hasn't landed
+    /// (or never carried) would otherwise spin forever with no diagnosis.
+    /// String mirrored from `ConductorError::AgentKeyNotInKeystore`.
+    #[test]
+    fn missing_carried_key_is_bounded_not_unbounded() {
+        assert_eq!(
+            classify_migration_init_error(
+                "Agent key AgentPubKey(uhCAk…) is not present in the local Lair keystore"
+            ),
+            InitErrorClass::TooEarly
+        );
     }
 
     #[test]
