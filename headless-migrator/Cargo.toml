@@ -74,3 +74,6 @@ zfuel = "=0.9.1"
 [dev-dependencies]
 # Deterministic seeded RNG for the policy unit tests.
 rand_chacha = "0.3"
+
+[profile.release]
+strip = "symbols"

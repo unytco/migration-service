@@ -22,6 +22,7 @@ use headless_migrator::{close, open, status, verify};
 #[derive(Parser, Debug)]
 #[command(
     name = "headless-migrator",
+    version,
     about = "Headless server-agent migration: close the old chain (M-of-N) and \
              re-open it on the successor DNA with the carried key",
     long_about = None,
