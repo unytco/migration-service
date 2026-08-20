@@ -23,9 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **headless-migrator: `rave_engine` 0.10.0, where fees owed are per unit.** The ledger's `fees_owed` is a map of unit index to amount, so a debt on ANY unit blocks a close, not just the base one. Pins are `rave_engine =0.10.0` / `zfuel =0.9.1`. (notary-daemon stays on `=0.9.0`: separate crate, separate lockfile, and the migration wire types are unchanged between the two.)
-- **headless-migrator: a READ whose response will not decode is a hard stop carrying its remedy.** The binary's `rave_engine` disagreeing with the deployed DNA's is a schema mismatch, so the close and open services exit nonzero naming the rebuild rather than retrying it forever. A write's undecodable response stays transient: it says nothing about whether the write landed, and the next probe reads that back.
-- headless-migrator: an out-of-window `GlobalDefinition` at `init` waits under the bounded deadline and reports the window as its own cause, distinct from a successor GD that has not gossiped in.
+- **headless-migrator: a debt on any unit blocks a close, not just the base one.** What an agent owes is now stated per unit (`rave_engine` 0.10.0), so the check before closing a chain reads every unit. `notary-daemon` stays on 0.9.0; the migration wire types are unchanged between the two.
+- headless-migrator: a successor definition that is not yet inside its effective window waits under the bounded deadline and is named as its own cause, rather than being confused with one that has not gossiped in.
 - **Upgrade to Holochain 0.7 + `rave_engine` 0.9.0** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`, `zfuel 0.9.0`, `ham` on branch `main`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
@@ -48,6 +47,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - router: registry now rejects a fork (two DNAs upgrading from the same predecessor) so forward lookup is unambiguous
 
 ### Fixed
+
+- **headless-migrator: a reply it cannot read stops the run instead of retrying forever, and no longer blames the notaries.** Two versions disagreeing about a message shape is never resolved by waiting. Asking a notary to sign treated every failure as that notary being unreachable, so an unreadable reply worked through the whole list and reported `notary list exhausted`, sending an operator to check servers that were fine. A reply to a write still retries: it says nothing about whether the write landed.
 
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.
