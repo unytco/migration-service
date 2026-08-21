@@ -126,6 +126,7 @@ async fn gd_wait_exhaustion_reports_a_config_fault_not_a_raw_genesis_error() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
+        network: "v0.99.0".into(),
         // Zero budget: the FIRST too-early exhausts immediately (single pass,
         // single fetch), so the one-shot router suffices.
         gd_wait_timeout: Duration::ZERO,
@@ -229,6 +230,7 @@ async fn an_already_installed_app_on_the_wrong_dna_hard_stops_immediately() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
+        network: "v0.99.0".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
@@ -302,6 +304,7 @@ async fn an_installed_app_for_the_wrong_agent_hard_stops() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
+        network: "v0.99.0".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {

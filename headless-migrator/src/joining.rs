@@ -183,89 +183,102 @@ fn provision_for_role(mut response: ProvisionResponse, role_name: &str) -> Resul
     })
 }
 
+/// Sends `req` and decodes a successful response as `T`. A non-2xx status is
+/// reported WITH the response body — the joining service's structured error
+/// (`{ "error": { "code": ..., "message": ... } }`) — rather than just the
+/// status code: `reqwest::Response::error_for_status()` alone discards the
+/// body, which is the only place a rejection reason (`unknown_network`,
+/// `join_rejected`, ...) is carried.
+async fn send_json<T: serde::de::DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    what: &str,
+) -> Result<T> {
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("{what} request"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("{what} returned {status}: {body}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("decoding {what} response"))
+}
+
 /// Run the full join + provision flow against `joining_url` for `agent_key`,
-/// signing the challenge nonce with `signer`. Returns `role_name`'s membrane
-/// proof + modifiers for the install, erroring if the response's `roles` map
-/// carries no entry for it.
+/// signing the challenge nonce with `signer`. `network` is the release's
+/// registered `happ_id` (`publish-joining-modifiers.sh`), sent on `POST /join`
+/// so the join lands on the release's own network rather than the joining
+/// service's static default. Returns `role_name`'s membrane proof + modifiers
+/// for the install, erroring if the response's `roles` map carries no entry
+/// for it.
 pub async fn join_and_provision(
     client: &reqwest::Client,
     joining_url: &str,
     agent_key: &AgentPubKey,
     signer: &dyn NonceSigner,
     role_name: &str,
+    network: &str,
 ) -> Result<Provision> {
     let base = joining_url.trim_end_matches('/');
     let agent_b64 = AgentPubKeyB64::from(agent_key.clone()).to_string();
 
     // Step 1: POST /join.
-    let join: JoinResponse = client
-        .post(format!("{base}/join"))
-        .json(&serde_json::json!({ "agent_key": agent_b64 }))
-        .send()
-        .await
-        .context("POST /join")?
-        .error_for_status()
-        .context("POST /join returned an error status")?
-        .json()
-        .await
-        .context("decoding /join response")?;
+    let join: JoinResponse = send_json(
+        client
+            .post(format!("{base}/join"))
+            .json(&serde_json::json!({ "agent_key": agent_b64, "network": network })),
+        "POST /join",
+    )
+    .await?;
 
-    let session = match join.status.as_str() {
-        // Already cleared (e.g. an allow-list with no challenge) → provision.
-        "ready" => join.session.clone(),
-        "pending" => {
-            let challenge = join
-                .challenges
-                .iter()
-                .find(|c| c.challenge_type == "agent_allow_list")
-                .context("no agent_allow_list challenge in /join response")?;
-            let nonce = challenge
-                .metadata
-                .as_ref()
-                .and_then(|m| m.nonce.as_deref())
-                .context("agent_allow_list challenge missing nonce")?;
-            let signature = signer.sign_nonce(nonce)?;
+    let session =
+        match join.status.as_str() {
+            // Already cleared (e.g. an allow-list with no challenge) → provision.
+            "ready" => join.session.clone(),
+            "pending" => {
+                let challenge = join
+                    .challenges
+                    .iter()
+                    .find(|c| c.challenge_type == "agent_allow_list")
+                    .context("no agent_allow_list challenge in /join response")?;
+                let nonce = challenge
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.nonce.as_deref())
+                    .context("agent_allow_list challenge missing nonce")?;
+                let signature = signer.sign_nonce(nonce)?;
 
-            // Step 3: POST /join/:session/verify.
-            let verify: VerifyResponse = client
-                .post(format!("{base}/join/{}/verify", join.session))
-                .json(&serde_json::json!({
-                    "challenge_id": challenge.id,
-                    "response": signature,
-                }))
-                .send()
-                .await
-                .context("POST /join/:session/verify")?
-                .error_for_status()
-                .context("verify returned an error status")?
-                .json()
-                .await
-                .context("decoding verify response")?;
-            if verify.status != "ready" {
-                bail!("join verify status {} (expected ready)", verify.status);
+                // Step 3: POST /join/:session/verify.
+                let verify: VerifyResponse = send_json(
+                client.post(format!("{base}/join/{}/verify", join.session)).json(
+                    &serde_json::json!({ "challenge_id": challenge.id, "response": signature }),
+                ),
+                "POST /join/:session/verify",
+            )
+            .await?;
+                if verify.status != "ready" {
+                    bail!("join verify status {} (expected ready)", verify.status);
+                }
+                join.session.clone()
             }
-            join.session.clone()
-        }
-        other => {
-            let detail = join
-                .reason
-                .map(|r| format!(" (reason: {r})"))
-                .unwrap_or_default();
-            bail!("unexpected join status {other}{detail}");
-        }
-    };
+            other => {
+                let detail = join
+                    .reason
+                    .map(|r| format!(" (reason: {r})"))
+                    .unwrap_or_default();
+                bail!("unexpected join status {other}{detail}");
+            }
+        };
 
     // Step 4: GET /join/:session/provision.
-    let provision: ProvisionResponse = client
-        .get(format!("{base}/join/{session}/provision"))
-        .send()
-        .await
-        .context("GET /join/:session/provision")?
-        .error_for_status()
-        .context("provision returned an error status")?
-        .json()
-        .await
-        .context("decoding provision response")?;
+    let provision: ProvisionResponse = send_json(
+        client.get(format!("{base}/join/{session}/provision")),
+        "GET /join/:session/provision",
+    )
+    .await?;
 
     provision_for_role(provision, role_name)
 }
@@ -282,9 +295,159 @@ pub fn http_client() -> Result<reqwest::Client> {
 mod tests {
     use super::*;
     use holochain_types::prelude::SerializedBytes;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn decode(body: &str) -> ProvisionResponse {
         serde_json::from_str(body).expect("decode provision")
+    }
+
+    struct NeverCalledSigner;
+    impl NonceSigner for NeverCalledSigner {
+        fn sign_nonce(&self, _nonce_b64: &str) -> Result<String> {
+            unreachable!("an already-ready join issues no challenge to sign")
+        }
+    }
+
+    /// Reads one HTTP/1.1 request off `socket` and returns its body, using
+    /// Content-Length to know how far past the header terminator to read.
+    async fn read_request_body(socket: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(
+                n, 0,
+                "peer closed mid-request (before headers/body completed)"
+            );
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                while buf.len() < body_start + content_length {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(
+                        n, 0,
+                        "peer closed mid-body (shorter than its own Content-Length)"
+                    );
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                return String::from_utf8_lossy(&buf[body_start..body_start + content_length])
+                    .to_string();
+            }
+        }
+    }
+
+    async fn write_response(socket: &mut TcpStream, status_line: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+    }
+
+    async fn write_json_response(socket: &mut TcpStream, body: &str) {
+        write_response(socket, "200 OK", body).await;
+    }
+
+    /// The wire-level proof for this change: `join_and_provision` must send the
+    /// release's registered network on `POST /join` alongside the agent key —
+    /// omitting it is exactly what makes the joining service silently resolve
+    /// its static default network instead of the release's own.
+    #[tokio::test]
+    async fn join_and_provision_sends_the_configured_network_on_join() {
+        let captured = Arc::new(Mutex::new(None));
+        let captured_writer = captured.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // POST /join — capture the body, answer already-ready (no challenge).
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = read_request_body(&mut socket).await;
+            *captured_writer.lock().unwrap() = Some(body);
+            write_json_response(&mut socket, r#"{"session":"s1","status":"ready"}"#).await;
+
+            // GET /join/s1/provision.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_json_response(
+                &mut socket,
+                r#"{"roles":{"alliance":{"membrane_proof":"cHJvb2Y="}}}"#,
+            )
+            .await;
+        });
+
+        let client = http_client().unwrap();
+        let agent_key = AgentPubKey::from_raw_36(vec![9; 36]);
+        let base = format!("http://{addr}");
+        let provision = join_and_provision(
+            &client,
+            &base,
+            &agent_key,
+            &NeverCalledSigner,
+            "alliance",
+            "v0.99.0",
+        )
+        .await
+        .expect("join_and_provision succeeds against the fixture");
+
+        assert_eq!(provision.membrane_proof.as_deref(), Some("cHJvb2Y="));
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the join request body was captured");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("join body is JSON");
+        assert_eq!(json["network"], "v0.99.0");
+        assert_eq!(
+            json["agent_key"],
+            AgentPubKeyB64::from(agent_key).to_string()
+        );
+    }
+
+    /// A rejected join (e.g. an unregistered `network`) must surface the
+    /// joining service's own reason in the error, not just the bare status
+    /// code — `error_for_status()` alone would discard the body carrying it.
+    #[tokio::test]
+    async fn join_and_provision_surfaces_the_error_bodys_reason() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_response(
+                &mut socket,
+                "400 Bad Request",
+                r#"{"error":{"code":"unknown_network","message":"network not registered"}}"#,
+            )
+            .await;
+        });
+
+        let client = http_client().unwrap();
+        let agent_key = AgentPubKey::from_raw_36(vec![9; 36]);
+        let base = format!("http://{addr}");
+        let err = join_and_provision(
+            &client,
+            &base,
+            &agent_key,
+            &NeverCalledSigner,
+            "alliance",
+            "v0.2.0",
+        )
+        .await
+        .expect_err("a 400 from /join must fail the call");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown_network"), "{msg}");
+        assert!(msg.contains("network not registered"), "{msg}");
     }
 
     /// The decisive regression test: a payload shaped exactly like the real

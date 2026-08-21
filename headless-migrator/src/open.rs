@@ -558,6 +558,7 @@ async fn install(
         &params.agent_key,
         signer,
         &cfg.role_name,
+        &open_cfg.network,
     )
     .await
     {

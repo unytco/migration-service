@@ -2,9 +2,9 @@
 //! `Config::from_env`). The `automation/` installer renders these into the
 //! systemd `EnvironmentFile`; every field has a sensible default except the
 //! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and — for the
-//! open service — `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL`,
-//! validated by the open command itself, not here, so close/status need no
-//! open-only vars).
+//! open service — `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
+//! `MIGRATION_AGENT_NETWORK`, validated by the open command itself, not here,
+//! so close/status need no open-only vars).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -56,6 +56,13 @@ pub struct OpenConfig {
     /// Network seed for the new DNA's app install. The joining service may also
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
+    /// The `happ_id` the release registered on the joining service
+    /// (`publish-joining-modifiers.sh`, `POST /v1/admin/networks`), sent as
+    /// `network` on `POST /v1/join`. Required, unlike `network_seed`: the
+    /// joining service has no fallback source for it, and a missing value
+    /// would silently resolve to the service's static default network instead
+    /// of the release's own.
+    pub network: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
     /// gossiped in, or before its effective date) for longer than this, the open
@@ -158,6 +165,8 @@ impl OpenConfig {
             joining_url: var("MIGRATION_AGENT_JOINING_URL")
                 .context("MIGRATION_AGENT_JOINING_URL is required for the open service")?,
             network_seed: var("MIGRATION_AGENT_NETWORK_SEED"),
+            network: var("MIGRATION_AGENT_NETWORK")
+                .context("MIGRATION_AGENT_NETWORK is required for the open service")?,
             gd_wait_timeout: Duration::from_secs(gd_wait_secs),
         })
     }
@@ -165,7 +174,32 @@ impl OpenConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_backoff_bounds;
+    use super::{validate_backoff_bounds, OpenConfig};
+
+    /// `MIGRATION_AGENT_NETWORK` unset, empty, then set — one test, sequential env
+    /// mutation, so parallel `cargo test` threads can't race each other over the
+    /// same process-global env vars (no other test in this binary touches these
+    /// three names).
+    #[test]
+    fn open_config_from_env_requires_network() {
+        std::env::set_var("MIGRATION_AGENT_HAPP_PATH", "/tmp/unyt.happ");
+        std::env::set_var("MIGRATION_AGENT_JOINING_URL", "https://joining.example/v1");
+
+        std::env::remove_var("MIGRATION_AGENT_NETWORK");
+        let err = OpenConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("MIGRATION_AGENT_NETWORK"), "{err}");
+
+        std::env::set_var("MIGRATION_AGENT_NETWORK", "");
+        let err = OpenConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("MIGRATION_AGENT_NETWORK"), "{err}");
+
+        std::env::set_var("MIGRATION_AGENT_NETWORK", "v0.99.0");
+        assert_eq!(OpenConfig::from_env().unwrap().network, "v0.99.0");
+
+        std::env::remove_var("MIGRATION_AGENT_HAPP_PATH");
+        std::env::remove_var("MIGRATION_AGENT_JOINING_URL");
+        std::env::remove_var("MIGRATION_AGENT_NETWORK");
+    }
 
     #[test]
     fn valid_backoff_bounds_pass() {
