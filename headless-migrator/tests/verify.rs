@@ -16,8 +16,8 @@ use headless_migrator::verify::{
     build_verify_state, verify_against_ledger, verify_agreement_state,
 };
 use rave_engine::types::ledger::CarryForwardUnits;
+use rave_engine::types::units::UnitMap;
 use support::*;
-use zfuel::fuel::ZFuel;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -156,7 +156,7 @@ fn ledger_halves_match_when_the_new_chain_mirrors_the_close() {
     // (see `agreement_state_cross_check`), so here we check the two ledger
     // fields directly.
     let closing = summary_state(unit_map(0, 100), CarryForwardUnits::new(), 2);
-    let ledger = ledger(unit_map(0, 100), CarryForwardUnits::new(), ZFuel::zero());
+    let ledger = ledger(unit_map(0, 100), CarryForwardUnits::new(), UnitMap::new());
     let report = verify_against_ledger(&closing, &ledger);
     assert!(report.balance_match, "balance: {:?}", report.mismatches);
     assert!(
@@ -170,7 +170,7 @@ fn ledger_halves_match_when_the_new_chain_mirrors_the_close() {
 #[test]
 fn balance_mismatch_is_reported() {
     let closing = summary_state(unit_map(0, 100), CarryForwardUnits::new(), 0);
-    let ledger = ledger(unit_map(0, 999), CarryForwardUnits::new(), ZFuel::zero());
+    let ledger = ledger(unit_map(0, 999), CarryForwardUnits::new(), UnitMap::new());
     let report = verify_against_ledger(&closing, &ledger);
     assert!(!report.passed());
     assert!(!report.balance_match);
@@ -184,7 +184,7 @@ fn carry_forward_units_mismatch_is_reported() {
     let closing_cfu = CarryForwardUnits::from(vec![(0u32, vec!["5"])]);
     let closing = summary_state(unit_map(0, 10), closing_cfu, 0);
     // Ledger has a DIFFERENT (empty) CFU.
-    let ledger = ledger(unit_map(0, 10), CarryForwardUnits::new(), ZFuel::zero());
+    let ledger = ledger(unit_map(0, 10), CarryForwardUnits::new(), UnitMap::new());
     let report = verify_against_ledger(&closing, &ledger);
     assert!(!report.passed());
     assert!(report.balance_match);
@@ -204,7 +204,7 @@ fn ledger_half_alone_does_not_pass_without_the_agreement_cross_check() {
     // `fetch_and_compare` (which reads the extern) can raise it. Regression
     // guard against reverting to the balance+CFU-only pass.
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 3);
-    let ledger = ledger(unit_map(0, 10), CarryForwardUnits::new(), ZFuel::zero());
+    let ledger = ledger(unit_map(0, 10), CarryForwardUnits::new(), UnitMap::new());
     let report = verify_against_ledger(&closing, &ledger);
     assert!(report.balance_match && report.carry_forward_units_match);
     assert!(
@@ -218,7 +218,7 @@ fn multiple_mismatches_all_reported() {
     // Both independent on-chain-recomputed fields differ → two report lines.
     let closing_cfu = CarryForwardUnits::from(vec![(0u32, vec!["5"])]);
     let closing = summary_state(unit_map(0, 100), closing_cfu, 3);
-    let ledger = ledger(unit_map(0, 1), CarryForwardUnits::new(), ZFuel::zero());
+    let ledger = ledger(unit_map(0, 1), CarryForwardUnits::new(), UnitMap::new());
     let report = verify_against_ledger(&closing, &ledger);
     assert!(!report.passed());
     assert!(!report.balance_match);

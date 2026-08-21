@@ -28,6 +28,9 @@ pub use crate::dna_errors::{
     classify_migration_init_error, is_agent_key_not_in_keystore, is_successor_gd_not_in_effect,
     InitErrorClass,
 };
+use crate::dna_errors::{
+    is_global_definition_out_of_window, is_response_decode_failure, schema_mismatch_message,
+};
 use crate::fetch::{self, FetchOutcome};
 use crate::joining::{self, LairSigner, NonceSigner};
 use crate::probe::{probe_open_state, OpenState};
@@ -106,13 +109,13 @@ fn gd_wait_expired(started_us: i64, now_us: i64, timeout: Duration) -> bool {
     Duration::from_micros(now_us.saturating_sub(started_us).max(0) as u64) >= timeout
 }
 
-/// Which precondition a bounded [`OpenOutcome::TooEarly`] is waiting on. Both
+/// Which precondition a bounded [`OpenOutcome::TooEarly`] is waiting on. They
 /// share ONE retry path and ONE deadline, but they are different faults in
-/// different subsystems — reporting either as the other sends the operator to
-/// the wrong place for the whole window. Derived from the cause once, at the
-/// point the outcome is reported, so every operator-facing surface (the backoff
-/// warn, the per-pass state-file message, the exhaustion message) is consistent
-/// by construction instead of re-sniffing the error string at each site.
+/// different subsystems — reporting one as another sends the operator to the
+/// wrong place for the whole window. Derived from the cause once, at the point
+/// the outcome is reported, so every operator-facing surface (the backoff warn,
+/// the per-pass state-file message, the exhaustion message) is consistent by
+/// construction instead of re-sniffing the error string at each site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingPrecondition {
     /// The successor `GlobalDefinition` `init` needs hasn't gossiped in / isn't
@@ -121,22 +124,28 @@ enum PendingPrecondition {
     /// Holochain 0.7+ refuses an install whose `agent_key` the local lair
     /// doesn't hold — the carried key isn't visible (yet).
     CarriedKey,
+    /// The GD resolved, but the action's timestamp falls outside its validity
+    /// window. Distinct from `SuccessorGd`: nothing is missing, the dates are
+    /// wrong, and half of this cause (an expired window) never clears.
+    GdWindow,
     /// Bounded, but not one of the causes above. Kept as an explicit variant so
-    /// a future third bounded cause reports the RAW error instead of silently
-    /// inheriting one of these diagnoses — the same misattribution the
-    /// `CarriedKey` split exists to prevent, and the same "fail loud instead of
-    /// hanging" doctrine as `dna_errors`' deliberate allowlists.
+    /// a future bounded cause reports the RAW error instead of silently
+    /// inheriting one of these diagnoses.
     Unrecognized,
 }
 
 impl PendingPrecondition {
-    /// Both known causes are matched POSITIVELY — neither is the other's
-    /// fallback — so an unrecognized bounded cause lands on `Unrecognized`
-    /// rather than being reported as whichever happened to be the default.
+    /// Every known cause is matched POSITIVELY — none is another's fallback — so
+    /// an unrecognized bounded cause lands on `Unrecognized` rather than on
+    /// whichever happened to be the default. The tag-aware out-of-window check
+    /// precedes the substring-only successor-GD one, so a chain carrying both
+    /// is not reported as missing gossip.
     fn of(cause: &anyhow::Error) -> Self {
         let rendered = format!("{cause:#}");
         if is_agent_key_not_in_keystore(&rendered) {
             Self::CarriedKey
+        } else if is_global_definition_out_of_window(&rendered) {
+            Self::GdWindow
         } else if is_successor_gd_not_in_effect(&rendered) {
             Self::SuccessorGd
         } else {
@@ -149,6 +158,7 @@ impl PendingPrecondition {
         match self {
             Self::SuccessorGd => "successor GD not yet in effect",
             Self::CarriedKey => "carried agent key not yet visible to the local lair",
+            Self::GdWindow => "successor GD outside its validity window",
             Self::Unrecognized => "an install precondition is unmet (see the error)",
         }
     }
@@ -179,6 +189,12 @@ fn gd_wait_exhausted_message(
             "v2 GD never gossiped to the target within {}s — check the successor DNA hash / \
              registry and the target's Holochain+network config (from={from} to={to}). \
              Last init error: {cause:#}",
+            timeout.as_secs()
+        ),
+        PendingPrecondition::GdWindow => format!(
+            "the successor GD stayed outside its validity window for {}s: check its effective \
+             and expiry dates against this deploy's timing (from={from} to={to}). An expired \
+             window never opens. Last init error: {cause:#}",
             timeout.as_secs()
         ),
         // No subsystem is named: guessing one would send the operator to the
@@ -274,13 +290,12 @@ pub async fn run_with(
                 bail!("open hard-stopped: {why}");
             }
             OpenOutcome::TooEarly(e) => {
-                // Bounded retry: a precondition the open needs (the successor GD,
-                // or the carried key being visible to lair) isn't satisfied yet.
-                // Re-drive after a backoff, but give up once it has stayed
-                // unresolved past the deadline (it may never come). The deadline is
-                // measured from the FIRST too-early and PERSISTED to the state file,
-                // so a supervised `Restart=on-failure` resumes the SAME budget
-                // rather than starting a fresh 30 minutes each restart.
+                // Bounded retry: a precondition the open needs isn't satisfied
+                // yet. Re-drive after a backoff, but give up once it has stayed
+                // unresolved past the deadline (it may never come). The deadline
+                // is measured from the FIRST too-early and PERSISTED to the state
+                // file, so a supervised `Restart=on-failure` resumes the SAME
+                // budget rather than starting a fresh 30 minutes each restart.
                 let now = crate::state_file::now_us();
                 let started = *state.gd_wait_started_us.get_or_insert(now);
                 if gd_wait_expired(started, now, open_cfg.gd_wait_timeout) {
@@ -681,11 +696,10 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
         InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
             "unexpected non-fresh chain surfaced at install: {rendered}"
         )),
-        // Bounded: either the successor GD isn't in effect yet, or (Holochain
-        // 0.7+) the carried key isn't visible to lair yet. WHICH one is derived
-        // from the cause by `PendingPrecondition`, which owns every
-        // operator-facing message — so this context stays neutral about the
-        // cause and records only where it surfaced.
+        // Bounded. WHICH precondition is derived from the cause by
+        // `PendingPrecondition`, which owns every operator-facing message — so
+        // this context stays neutral about the cause and records only where it
+        // surfaced.
         InitErrorClass::TooEarly => {
             OpenOutcome::TooEarly(e.context("bounded precondition unmet (surfaced at install)"))
         }
@@ -699,11 +713,11 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
 /// role's `init_properties`, the FIRST zome call (`verify_if_migrated`) makes the
 /// DNA's `init` read it and commit the `OpeningStateSummary` + `open_chain` — so
 /// this both opens the chain and reports whether it opened. On `true` → verify.
-/// A too-early `init` (the successor GD not yet in effect) surfaces as the
-/// `Transient` fallthrough — the supervised loop re-drives it once the GD syncs.
-/// A terminal validator verdict (key mismatch, signatures below threshold,
-/// malformed carry-forward) is a [`OpenOutcome::HardStop`] — never an infinite
-/// retry.
+/// A bounded precondition surfaces as [`OpenOutcome::TooEarly`] under the
+/// persisted deadline; only an unrecognized failure falls through to
+/// `Transient`. A terminal validator verdict (key mismatch, signatures below
+/// threshold, malformed carry-forward) is a [`OpenOutcome::HardStop`] — never an
+/// infinite retry.
 async fn drive_open_and_verify(
     cfg: &Config,
     conductor: &dyn Conductor,
@@ -745,15 +759,26 @@ async fn drive_open_and_verify(
                 InitErrorClass::NonFreshChain => OpenOutcome::HardStop(format!(
                     "unexpected non-fresh chain at init (no call should precede it): {rendered}"
                 )),
-                // The successor GD is not yet in effect — re-drive `init` once it
-                // syncs, but bounded by the run loop's deadline.
-                InitErrorClass::TooEarly => {
-                    OpenOutcome::TooEarly(e.context("successor GD not yet in effect"))
-                }
+                // A precondition that may still arrive: re-drive `init`, bounded
+                // by the run loop's deadline. Which one is named by
+                // `PendingPrecondition`, so no diagnosis is asserted here.
+                InitErrorClass::TooEarly => OpenOutcome::TooEarly(e),
                 // Any other blip: back off and re-probe.
                 InitErrorClass::Transient => OpenOutcome::Transient(e.context("driving init")),
             }
         }
+    }
+}
+
+/// Classify a failed read of a `rave_engine`-typed zome response: a HARD stop on
+/// a schema mismatch, which the unbounded transient retry can never resolve, and
+/// the usual blip otherwise.
+fn zome_read_outcome(e: anyhow::Error, ctx: &'static str) -> OpenOutcome {
+    let rendered = format!("{e:#}");
+    if is_response_decode_failure(&rendered) {
+        OpenOutcome::HardStop(schema_mismatch_message(ctx, &rendered))
+    } else {
+        OpenOutcome::Transient(e.context(ctx))
     }
 }
 
@@ -776,14 +801,12 @@ async fn verify_after_open_with(
     });
     let ledger = match conductor.get_ledger().await {
         Ok(l) => l,
-        Err(e) => return OpenOutcome::Transient(e.context("reading new-chain ledger for verify")),
+        Err(e) => return zome_read_outcome(e, "reading new-chain ledger for verify"),
     };
     let opened = match conductor.get_opened_agreement_state().await {
         Ok(o) => o,
         Err(e) => {
-            return OpenOutcome::Transient(
-                e.context("reading new-chain opened agreement state for verify"),
-            )
+            return zome_read_outcome(e, "reading new-chain opened agreement state for verify")
         }
     };
     let mut report: VerifyReport = verify_against_ledger(&package.payload.closing_state, &ledger);
@@ -868,8 +891,8 @@ pub async fn probe_for_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, OpenOutcome,
-        PendingPrecondition,
+        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, zome_read_outcome,
+        OpenOutcome, PendingPrecondition,
     };
     use crate::state_file::now_us;
     use holo_hash::{DnaHash, DnaHashB64};
@@ -927,6 +950,67 @@ mod tests {
             "must NOT misdiagnose this as a GD/registry fault: {msg}"
         );
         assert!(msg.contains("1800s"), "carries the elapsed budget: {msg}");
+    }
+
+    /// The whole point of the class: a response that did not decode exits
+    /// nonzero, where the unbounded transient retry would spin forever on a
+    /// fault only a rebuilt binary clears. Strings mirrored from
+    /// `ham::call_zome`.
+    #[test]
+    fn an_undecodable_read_hard_stops_and_a_blip_still_retries() {
+        let decode = anyhow::anyhow!(
+            "get_ledger zome call failed: Failed to deserialize response: \
+             invalid type: string \"5\", expected a map"
+        );
+        let OpenOutcome::HardStop(why) = zome_read_outcome(decode, "reading ledger") else {
+            panic!("a schema mismatch must hard-stop the open service");
+        };
+        assert!(
+            why.contains("Rebuild the migrator"),
+            "the hard stop names the only remedy: {why}"
+        );
+        let blip = anyhow::anyhow!("Failed to call zome: Websocket error: Websocket closed");
+        assert!(matches!(
+            zome_read_outcome(blip, "reading ledger"),
+            OpenOutcome::Transient(_)
+        ));
+    }
+
+    /// An out-of-window GD must NOT land on `Unrecognized`, whose report tells
+    /// the operator the migrator does not know the cause, for the whole budget,
+    /// on the surface `automation` cats out. Mirrored from the alliance open
+    /// validator both tagged and untagged: both reach the bounded class.
+    #[test]
+    fn an_out_of_window_gd_is_named_not_reported_as_unrecognized() {
+        let untagged = "the referenced GlobalDefinition is outside its validity window \
+                        — not yet effective or expired — so the open is refused";
+        for rendered in [
+            format!("[MIGERR:MIG_GD_OUT_OF_WINDOW] {untagged}"),
+            untagged.into(),
+        ] {
+            let cause = anyhow::anyhow!(rendered);
+            assert_eq!(
+                PendingPrecondition::of(&cause),
+                PendingPrecondition::GdWindow
+            );
+            assert!(PendingPrecondition::of(&cause)
+                .waiting_label()
+                .contains("validity window"));
+            let msg = gd_wait_exhausted_message(
+                &DnaHashB64::from(DnaHash::from_raw_36(vec![1; 36])),
+                &DnaHashB64::from(DnaHash::from_raw_36(vec![2; 36])),
+                Duration::from_secs(1800),
+                &cause,
+            );
+            assert!(
+                msg.contains("effective and expiry dates"),
+                "points at the window, not at gossip: {msg}"
+            );
+            assert!(
+                !msg.contains("not one the migrator recognizes"),
+                "a cause the migrator DOES classify must not report as unrecognized: {msg}"
+            );
+        }
     }
 
     /// The backoff warn and the per-pass state-file message both label the wait
