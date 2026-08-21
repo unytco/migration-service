@@ -6,8 +6,10 @@
 //! `MigrationError::from_rendered` recovers the variant from a
 //! conductor-wrapped string. Every classifier below matches **the code, not
 //! the English text**, so a validator message reword can never silently
-//! reclassify. The substring tables remain only as the fallback for the
-//! surfaces that carry no tag:
+//! reclassify. The substring tables remain as the fallback for the surfaces
+//! that carry no tag, and for a tagged surface whose CODE this binary's
+//! `rave_engine` does not know — `from_rendered` returns `None`, so a DNA newer
+//! than the pin lands here too. The untagged surfaces:
 //!
 //!   * the coordinator's untagged too-early wrapper ("Could not resolve a
 //!     successor GlobalDefinition at init") + the GD lookup's "No Global
@@ -44,9 +46,11 @@ fn init_class_of(code: MigrationError) -> InitErrorClass {
         | NotaryThresholdNotMet => InitErrorClass::HardFailure,
         AlreadyMigrated => InitErrorClass::AlreadyMigrated,
         NonFreshChain => InitErrorClass::NonFreshChain,
-        // Deliberately NOT the HardFailure `rave_engine`'s own doc calls for:
-        // the window check reads the ACTION's timestamp, so a re-driven `init`
-        // carries a fresh one and a not-yet-effective window clears.
+        // Deliberately NOT the HardFailure `rave_engine`'s own doc calls for: a
+        // re-driven `init` carries a fresh action timestamp, so a not-yet-
+        // effective window clears. An expired one never does, and the
+        // coordinator selects a GD on `effective_start_date` alone, so it does
+        // reach here: the BOUNDED deadline is what stops it retrying forever.
         GlobalDefinitionOutOfWindow => InitErrorClass::TooEarly,
         ClosingSummaryUpdateForbidden
         | CloseAuthorMismatch
@@ -75,10 +79,10 @@ pub enum InitErrorClass {
     /// the new GD's opening threshold (or don't verify, or aren't from listed
     /// notaries), or the carry-forward section is malformed. Fail loudly.
     HardFailure,
-    /// The successor `GlobalDefinition` `init` needs to open the chain is not yet
-    /// in effect (not gossiped in, or before its effective date). Recoverable —
-    /// the open service re-drives `init` once the GD syncs — but under a BOUNDED
-    /// deadline, since the classifier can't tell "not yet" from "never".
+    /// A precondition the install is still waiting on: the successor
+    /// `GlobalDefinition` (not gossiped in, or outside its validity window), or
+    /// the carried agent key. Recoverable, but under a BOUNDED deadline, since
+    /// the classifier can't tell "not yet" from "never".
     TooEarly,
     /// Anything else (a websocket blip, a transient host error) — back off and
     /// re-probe.
@@ -105,7 +109,10 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
         InitErrorClass::AlreadyMigrated
     } else if is_non_fresh_chain(&r) {
         InitErrorClass::NonFreshChain
-    } else if is_successor_gd_not_in_effect_lower(&r) || is_agent_key_not_in_keystore(rendered) {
+    } else if is_successor_gd_not_in_effect_lower(&r)
+        || is_global_definition_out_of_window_lower(&r)
+        || is_agent_key_not_in_keystore(rendered)
+    {
         InitErrorClass::TooEarly
     } else {
         InitErrorClass::Transient
@@ -163,9 +170,7 @@ pub fn is_successor_gd_not_in_effect(rendered: &str) -> bool {
 }
 
 fn is_successor_gd_not_in_effect_lower(r_lower: &str) -> bool {
-    // Anchored to the two distinctive phrases (verified in the alliance DNA:
-    // `migration/open.rs` wrapper + `progenitor_calls/global_definition.rs` lookup)
-    // — NOT the bare `"successor globaldefinition"` token, which would also swallow
+    // NOT the bare `"successor globaldefinition"` token, which would also swallow
     // a *malformed* / mis-configured successor GD (a hard failure) into the bounded
     // TooEarly retry until the deadline expires.
     r_lower.contains("could not resolve a successor globaldefinition")
@@ -270,9 +275,11 @@ pub fn is_global_definition_out_of_window(rendered: &str) -> bool {
     if let Some(code) = MigrationError::from_rendered(rendered) {
         return code == MigrationError::GlobalDefinitionOutOfWindow;
     }
-    rendered
-        .to_lowercase()
-        .contains("outside its validity window")
+    is_global_definition_out_of_window_lower(&rendered.to_lowercase())
+}
+
+fn is_global_definition_out_of_window_lower(r_lower: &str) -> bool {
+    r_lower.contains("outside its validity window")
 }
 
 /// The non-closed close states the close-side probe must distinguish from a
@@ -453,12 +460,8 @@ mod tests {
         );
     }
 
-    /// `genesis_self_check`'s membrane-proof verdicts must be TERMINAL. This path
-    /// only became reachable once the install started applying the network's DNA
-    /// properties (the gate is skipped while `joining_server_signer` is None), and
-    /// a rejected proof is unfixable by retrying — classed transient it would spin
-    /// the supervised loop forever with no diagnosis. Strings mirrored verbatim
-    /// from the alliance integrity zome's `mem_proof.rs`.
+    /// A rejected membrane proof is terminal: classed transient it would spin the
+    /// supervised loop forever with no diagnosis. Strings from `mem_proof.rs`.
     #[test]
     fn rejected_membrane_proofs_are_hard_failures_not_infinite_retries() {
         for verdict in [
@@ -528,10 +531,14 @@ mod tests {
             InitErrorClass::TooEarly
         );
         assert!(is_global_definition_out_of_window(tagged));
-        // Untagged, from the validator's own wording.
-        assert!(is_global_definition_out_of_window(
-            "the referenced GlobalDefinition is outside its validity window"
-        ));
+        // Untagged: the substring fallback must reach the same bounded class.
+        let untagged = "the referenced GlobalDefinition is outside its validity window \
+                        — not yet effective or expired — so the open is refused";
+        assert_eq!(
+            classify_migration_init_error(untagged),
+            InitErrorClass::TooEarly
+        );
+        assert!(is_global_definition_out_of_window(untagged));
         // The other bounded cause must not answer to this predicate.
         assert!(!is_global_definition_out_of_window(
             "wasm error: No Global Definition found"
