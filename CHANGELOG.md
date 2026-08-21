@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Tag-driven release workflow.** Pushing a semver tag builds both Rust binaries and publishes them — each with a `.sha256` — as fixed-name GitHub release assets. The tag must match the version in both crates' `Cargo.toml`; they release together, so one tag is one tested pairing of the close-side and open-side halves of a migration.
+- `--version` on `headless-migrator` and `migration-notary`, derived from the crate version. The release assets have fixed filenames, so this is how a deployed binary identifies itself.
 - **router: per-entry `published` visibility gate — customers-last migration surfacing.** Registry `DnaEntry` gains an optional `published` boolean (absent = unpublished): honored by `/v1/update-check`, ignored by `/v1/migrate` + `/v1/migration-options`. Additive + backward-compatible.
 - **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry point stays strict https-only.
 - **router: `latest_build.assets` — the release's downloadable installers, for the in-app updater (release-patterns task 07).** `/v1/update-check`'s `latest_build` carries each asset's `name` + `url` + optional `digest`; the router stays platform-agnostic. Additive + backward-compatible.
@@ -23,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
+- `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
+- **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.
 - **Upgrade to Holochain 0.7 + `rave_engine` 0.9.0** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`, `zfuel 0.9.0`, `ham` on branch `main`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
