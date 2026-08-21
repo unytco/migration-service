@@ -25,7 +25,6 @@ use rave_engine::types::entries::migration::v0_1::{
 use rave_engine::types::ledger::CarryForwardUnits;
 use rave_engine::types::ledger::Ledger;
 use rave_engine::types::units::UnitMap;
-use zfuel::fuel::ZFuel;
 
 /// Every interaction the mock records, so a test can assert ordering (e.g.
 /// `drop_off_fees` precedes `prepare_closing_summary`).
@@ -56,7 +55,9 @@ pub struct MockConductor {
     /// reports not-migrated — the safe default for mismatch-path tests).
     pub opened_agreement_state: Mutex<Option<headless_migrator::conductor::OpenedAgreementState>>,
     pub calls: Mutex<Vec<Call>>,
-    pub ledger: Mutex<Option<Ledger>>,
+    /// Persistent (never consumed), so a scripted `Err` is a read that fails on
+    /// every pass, the shape a schema mismatch actually has.
+    pub ledger: Mutex<Option<anyhow::Result<Ledger>>>,
     pub drop_fees: Mutex<Option<anyhow::Result<String>>>,
     pub prepare: Mutex<Option<anyhow::Result<PrepareCloseResponse>>>,
     pub sign_responses: Mutex<VecDeque<anyhow::Result<SignClosingResponse>>>,
@@ -99,11 +100,11 @@ impl Conductor for MockConductor {
 
     async fn get_ledger(&self) -> anyhow::Result<Ledger> {
         self.record(Call::GetLedger);
-        self.ledger
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("mock: no ledger scripted"))
+        match self.ledger.lock().unwrap().as_ref() {
+            Some(Ok(l)) => Ok(l.clone()),
+            Some(Err(e)) => Err(anyhow::anyhow!("{e:#}")),
+            None => Err(anyhow::anyhow!("mock: no ledger scripted")),
+        }
     }
 
     async fn drop_off_fees(&self) -> anyhow::Result<String> {
@@ -237,8 +238,8 @@ pub fn dna_b64(seed: u8) -> holo_hash::DnaHashB64 {
     holo_hash::DnaHashB64::from(dna(seed))
 }
 
-/// A ledger with the given balance/CFU and zero fees.
-pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: ZFuel) -> Ledger {
+/// A ledger with the given balance/CFU and per-unit fees owed.
+pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: UnitMap) -> Ledger {
     Ledger {
         balance,
         carry_forward_units: cfu,

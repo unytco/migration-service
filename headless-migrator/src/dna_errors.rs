@@ -6,14 +6,17 @@
 //! `MigrationError::from_rendered` recovers the variant from a
 //! conductor-wrapped string. Every classifier below matches **the code, not
 //! the English text**, so a validator message reword can never silently
-//! reclassify. The substring tables remain only as the fallback for the
-//! surfaces that carry no tag:
+//! reclassify. The substring tables remain as the fallback for the surfaces
+//! that carry no tag, and for a tagged surface whose CODE this binary's
+//! `rave_engine` does not know — `from_rendered` returns `None`, so a DNA newer
+//! than the pin lands here too. The untagged surfaces:
 //!
 //!   * the coordinator's untagged too-early wrapper ("Could not resolve a
 //!     successor GlobalDefinition at init") + the GD lookup's "No Global
 //!     Definition found" (`.../progenitor_calls/global_definition.rs`),
 //!   * the conductor's own install preconditions (Holochain 0.7's
 //!     `AgentKeyNotInKeystore`), which are not validator verdicts at all,
+//!   * `ham`'s response-decode failure ([`is_response_decode_failure`]),
 //!   * transport / conductor errors that never came from a validator, and
 //!   * the router's wire error codes (`migration-service/migration-router`) — a separate
 //!     string namespace that shares this home, unchanged.
@@ -43,6 +46,12 @@ fn init_class_of(code: MigrationError) -> InitErrorClass {
         | NotaryThresholdNotMet => InitErrorClass::HardFailure,
         AlreadyMigrated => InitErrorClass::AlreadyMigrated,
         NonFreshChain => InitErrorClass::NonFreshChain,
+        // Deliberately NOT the HardFailure `rave_engine`'s own doc calls for: a
+        // re-driven `init` carries a fresh action timestamp, so a not-yet-
+        // effective window clears. An expired one never does, and the
+        // coordinator selects a GD on `effective_start_date` alone, so it does
+        // reach here: the BOUNDED deadline is what stops it retrying forever.
+        GlobalDefinitionOutOfWindow => InitErrorClass::TooEarly,
         ClosingSummaryUpdateForbidden
         | CloseAuthorMismatch
         | CloseSourceDnaMismatch
@@ -70,10 +79,10 @@ pub enum InitErrorClass {
     /// the new GD's opening threshold (or don't verify, or aren't from listed
     /// notaries), or the carry-forward section is malformed. Fail loudly.
     HardFailure,
-    /// The successor `GlobalDefinition` `init` needs to open the chain is not yet
-    /// in effect (not gossiped in, or before its effective date). Recoverable —
-    /// the open service re-drives `init` once the GD syncs — but under a BOUNDED
-    /// deadline, since the classifier can't tell "not yet" from "never".
+    /// A precondition the install is still waiting on: the successor
+    /// `GlobalDefinition` (not gossiped in, or outside its validity window), or
+    /// the carried agent key. Recoverable, but under a BOUNDED deadline, since
+    /// the classifier can't tell "not yet" from "never".
     TooEarly,
     /// Anything else (a websocket blip, a transient host error) — back off and
     /// re-probe.
@@ -100,7 +109,10 @@ pub fn classify_migration_init_error(rendered: &str) -> InitErrorClass {
         InitErrorClass::AlreadyMigrated
     } else if is_non_fresh_chain(&r) {
         InitErrorClass::NonFreshChain
-    } else if is_successor_gd_not_in_effect_lower(&r) || is_agent_key_not_in_keystore(rendered) {
+    } else if is_successor_gd_not_in_effect_lower(&r)
+        || is_global_definition_out_of_window_lower(&r)
+        || is_agent_key_not_in_keystore(rendered)
+    {
         InitErrorClass::TooEarly
     } else {
         InitErrorClass::Transient
@@ -158,9 +170,7 @@ pub fn is_successor_gd_not_in_effect(rendered: &str) -> bool {
 }
 
 fn is_successor_gd_not_in_effect_lower(r_lower: &str) -> bool {
-    // Anchored to the two distinctive phrases (verified in the alliance DNA:
-    // `migration/open.rs` wrapper + `progenitor_calls/global_definition.rs` lookup)
-    // — NOT the bare `"successor globaldefinition"` token, which would also swallow
+    // NOT the bare `"successor globaldefinition"` token, which would also swallow
     // a *malformed* / mis-configured successor GD (a hard failure) into the bounded
     // TooEarly retry until the deadline expires.
     r_lower.contains("could not resolve a successor globaldefinition")
@@ -234,6 +244,42 @@ pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     r.contains("is not in this network's upgrade_targets")
         // close validator: "Close target is not in this DNA's upgrade_targets".
         || r.contains("close target is not in this dna's upgrade_targets")
+}
+
+/// Whether a zome call failed at DECODING the response rather than at making it,
+/// i.e. this binary's `rave_engine` and the deployed DNA's disagree. Anchored to
+/// `ham`'s `call_zome` decode context (`ham/src/client.rs`), which `ham` exposes
+/// no predicate for. Narrow on purpose, since promoting a recoverable failure to
+/// a terminal one costs an operator: the bare `"failed to deserialize"` token is
+/// the alliance DNA's own entry decodes, and `ham` returns on the call error
+/// BEFORE reaching the decode, so a chain carrying both contexts quoted the
+/// phrase in guest text. Lowercases internally.
+pub fn is_response_decode_failure(rendered: &str) -> bool {
+    let r = rendered.to_lowercase();
+    r.contains("failed to deserialize response") && !r.contains("failed to call zome")
+}
+
+/// The operator-facing text for a schema mismatch, carrying the only remedy
+/// there is. Shared, so the diagnosis reads the same wherever it surfaces.
+pub fn schema_mismatch_message(ctx: &str, rendered: &str) -> String {
+    format!(
+        "{ctx}: the response did not decode, so this binary's rave_engine does not match the \
+         deployed DNA's. Rebuild the migrator against the DNA's version. Cause: {rendered}"
+    )
+}
+
+/// Whether an error is the validator's out-of-window `GlobalDefinition` verdict.
+/// Matched positively so it never inherits the successor-GD diagnosis: the GD
+/// resolved fine, its validity window is wrong.
+pub fn is_global_definition_out_of_window(rendered: &str) -> bool {
+    if let Some(code) = MigrationError::from_rendered(rendered) {
+        return code == MigrationError::GlobalDefinitionOutOfWindow;
+    }
+    is_global_definition_out_of_window_lower(&rendered.to_lowercase())
+}
+
+fn is_global_definition_out_of_window_lower(r_lower: &str) -> bool {
+    r_lower.contains("outside its validity window")
 }
 
 /// The non-closed close states the close-side probe must distinguish from a
@@ -414,12 +460,8 @@ mod tests {
         );
     }
 
-    /// `genesis_self_check`'s membrane-proof verdicts must be TERMINAL. This path
-    /// only became reachable once the install started applying the network's DNA
-    /// properties (the gate is skipped while `joining_server_signer` is None), and
-    /// a rejected proof is unfixable by retrying — classed transient it would spin
-    /// the supervised loop forever with no diagnosis. Strings mirrored verbatim
-    /// from the alliance integrity zome's `mem_proof.rs`.
+    /// A rejected membrane proof is terminal: classed transient it would spin the
+    /// supervised loop forever with no diagnosis. Strings from `mem_proof.rs`.
     #[test]
     fn rejected_membrane_proofs_are_hard_failures_not_infinite_retries() {
         for verdict in [
@@ -451,6 +493,56 @@ mod tests {
             ),
             InitErrorClass::TooEarly
         );
+    }
+
+    /// Strings mirrored from `ham::call_zome` and the alliance DNA. The
+    /// negatives are the design: a widened needle hard-stops a migration a
+    /// retry would have completed.
+    #[test]
+    fn only_hams_own_decode_context_is_a_decode_failure() {
+        assert!(is_response_decode_failure(
+            "get_ledger zome call failed: Failed to deserialize response: \
+             invalid type: string \"5\", expected a map"
+        ));
+        // A call that never returned a body.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: Websocket error: Websocket closed: No connection"
+        ));
+        // The DNA's own entry decode, quoted through the call error.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: Guest(\"Failed to deserialize DocDef: Error(...)\")"
+        ));
+        // Guest text quoting the anchor verbatim still arrives under the call
+        // error, so it is not this binary's decode.
+        assert!(!is_response_decode_failure(
+            "Failed to call zome: RibosomeError(\"Failed to deserialize response\")"
+        ));
+    }
+
+    /// A deliberate divergence from the variant's own `rave_engine` doc, which
+    /// calls it terminal. Pinned so the arm cannot drift into the neighbouring
+    /// `HardFailure` chain.
+    #[test]
+    fn an_out_of_window_gd_waits_under_the_deadline() {
+        let tagged = "[MIGERR:MIG_GD_OUT_OF_WINDOW] the referenced GlobalDefinition is \
+                      outside its validity window";
+        assert_eq!(
+            classify_migration_init_error(tagged),
+            InitErrorClass::TooEarly
+        );
+        assert!(is_global_definition_out_of_window(tagged));
+        // Untagged: the substring fallback must reach the same bounded class.
+        let untagged = "the referenced GlobalDefinition is outside its validity window \
+                        — not yet effective or expired — so the open is refused";
+        assert_eq!(
+            classify_migration_init_error(untagged),
+            InitErrorClass::TooEarly
+        );
+        assert!(is_global_definition_out_of_window(untagged));
+        // The other bounded cause must not answer to this predicate.
+        assert!(!is_global_definition_out_of_window(
+            "wasm error: No Global Definition found"
+        ));
     }
 
     #[test]
