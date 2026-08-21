@@ -42,12 +42,8 @@ holo_hash = { version = "=0.7.0", features = ["encoding"] }
 # Timestamp / hash types are identical to the ones in the zome-call payloads.
 hdi = "=0.8.0"
 
-# Shared migration protocol types (ReadCloseResponse / NotarySignature /
-# SummaryStatePayload / SummaryState). Exact-pinned for the same reason as the
-# stack above — this is THE wire-type crate the byte-parity rule is about, so a
-# caret drifting it ahead of the deployed DNA is exactly what must not happen.
-# Stays at 0.9.0: 0.10.0 breaks the ledger's `fees_owed`, which this never touches.
-rave_engine = "=0.9.0"
+# The wire-type crate the byte-parity rule above is about, so the `=` must never become a caret.
+rave_engine = "=0.10.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
