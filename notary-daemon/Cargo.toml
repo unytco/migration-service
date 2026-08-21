@@ -46,9 +46,7 @@ hdi = "=0.8.0"
 # SummaryStatePayload / SummaryState). Exact-pinned for the same reason as the
 # stack above — this is THE wire-type crate the byte-parity rule is about, so a
 # caret drifting it ahead of the deployed DNA is exactly what must not happen.
-# Stays at 0.9.0 while headless-migrator moves to 0.10.0: separate crates with
-# separate lockfiles, and 0.10.0's break is the ledger's `fees_owed`, which this
-# daemon never touches. The migration wire types it does serve are unchanged.
+# Stays at 0.9.0: 0.10.0 breaks the ledger's `fees_owed`, which this never touches.
 rave_engine = "=0.9.0"
 
 [dev-dependencies]

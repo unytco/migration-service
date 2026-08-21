@@ -28,8 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
 - `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
 - **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.
-- **headless-migrator: a debt on any unit blocks a close, not just the base one.** What an agent owes is now stated per unit (`rave_engine` 0.10.0), so the check before closing a chain reads every unit. `notary-daemon` stays on 0.9.0; the migration wire types are unchanged between the two.
-- headless-migrator: a successor definition outside its validity window, whether not yet effective or already expired, waits under the bounded deadline and is named as its own cause, rather than being confused with one that has not gossiped in.
+- headless-migrator: a debt on any unit blocks a close, not just the base one (`rave_engine` 0.10.0). `notary-daemon` stays on 0.9.0.
+- headless-migrator: a global definition outside its validity window waits under the bounded deadline rather than retrying unbounded.
 - **Upgrade to Holochain 0.7 + `rave_engine` 0.9.0** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`, `zfuel 0.9.0`, `ham` on branch `main`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
@@ -53,7 +53,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **headless-migrator: a reply it cannot read stops the run instead of retrying forever, and no longer blames the notaries.** Two versions disagreeing about a message shape is never resolved by waiting. Asking a notary to sign treated every failure as that notary being unreachable, so an unreadable reply worked through the whole list and reported `notary list exhausted`, sending an operator to check servers that were fine. A reply to a write still retries: it says nothing about whether the write landed.
+- headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
 
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.

@@ -65,10 +65,7 @@ hdi = "=0.8.0"
 # crate the byte-parity rule is about, so a caret drifting it ahead of the
 # deployed DNA is exactly what must not happen.
 rave_engine = "=0.10.0"
-# ZFuel, the amount type inside the ledger's `UnitMap`s. Not named in this
-# crate's own code: the exact pin is a RESOLUTION guard, holding the whole graph
-# (rave_engine's own zfuel included) to the version the deployed DNA serializes
-# with, by the same byte-parity rule as the pins above.
+# Not used directly; the exact pin holds the graph to the DNA's serialization.
 zfuel = "=0.9.1"
 
 [dev-dependencies]
