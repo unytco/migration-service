@@ -20,28 +20,43 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Bind a local listener, handing back it and its base URL.
+async fn bind_local() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+/// Answer one request. `false` once the listener can no longer accept, which
+/// ends whichever serving loop is driving it.
+async fn answer(listener: &TcpListener, status_line: &str, body: &str) -> bool {
+    let Ok((mut socket, _)) = listener.accept().await else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    let _ = socket.read(&mut buf).await;
+    let response = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.flush().await;
+    true
+}
+
 /// Serve `script` in order, one HTTP response per request, then close. Returns
 /// the bound base URL. (Mirrors `tests/fetch.rs`'s helper; each test crate is
 /// standalone, so it carries its own.)
 async fn serve(script: Vec<(&'static str, &'static str)>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, url) = bind_local().await;
     tokio::spawn(async move {
         for (status_line, body) in script {
-            let Ok((mut socket, _)) = listener.accept().await else {
+            if !answer(&listener, status_line, body).await {
                 return;
-            };
-            let mut buf = [0u8; 4096];
-            let _ = socket.read(&mut buf).await;
-            let response = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-            let _ = socket.flush().await;
+            }
         }
     });
-    format!("http://{addr}")
+    url
 }
 
 /// One request answered, which is all a test reaching its fixture once needs.
@@ -49,9 +64,11 @@ async fn one_shot_server(status_line: &'static str, body: &'static str) -> Strin
     serve(vec![(status_line, body)]).await
 }
 
-/// The same answer to `responses` requests, for a test that drives several passes.
-async fn server(status_line: &'static str, body: &'static str, responses: usize) -> String {
-    serve(vec![(status_line, body); responses]).await
+/// The same answer to every request, for a run with no last pass.
+async fn endless_server(status_line: &'static str, body: &'static str) -> String {
+    let (listener, url) = bind_local().await;
+    tokio::spawn(async move { while answer(&listener, status_line, body).await {} });
+    url
 }
 
 fn tmp_state(name: &str) -> std::path::PathBuf {
@@ -63,6 +80,31 @@ fn tmp_state(name: &str) -> std::path::PathBuf {
     ));
     let _ = std::fs::remove_file(&p);
     p
+}
+
+/// A watchdog, not a deadline to beat: everything awaited here is local and
+/// takes milliseconds, so only something that never happens trips it.
+const WATCHDOG: Duration = Duration::from_secs(30);
+
+const KEEP_RETRYING_WINDOW: Duration = Duration::from_millis(150);
+
+/// Watch the state file until `accepts` takes the persisted record. On watchdog
+/// expiry it hands back the last record read, so a failure says what was there.
+async fn persisted_state_reaches(
+    state_file: &std::path::Path,
+    accepts: impl Fn(&State) -> bool,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    let mut last = "no state file written yet".to_string();
+    while tokio::time::Instant::now() < deadline {
+        match State::read(state_file) {
+            Ok(state) if accepts(&state) => return Ok(()),
+            Ok(state) => last = format!("{:?}: {}", state.step, state.message),
+            Err(e) => last = format!("{e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    Err(last)
 }
 
 /// A `Config` with snappy retries; conductor ports are irrelevant (the mock
@@ -406,11 +448,9 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
         lair_passphrase: "x".into(),
     };
 
-    // Bounded, so a regression to the retry arm fails this test rather than
-    // hanging it: that arm's whole failure mode is looping without end.
     let mut sd = never_shutdown();
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
+        WATCHDOG,
         open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
     )
     .await
@@ -454,19 +494,15 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
 async fn a_joining_service_outage_keeps_the_run_waiting() {
     let state_file = tmp_state("joining-outage");
 
+    // Every fixture answers for as long as it is asked, so what ends this run is
+    // the test, never the script running out.
     let mock = Arc::new(MockConductor::default());
-    for _ in 0..20 {
-        mock.presence
-            .lock()
-            .unwrap()
-            .push_back(Ok(AppPresence::Absent));
-    }
+    *mock.presence_after_script.lock().unwrap() = Some(AppPresence::Absent);
 
-    let router = server("200 OK", package_body(), 20).await;
-    let joining = server(
+    let router = endless_server("200 OK", package_body()).await;
+    let joining = endless_server(
         "503 Service Unavailable",
         r#"{"error":{"code":"service_unavailable","message":"Auth service check failed"}}"#,
-        20,
     )
     .await;
 
@@ -474,8 +510,8 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
     std::fs::write(&happ, b"not a real happ").unwrap();
 
     let connector = MockConnector::shared(mock.clone());
-    // A backoff long enough that the window below holds a handful of passes,
-    // not hundreds: the scripted mock has to outlast the run.
+    // A backoff long enough that the windows below hold a handful of passes,
+    // not hundreds.
     let mut cfg = cfg(state_file.clone());
     cfg.retry_initial = Duration::from_millis(50);
     cfg.retry_max = Duration::from_millis(50);
@@ -498,23 +534,34 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
     // The sender stays in scope: dropping it closes the channel, which the loop
     // reads as a shutdown and returns on, hiding whether it would have retried.
     let (_shutdown_tx, mut sd) = tokio::sync::watch::channel(false);
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(250),
-        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
-    )
-    .await;
-    assert!(
-        outcome.is_err(),
-        "the run must still be retrying the outage, not have returned: {:?}",
-        outcome.map(|r| r.map_err(|e| e.to_string()))
-    );
+    let mut run = std::pin::pin!(open::run_with(
+        &connector, &cfg, &open_cfg, &params, &mut sd
+    ));
 
-    let state = State::read(&state_file).unwrap();
-    assert_ne!(state.step, Step::Failed);
+    // Half one: the outage reaches the state file, raced against the run's own
+    // return. Every pass rewrites the message, so a single timed read asserts
+    // where that instant landed; the run returning first is the regression.
+    tokio::select! {
+        outcome = &mut run => panic!(
+            "the run must still be retrying the outage, not have returned: {:?}",
+            outcome.map_err(|e| e.to_string())
+        ),
+        reached = persisted_state_reaches(&state_file, |s| {
+            s.step != Step::Failed && s.message.contains("service_unavailable")
+        }) => reached.unwrap_or_else(|last| panic!(
+            "the persisted message must come to name what the run is waiting on, last read {last}"
+        )),
+    }
+
+    // Half two: it keeps retrying past that. An absence, so a slow runner can
+    // only make this window quieter.
+    let returned = tokio::select! {
+        outcome = &mut run => Some(outcome.map_err(|e| e.to_string())),
+        _ = tokio::time::sleep(KEEP_RETRYING_WINDOW) => None,
+    };
     assert!(
-        state.message.contains("service_unavailable"),
-        "the persisted message names what it is waiting on: {}",
-        state.message
+        returned.is_none(),
+        "the run must go on retrying the outage, not return: {returned:?}"
     );
 
     let _ = std::fs::remove_file(&state_file);
@@ -567,7 +614,7 @@ async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
 
     let mut sd = never_shutdown();
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
+        WATCHDOG,
         open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
     )
     .await

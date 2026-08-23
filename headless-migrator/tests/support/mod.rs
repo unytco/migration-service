@@ -65,6 +65,10 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
+    /// Answered once the scripted queue runs out. A supervised loop under test
+    /// has no last pass, so without this the script's length is what ends the
+    /// run, in a panic naming the fixture.
+    pub presence_after_script: Mutex<Option<AppPresence>>,
     /// The `CellId` each scripted install reports the provisioned cell landed on
     /// — the open service checks it against the migration target (DNA + agent).
     pub install_result: Mutex<VecDeque<anyhow::Result<CellId>>>,
@@ -167,7 +171,11 @@ impl Conductor for MockConductor {
 
     async fn app_presence(&self, _app_id: &str) -> anyhow::Result<AppPresence> {
         self.record(Call::AppPresence);
-        Self::pop(&self.presence, "app_presence")
+        let after_script = self.presence_after_script.lock().unwrap().clone();
+        match after_script {
+            Some(presence) if self.presence.lock().unwrap().is_empty() => Ok(presence),
+            _ => Self::pop(&self.presence, "app_presence"),
+        }
     }
 
     async fn installed_cell_id(
