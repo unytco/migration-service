@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **Breaking.** The open service joins the release's own registered network and reads the joining service's roles-keyed provision, and a refusal it can never act on ends the run instead of retrying forever. An existing deployment fails at startup until its environment sets `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`.
+- headless-migrator: an open service whose carried key has already joined reconnects for its membrane proof.
 - **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
 - `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
 - **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.

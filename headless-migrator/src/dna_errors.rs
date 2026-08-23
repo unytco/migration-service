@@ -387,10 +387,14 @@ pub fn router_code_is_retryable(code: &str) -> bool {
 ///
 /// An explicit ALLOWLIST, for the same reason as [`router_code_is_retryable`]:
 /// an unrecognized code is surfaced rather than retried forever. What makes an
-/// entry retryable here is that the open service starts a FRESH `POST /join` on
-/// every pass, so anything scoped to one session or one challenge is gone by the
-/// next one. A refusal of the request itself (an unregistered network, an agent
-/// off the allow list, a key that already holds a ready session) is not.
+/// entry retryable is that the open service builds the thing it names afresh on
+/// every pass: a new session, a new challenge answer, a new signed timestamp.
+/// A refusal of the request ITSELF (an unregistered network, an agent off the
+/// allow list) is not, because the next pass asks the identical question.
+///
+/// "Not retryable" is about asking the same way again, not about the run being
+/// over. [`AGENT_ALREADY_JOINED`] belongs here and is still recovered, by asking
+/// a different way.
 pub fn joining_code_is_retryable(code: &str) -> bool {
     matches!(
         code,
@@ -398,13 +402,26 @@ pub fn joining_code_is_retryable(code: &str) -> bool {
         "service_unavailable" | "internal_error"
         // Momentary; back off.
         | "rate_limited"
-        // Scoped to a session or a challenge the next pass re-creates.
+        // Scoped to a session, a challenge, or a timestamp the next pass
+        // re-creates. The open service runs beside a droplet's first clock sync,
+        // so a signed instant outside the service's tolerance is the same shape
+        // as an expired challenge: the next pass signs a new one, off a clock
+        // that may by then have stepped. The service's own message names the
+        // measured drift and its limit, so the wait says what it is waiting on.
         | "invalid_session"
         | "challenge_expired"
         | "challenge_not_found"
         | "not_ready"
+        | "timestamp_out_of_range"
     )
 }
+
+/// `POST /join` for a key that already holds a ready session on the network it
+/// names. The service's own 409 answers itself: reconnect instead.
+pub const AGENT_ALREADY_JOINED: &str = "agent_already_joined";
+
+/// `POST /reconnect` for a key holding no ready session.
+pub const AGENT_NOT_JOINED: &str = "agent_not_joined";
 
 /// The joining service's and the router's shared error envelope, decoded to
 /// classify a non-2xx by its `code` rather than by the HTTP status alone: the
@@ -439,22 +456,27 @@ mod tests {
             "challenge_expired",
             "challenge_not_found",
             "not_ready",
+            // The reconnect signs a fresh instant on every pass, so a droplet
+            // whose clock has not stepped yet waits rather than ending the run.
+            "timestamp_out_of_range",
         ] {
             assert!(joining_code_is_retryable(code), "{code} is waitable");
         }
-        // Each of these needs an operator: the network is not registered, the
-        // key is not allowed on it, the key already holds a ready session, or
-        // its signature did not verify.
+        // Asking again the same way changes none of these.
         for code in [
             "unknown_network",
             "join_rejected",
-            "agent_already_joined",
+            AGENT_ALREADY_JOINED,
+            AGENT_NOT_JOINED,
             "invalid_agent_key",
             "verification_failed",
             "agent_revoked",
             "missing_claims",
         ] {
-            assert!(!joining_code_is_retryable(code), "{code} needs an operator");
+            assert!(
+                !joining_code_is_retryable(code),
+                "{code} does not clear by repeating the same request"
+            );
         }
         // Drift: a code added upstream after this binary was built is NOT
         // waitable, so it surfaces instead of retrying forever.

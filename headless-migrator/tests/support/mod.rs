@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
+use headless_migrator::joining::NonceSigner;
 use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
 use holochain_types::prelude::CellId;
@@ -76,6 +77,10 @@ pub struct MockConductor {
     /// "can't be read", which the open service treats as unknown rather than a
     /// mismatch — so the existing already-installed tests are unaffected.
     pub installed_cell: Mutex<Option<CellId>>,
+    /// Every `InstallSpec` the loop actually installed with. The membrane proof
+    /// and DNA modifiers inside decide the cell's DNA hash, so a test that only
+    /// counts installs cannot see whether the RIGHT ones arrived.
+    pub install_specs: Mutex<Vec<InstallSpec>>,
 }
 
 impl MockConductor {
@@ -187,8 +192,9 @@ impl Conductor for MockConductor {
         Ok(self.installed_cell.lock().unwrap().clone())
     }
 
-    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<CellId> {
+    async fn install_app(&self, spec: &InstallSpec) -> anyhow::Result<CellId> {
         self.record(Call::InstallApp);
+        self.install_specs.lock().unwrap().push(spec.clone());
         Self::pop(&self.install_result, "install_app")
     }
 }
@@ -224,6 +230,18 @@ impl Connector for MockConnector {
     async fn connect_ham(&self, _shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>> {
         let c: Arc<dyn Conductor> = self.ham.clone();
         Some(c)
+    }
+}
+
+/// Stands in for lair, deriving the signature from what it was asked to sign so
+/// the rail drives the joining service's signed steps with no keystore. The real
+/// [`headless_migrator::joining::LairSigner`] shells out to `lair-sign`, which is
+/// on no test runner's PATH.
+pub struct EchoSigner;
+
+impl NonceSigner for EchoSigner {
+    fn sign_nonce(&self, nonce_b64: &str) -> anyhow::Result<String> {
+        Ok(format!("signed:{nonce_b64}"))
     }
 }
 

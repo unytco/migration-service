@@ -64,11 +64,25 @@ async fn one_shot_server(status_line: &'static str, body: &'static str) -> Strin
     serve(vec![(status_line, body)]).await
 }
 
+/// Serve `script` in order and then start it again, for a run with no last pass
+/// whose every pass makes the same sequence of calls.
+async fn cycling_server(script: Vec<(&'static str, &'static str)>) -> String {
+    let (listener, url) = bind_local().await;
+    tokio::spawn(async move {
+        'serving: loop {
+            for (status_line, body) in &script {
+                if !answer(&listener, status_line, body).await {
+                    break 'serving;
+                }
+            }
+        }
+    });
+    url
+}
+
 /// The same answer to every request, for a run with no last pass.
 async fn endless_server(status_line: &'static str, body: &'static str) -> String {
-    let (listener, url) = bind_local().await;
-    tokio::spawn(async move { while answer(&listener, status_line, body).await {} });
-    url
+    cycling_server(vec![(status_line, body)]).await
 }
 
 fn tmp_state(name: &str) -> std::path::PathBuf {
@@ -191,12 +205,10 @@ async fn gd_wait_exhaustion_reports_a_config_fault_not_a_raw_genesis_error() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     let mut sd = never_shutdown();
-    let err = open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd)
+    let err = open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd)
         .await
         .expect_err("an exhausted GD wait must fail the open service")
         .to_string();
@@ -295,12 +307,10 @@ async fn an_already_installed_app_on_the_wrong_dna_hard_stops_immediately() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     let mut sd = never_shutdown();
-    let err = open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd)
+    let err = open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd)
         .await
         .expect_err("an app on the wrong DNA must hard-stop the open service")
         .to_string();
@@ -367,12 +377,10 @@ async fn an_installed_app_for_the_wrong_agent_hard_stops() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     let mut sd = never_shutdown();
-    let err = open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd)
+    let err = open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd)
         .await
         .expect_err("an app installed for the wrong agent must hard-stop")
         .to_string();
@@ -444,14 +452,12 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     let mut sd = never_shutdown();
     let err = tokio::time::timeout(
         WATCHDOG,
-        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
+        open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd),
     )
     .await
     .expect("the open service must return, not keep retrying a refusal")
@@ -527,15 +533,18 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     // The sender stays in scope: dropping it closes the channel, which the loop
     // reads as a shutdown and returns on, hiding whether it would have retried.
     let (_shutdown_tx, mut sd) = tokio::sync::watch::channel(false);
     let mut run = std::pin::pin!(open::run_with(
-        &connector, &cfg, &open_cfg, &params, &mut sd
+        &connector,
+        &EchoSigner,
+        &cfg,
+        &open_cfg,
+        &params,
+        &mut sd
     ));
 
     // Half one: the outage reaches the state file, raced against the run's own
@@ -608,14 +617,12 @@ async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
         from_dna: dna_b64(1),
         to_dna: dna_b64(2),
         agent_key: agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     let mut sd = never_shutdown();
     let err = tokio::time::timeout(
         WATCHDOG,
-        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
+        open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd),
     )
     .await
     .expect("the open service must return, not keep retrying a proof it cannot decode")
@@ -635,6 +642,196 @@ async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
         "no install without a decodable proof: {:?}",
         mock.calls()
     );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// How the joining service answers a re-join by a key it has already admitted,
+/// in the envelope its own handler renders (`joining-service/src/app.ts`).
+const ALREADY_JOINED_409: (&str, &str) = (
+    "409 Conflict",
+    r#"{"error":{"code":"agent_already_joined","message":"This agent key has already completed joining this network. Use POST /v1/reconnect instead."}}"#,
+);
+
+/// The full recovery a re-entered install now meets: refused, reconnected,
+/// provisioned. The provision carries the modifiers a real one does, since those
+/// and the proof are what the install has to receive for the cell to land on the
+/// network's own DNA rather than beside it.
+fn already_joined_then_reconnected() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ALREADY_JOINED_409,
+        (
+            "200 OK",
+            r#"{"linker_urls":[],"http_gateways":[],"session":"s_reconnected"}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"roles":{"alliance":{"membrane_proof":"cHJvb2Y=","dna_modifiers":{"network_seed":"unyt-recovered"}}}}"#,
+        ),
+    ]
+}
+
+/// The rail proof for B148, across the pass boundary the bug lives on. An
+/// install that fails on the successor GD is the EXPECTED case the bounded wait
+/// exists for, and it leaves the app uninstalled, so the next pass re-enters
+/// `install` and joins with a key that has already joined. A ready session never
+/// expires, so that 409 is the same answer on every later pass: without the
+/// reconnect the run ends at the first one and the GD budget it was meant to
+/// spend is never spent at all.
+///
+/// Two passes, ended deterministically by the second install's own verdict
+/// rather than by a clock, so what it proves is that the recovery REPEATS.
+#[tokio::test]
+async fn a_re_entered_install_reconnects_on_every_pass() {
+    let state_file = tmp_state("already-joined");
+
+    let mock = Arc::new(MockConductor::default());
+    *mock.presence_after_script.lock().unwrap() = Some(AppPresence::Absent);
+    // Pass one fails the way the budget is there for: the successor GD has not
+    // gossiped in yet, which leaves the app uninstalled and sends the loop back
+    // round. Pass two ends the run on a verdict of its own, so the test stops
+    // where it means to instead of on a timer.
+    mock.install_result.lock().unwrap().extend([
+        Err(anyhow::anyhow!("wasm error: No Global Definition found")),
+        Err(anyhow::anyhow!(
+            "Guest(\"[MIGERR:MIG_KEY_MISMATCH] the carried key is not the notarized agent\")"
+        )),
+    ]);
+
+    let router = endless_server("200 OK", package_body()).await;
+    let joining = cycling_server(already_joined_then_reconnected()).await;
+
+    let happ = tmp_state("dummy-happ-already-joined");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: joining,
+        network_seed: None,
+        joining_service_happ_id: "v0.99.0".into(),
+        // Ample, so a run that ends here ended on a verdict and not on the
+        // budget: the point is that the budget CAN be spent, not that it was.
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: router,
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+    };
+
+    // The sender stays in scope for the whole run: dropping it closes the
+    // channel, which the loop reads as a shutdown, and this test's point is the
+    // SECOND pass. `never_shutdown` drops it, so it suits single-pass tests only.
+    let (_shutdown_tx, mut sd) = tokio::sync::watch::channel(false);
+    let err = tokio::time::timeout(
+        WATCHDOG,
+        open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd),
+    )
+    .await
+    .expect("the open service must return, not hang")
+    .expect_err("the second install returns an unrecoverable verdict")
+    .to_string();
+
+    // The decisive one. Refused at the join, the run stops before the FIRST
+    // install; recovering only once, it stops before the second.
+    let specs = mock.install_specs.lock().unwrap().clone();
+    assert_eq!(
+        specs.len(),
+        2,
+        "every pass must recover its own provision and install with it: {:?}",
+        mock.calls()
+    );
+    // And what the recovery yielded is what the install used. The proof and the
+    // seed decide the cell's DNA hash, so counting installs would pass for a
+    // recovery that handed back nothing.
+    for (pass, spec) in specs.iter().enumerate() {
+        assert_eq!(
+            spec.membrane_proof.as_deref(),
+            Some(b"proof".as_slice()),
+            "pass {pass} installed without the reconnected proof"
+        );
+        assert_eq!(
+            spec.network_seed.as_deref(),
+            Some("unyt-recovered"),
+            "pass {pass} installed without the reconnected network seed"
+        );
+    }
+    assert!(
+        !err.contains("will not provision the carried key"),
+        "a key that has already joined is not a refusal to provision: {err}"
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// The recovery inherits the classification rather than escaping it: a reconnect
+/// the service itself refuses is as final as a refused join, so the run ends
+/// with that reason instead of asking a service that has already answered.
+#[tokio::test]
+async fn a_reconnect_the_joining_service_refuses_ends_the_run() {
+    let state_file = tmp_state("reconnect-refused");
+
+    // A second scripted pass, so a regression that retries fails on this test's
+    // own assertions rather than on an exhausted mock.
+    let mock = Arc::new(MockConductor::default());
+    *mock.presence_after_script.lock().unwrap() = Some(AppPresence::Absent);
+
+    let router = endless_server("200 OK", package_body()).await;
+    let joining = serve(vec![
+        ALREADY_JOINED_409,
+        (
+            "400 Bad Request",
+            r#"{"error":{"code":"invalid_signature","message":"Signature does not verify against agent key"}}"#,
+        ),
+    ])
+    .await;
+
+    let happ = tmp_state("dummy-happ-reconnect-refused");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: joining,
+        network_seed: None,
+        joining_service_happ_id: "v0.99.0".into(),
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: router,
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+    };
+
+    let mut sd = never_shutdown();
+    let err = tokio::time::timeout(
+        WATCHDOG,
+        open::run_with(&connector, &EchoSigner, &cfg, &open_cfg, &params, &mut sd),
+    )
+    .await
+    .expect("the open service must return, not keep retrying a refusal")
+    .expect_err("a refused reconnect leaves no way to provision")
+    .to_string();
+
+    assert!(
+        err.contains("invalid_signature"),
+        "the failure carries the joining service's own reason: {err}"
+    );
+    assert!(
+        !mock.calls().contains(&Call::InstallApp),
+        "no install without a provision: {:?}",
+        mock.calls()
+    );
+
+    let state = State::read(&state_file).unwrap();
+    assert_eq!(state.step, Step::Failed);
 
     let _ = std::fs::remove_file(&state_file);
     let _ = std::fs::remove_file(&happ);
