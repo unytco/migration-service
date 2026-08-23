@@ -3,8 +3,8 @@
 //! systemd `EnvironmentFile`; every field has a sensible default except the
 //! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and — for the
 //! open service — `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
-//! `MIGRATION_AGENT_NETWORK`, validated by the open command itself, not here,
-//! so close/status need no open-only vars).
+//! `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`, validated by the open command
+//! itself, not here, so close/status need no open-only vars).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,12 +57,14 @@ pub struct OpenConfig {
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
     /// The `happ_id` the release registered on the joining service
-    /// (`publish-joining-modifiers.sh`, `POST /v1/admin/networks`), sent as
-    /// `network` on `POST /v1/join`. Required, unlike `network_seed`: the
-    /// joining service has no fallback source for it, and a missing value
-    /// would silently resolve to the service's static default network instead
-    /// of the release's own.
-    pub network: String,
+    /// (`publish-joining-modifiers.sh`, `POST /v1/admin/networks`), sent as that
+    /// service's `network` field on `POST /v1/join`. Named as `automation`
+    /// names it, so one value has one name across both repos, and so it does not
+    /// read as a variant of `network_seed` above: the two are unrelated. Required,
+    /// unlike `network_seed`: the joining service has no fallback source for it,
+    /// and a missing value would silently resolve to the service's static default
+    /// network instead of the release's own.
+    pub joining_service_happ_id: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
     /// gossiped in, or before its effective date) for longer than this, the open
@@ -165,8 +167,9 @@ impl OpenConfig {
             joining_url: var("MIGRATION_AGENT_JOINING_URL")
                 .context("MIGRATION_AGENT_JOINING_URL is required for the open service")?,
             network_seed: var("MIGRATION_AGENT_NETWORK_SEED"),
-            network: var("MIGRATION_AGENT_NETWORK")
-                .context("MIGRATION_AGENT_NETWORK is required for the open service")?,
+            joining_service_happ_id: var("MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID").context(
+                "MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID is required for the open service",
+            )?,
             gd_wait_timeout: Duration::from_secs(gd_wait_secs),
         })
     }
@@ -176,29 +179,101 @@ impl OpenConfig {
 mod tests {
     use super::{validate_backoff_bounds, OpenConfig};
 
-    /// `MIGRATION_AGENT_NETWORK` unset, empty, then set — one test, sequential env
-    /// mutation, so parallel `cargo test` threads can't race each other over the
-    /// same process-global env vars (no other test in this binary touches these
-    /// three names).
+    const HAPP_PATH: &str = "MIGRATION_AGENT_HAPP_PATH";
+    const JOINING_URL: &str = "MIGRATION_AGENT_JOINING_URL";
+    const JOINING_SERVICE_HAPP_ID: &str = "MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID";
+
+    /// Puts an env var back the way it was when the guard goes out of scope,
+    /// including on the unwind out of a failed assertion. A cleanup line at the
+    /// end of a test never runs on that path, leaving a process-global value
+    /// behind for every other test in this binary.
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let guard = Self {
+                key,
+                original: std::env::var(key).ok(),
+            };
+            std::env::set_var(key, value);
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// The guard's two restore paths, checked before the test below trusts it
+    /// with the real variables: a value it must put back, and a variable that
+    /// was never set, each through an unwind that skips any cleanup line.
+    fn env_var_guard_restores_what_it_found_even_on_a_panic() {
+        const KEY: &str = "MIGRATION_AGENT_ENV_GUARD_SELF_CHECK";
+
+        std::env::set_var(KEY, "original");
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::set(KEY, "overwritten");
+            assert_eq!(std::env::var(KEY).unwrap(), "overwritten");
+            panic!("deliberate: the guard must restore on the unwind path too");
+        });
+        assert!(outcome.is_err(), "the closure panicked as written");
+        assert_eq!(std::env::var(KEY).unwrap(), "original");
+
+        std::env::remove_var(KEY);
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::set(KEY, "temporary");
+            assert_eq!(std::env::var(KEY).unwrap(), "temporary");
+            panic!("deliberate: an unset variable must come back unset");
+        });
+        assert!(outcome.is_err(), "the closure panicked as written");
+        assert!(
+            std::env::var(KEY).is_err(),
+            "a variable that was unset must be unset again, not left empty"
+        );
+    }
+
+    /// `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID` empty, unset, then set, plus the
+    /// guard the whole test leans on. Deliberately ONE test: the environment is
+    /// process-global, `set_var` is not thread-safe against another thread
+    /// reading it, and libtest runs a binary's tests in parallel. This is the
+    /// only test in this binary that touches the environment, so the mutation
+    /// stays sequential.
     #[test]
-    fn open_config_from_env_requires_network() {
-        std::env::set_var("MIGRATION_AGENT_HAPP_PATH", "/tmp/unyt.happ");
-        std::env::set_var("MIGRATION_AGENT_JOINING_URL", "https://joining.example/v1");
+    fn open_config_from_env_requires_the_joining_service_happ_id() {
+        env_var_guard_restores_what_it_found_even_on_a_panic();
 
-        std::env::remove_var("MIGRATION_AGENT_NETWORK");
+        let _happ_path = EnvVarGuard::set(HAPP_PATH, "/tmp/unyt.happ");
+        let _joining_url = EnvVarGuard::set(JOINING_URL, "https://joining.example/v1");
+        let _happ_id = EnvVarGuard::set(JOINING_SERVICE_HAPP_ID, "");
+
         let err = OpenConfig::from_env().unwrap_err().to_string();
-        assert!(err.contains("MIGRATION_AGENT_NETWORK"), "{err}");
+        assert!(err.contains(JOINING_SERVICE_HAPP_ID), "{err}");
 
-        std::env::set_var("MIGRATION_AGENT_NETWORK", "");
+        std::env::remove_var(JOINING_SERVICE_HAPP_ID);
         let err = OpenConfig::from_env().unwrap_err().to_string();
-        assert!(err.contains("MIGRATION_AGENT_NETWORK"), "{err}");
+        assert!(err.contains(JOINING_SERVICE_HAPP_ID), "{err}");
 
-        std::env::set_var("MIGRATION_AGENT_NETWORK", "v0.99.0");
-        assert_eq!(OpenConfig::from_env().unwrap().network, "v0.99.0");
-
-        std::env::remove_var("MIGRATION_AGENT_HAPP_PATH");
-        std::env::remove_var("MIGRATION_AGENT_JOINING_URL");
-        std::env::remove_var("MIGRATION_AGENT_NETWORK");
+        // The only two shapes a deployed fleet puts here, and they look nothing
+        // alike: prod leaves `joining_service_happ_id` out of release.json, so
+        // the registrar and the open service both fall back to `release_version`
+        // verbatim, while every local-testnet joining instance is one network
+        // with the static happ.id "unyt". Both are opaque ids to this config: a
+        // prod value that reads like a version is still a happ_id.
+        for happ_id in ["v0.99.0", "unyt"] {
+            std::env::set_var(JOINING_SERVICE_HAPP_ID, happ_id);
+            assert_eq!(
+                OpenConfig::from_env().unwrap().joining_service_happ_id,
+                happ_id
+            );
+        }
     }
 
     #[test]

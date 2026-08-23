@@ -32,7 +32,7 @@ use crate::dna_errors::{
     is_global_definition_out_of_window, is_response_decode_failure, schema_mismatch_message,
 };
 use crate::fetch::{self, FetchOutcome};
-use crate::joining::{self, LairSigner, NonceSigner};
+use crate::joining::{self, JoinError, LairSigner, NonceSigner};
 use crate::probe::{probe_open_state, OpenState};
 use crate::state_file::{Phase, State, Step, VerifyReport};
 use crate::verify::verify_against_ledger;
@@ -573,21 +573,25 @@ async fn install(
         &params.agent_key,
         signer,
         &cfg.role_name,
-        &open_cfg.network,
+        &open_cfg.joining_service_happ_id,
     )
     .await
     {
         Ok(p) => p,
-        Err(e) => {
-            return Err(OpenOutcome::Transient(
-                e.context("fresh membrane proof from target joining service"),
-            ))
-        }
+        Err(e) => return Err(join_error_outcome(e, open_cfg, &cfg.role_name)),
     };
     let membrane_proof = match provision.membrane_proof.as_deref() {
         Some(b64) => match decode_membrane_proof(b64) {
             Ok(bytes) => Some(bytes),
-            Err(e) => return Err(OpenOutcome::Transient(e)),
+            // The service serves this role the same string on every pass, so a
+            // decode that fails once fails always.
+            Err(e) => {
+                return Err(OpenOutcome::HardStop(format!(
+                    "the joining service served a membrane proof for role '{}' that is not \
+                     valid base64: {e:#}",
+                    cfg.role_name
+                )))
+            }
         },
         // No proof for the role is valid only if the role needs none; pass
         // `None` and let the validator decide.
@@ -711,6 +715,28 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
         }
         InitErrorClass::AlreadyMigrated | InitErrorClass::Transient => {
             OpenOutcome::Transient(e.context("install_app for the carried key"))
+        }
+    }
+}
+
+/// Map a joining-service failure onto the open outcome, the joining path's
+/// counterpart to [`install_error_outcome`]. A refusal the service will go on
+/// giving (an unregistered happ_id, an agent off the allow list, a provision
+/// response without the role) is a HARD stop: on the unbounded transient arm the
+/// open service asks again forever, so the operator gets one repeating back-off
+/// line instead of a nonzero exit carrying the service's own reason.
+fn join_error_outcome(e: JoinError, open_cfg: &OpenConfig, role_name: &str) -> OpenOutcome {
+    match e {
+        JoinError::Permanent(e) => OpenOutcome::HardStop(format!(
+            "the target release's joining service at {} will not provision the carried key, and \
+             retrying cannot change that: {e:#}. The code and message above are that service's \
+             own; the usual causes are MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID ('{}') naming a \
+             network it has not registered (publish-joining-modifiers.sh), the carried key not \
+             being on that network's allow list, and its roles map carrying no '{role_name}'.",
+            open_cfg.joining_url, open_cfg.joining_service_happ_id,
+        )),
+        JoinError::Transient(e) => {
+            OpenOutcome::Transient(e.context("fresh membrane proof from target joining service"))
         }
     }
 }
@@ -897,14 +923,71 @@ pub async fn probe_for_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, zome_read_outcome,
-        OpenOutcome, PendingPrecondition,
+        gd_wait_exhausted_message, gd_wait_expired, install_error_outcome, join_error_outcome,
+        zome_read_outcome, JoinError, OpenConfig, OpenOutcome, PendingPrecondition,
     };
     use crate::state_file::now_us;
     use holo_hash::{DnaHash, DnaHashB64};
     use std::time::Duration;
 
     const BUDGET: Duration = Duration::from_secs(1800);
+
+    fn open_cfg() -> OpenConfig {
+        OpenConfig {
+            happ_path: "/var/lib/holochain/unyt.happ".into(),
+            joining_url: "https://joining.example/v1".into(),
+            network_seed: None,
+            joining_service_happ_id: "v0.99.0".into(),
+            gd_wait_timeout: BUDGET,
+        }
+    }
+
+    /// The permanent joining faults this classification exists for: a 4xx the
+    /// service will keep giving, and a provision response with no entry for the
+    /// migrating role. On the transient arm the open service backs off and asks
+    /// again with no bound, so the operator sees one line repeat instead of a
+    /// nonzero exit. It is the same reasoning that already makes a rejected
+    /// membrane proof terminal.
+    #[test]
+    fn a_permanent_joining_fault_hard_stops_and_says_what_to_check() {
+        let cfg = open_cfg();
+        let refusal = JoinError::Permanent(anyhow::anyhow!(
+            "POST /join returned 400 Bad Request: {{\"error\":{{\"code\":\"unknown_network\"}}}}"
+        ));
+        let OpenOutcome::HardStop(why) = join_error_outcome(refusal, &cfg, "alliance") else {
+            panic!("a permanent joining refusal must hard-stop the open service");
+        };
+        assert!(why.contains("unknown_network"), "{why}");
+        assert!(
+            why.contains("MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID")
+                && why.contains("v0.99.0")
+                && why.contains("alliance")
+                && why.contains("joining.example"),
+            "the hard stop names the config to check: {why}"
+        );
+
+        let missing_role = JoinError::Permanent(anyhow::anyhow!(
+            "joining-service provision response has no entry for role 'alliance'"
+        ));
+        assert!(matches!(
+            join_error_outcome(missing_role, &cfg, "alliance"),
+            OpenOutcome::HardStop(_)
+        ));
+    }
+
+    /// A joining service that is unreachable or briefly unwell keeps the
+    /// unbounded back-off-and-re-probe it has always had.
+    #[test]
+    fn a_transient_joining_fault_stays_on_the_retry_arm() {
+        let blip = JoinError::Transient(anyhow::anyhow!("POST /join request: connection refused"));
+        let OpenOutcome::Transient(e) = join_error_outcome(blip, &open_cfg(), "alliance") else {
+            panic!("a transport failure must stay retryable");
+        };
+        assert!(
+            format!("{e:#}").contains("fresh membrane proof from target joining service"),
+            "the retry keeps the context naming where it failed: {e:#}"
+        );
+    }
 
     #[test]
     fn gd_wait_exhausted_message_is_a_config_fault_diagnosis() {

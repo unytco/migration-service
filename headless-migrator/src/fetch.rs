@@ -14,7 +14,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use holo_hash::DnaHashB64;
 use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
-use serde::Deserialize;
 
 /// The outcome of one package fetch.
 pub enum FetchOutcome {
@@ -27,18 +26,6 @@ pub enum FetchOutcome {
     KeepWaiting(String),
     /// A non-recoverable fault — exit nonzero.
     HardStop(String),
-}
-
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: ErrorBody,
-}
-
-#[derive(Deserialize)]
-struct ErrorBody {
-    code: String,
-    #[serde(default)]
-    message: String,
 }
 
 /// A `reqwest` client with a sane timeout for router calls (the `Status`
@@ -59,6 +46,7 @@ pub fn http_client_for_status() -> Result<reqwest::Client> {
 /// and the unit test (`fetch::is_hard_stop`) ergonomic.
 pub use crate::dna_errors::router_code_is_hard_stop as is_hard_stop;
 pub use crate::dna_errors::router_code_is_retryable as is_retryable;
+use crate::dna_errors::ErrorEnvelope;
 
 /// Fetch the package for `agent_b64` migrating `from_dna` → `to_dna` via the
 /// router at `router_url`.

@@ -380,9 +380,86 @@ pub fn router_code_is_retryable(code: &str) -> bool {
     )
 }
 
+/// Whether a joining-service error `code` is one a later pass can clear. The
+/// joining service (`Holo-Host/joining-service`, its `errorJson` helper) answers
+/// a fault in the same `{ "error": { "code", "message" } }` envelope the router
+/// uses, so its codes are a third namespace sharing this home.
+///
+/// An explicit ALLOWLIST, for the same reason as [`router_code_is_retryable`]:
+/// an unrecognized code is surfaced rather than retried forever. What makes an
+/// entry retryable here is that the open service starts a FRESH `POST /join` on
+/// every pass, so anything scoped to one session or one challenge is gone by the
+/// next one. A refusal of the request itself (an unregistered network, an agent
+/// off the allow list, a key that already holds a ready session) is not.
+pub fn joining_code_is_retryable(code: &str) -> bool {
+    matches!(
+        code,
+        // The service's own outage, or a dependency of it.
+        "service_unavailable" | "internal_error"
+        // Momentary; back off.
+        | "rate_limited"
+        // Scoped to a session or a challenge the next pass re-creates.
+        | "invalid_session"
+        | "challenge_expired"
+        | "challenge_not_found"
+        | "not_ready"
+    )
+}
+
+/// The joining service's and the router's shared error envelope, decoded to
+/// classify a non-2xx by its `code` rather than by the HTTP status alone: the
+/// status is also what a tunnel or proxy answers with when it has no route yet,
+/// and that is not the service refusing anything.
+#[derive(serde::Deserialize)]
+pub struct ErrorEnvelope {
+    pub error: ErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ErrorBody {
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The joining service's codes, split the way its own handlers mean them.
+    /// The allowlist is what keeps an unrecognized code off the unbounded retry
+    /// arm, so the split has to be asserted in both directions.
+    #[test]
+    fn joining_codes_split_into_wait_and_stop() {
+        for code in [
+            "service_unavailable",
+            "internal_error",
+            "rate_limited",
+            "invalid_session",
+            "challenge_expired",
+            "challenge_not_found",
+            "not_ready",
+        ] {
+            assert!(joining_code_is_retryable(code), "{code} is waitable");
+        }
+        // Each of these needs an operator: the network is not registered, the
+        // key is not allowed on it, the key already holds a ready session, or
+        // its signature did not verify.
+        for code in [
+            "unknown_network",
+            "join_rejected",
+            "agent_already_joined",
+            "invalid_agent_key",
+            "verification_failed",
+            "agent_revoked",
+            "missing_claims",
+        ] {
+            assert!(!joining_code_is_retryable(code), "{code} needs an operator");
+        }
+        // Drift: a code added upstream after this binary was built is NOT
+        // waitable, so it surfaces instead of retrying forever.
+        assert!(!joining_code_is_retryable("some_code_added_upstream"));
+    }
 
     #[test]
     fn typed_codes_classify_regardless_of_wording() {

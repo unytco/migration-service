@@ -9,14 +9,50 @@
 //! and dna modifiers. Nonce signing is the same `lair-sign` invocation the
 //! fleet uses, factored behind [`NonceSigner`] so the HTTP flow is unit-tested
 //! without lair.
+//!
+//! Every failure leaving this module is typed by whether a later pass could
+//! answer differently ([`JoinError`]), because the open service's retry of a
+//! transient one is unbounded.
 
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use holo_hash::{AgentPubKey, AgentPubKeyB64};
 use holochain_types::prelude::YamlProperties;
-use serde::Deserialize;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+
+use crate::dna_errors::{joining_code_is_retryable, ErrorEnvelope};
+
+/// A joining failure, typed by whether trying again could ever answer
+/// differently. The open service retries a transient failure without bound, so
+/// a refusal only an operator can lift has to be distinguishable HERE: mapped
+/// onto that arm it loops forever, one repeating back-off line where a nonzero
+/// exit and the joining service's own reason belong.
+///
+/// Deliberately NOT a `std::error::Error`. That impl would let anyhow's blanket
+/// conversion absorb a `JoinError` on any caller's `?`, silently dropping the
+/// classification this type exists to carry; without it, every caller has to
+/// decide, and the module's own `?` cannot erase one either.
+#[derive(Debug)]
+pub enum JoinError {
+    /// The service refused this join as it stands, and will keep refusing it:
+    /// an unregistered happ_id, an agent off the allow list, a key that has
+    /// already joined, or a provision response carrying no entry for the role.
+    Permanent(anyhow::Error),
+    /// Transport failure, a 5xx, or a refusal scoped to one session or challenge.
+    Transient(anyhow::Error),
+}
+
+impl JoinError {
+    /// The failure itself, for a caller adding context or rendering the chain.
+    pub fn cause(&self) -> &anyhow::Error {
+        match self {
+            Self::Permanent(e) | Self::Transient(e) => e,
+        }
+    }
+}
 
 /// What the joining service returns from `provision` for THIS migration's
 /// configured role: its membrane proof (base64) and the network's DNA
@@ -164,13 +200,16 @@ struct DnaModifiers {
 /// `membrane_proofs`/`dna_modifiers` keys — decodes to an EMPTY `roles` map
 /// here, so this must fail rather than let an absent role's data flow to the
 /// install as `None`.
-fn provision_for_role(mut response: ProvisionResponse, role_name: &str) -> Result<Provision> {
-    let role = response.roles.remove(role_name).with_context(|| {
-        format!(
+fn provision_for_role(
+    mut response: ProvisionResponse,
+    role_name: &str,
+) -> std::result::Result<Provision, JoinError> {
+    let role = response.roles.remove(role_name).ok_or_else(|| {
+        JoinError::Permanent(anyhow!(
             "joining-service provision response has no entry for role '{role_name}' in its \
              roles map (roles present: {:?}) — its membrane proof and DNA modifiers are unknown",
             response.roles.keys().collect::<Vec<_>>()
-        )
+        ))
     })?;
     let (network_seed, properties) = match role.dna_modifiers {
         Some(m) => (m.network_seed, m.properties),
@@ -192,24 +231,67 @@ fn provision_for_role(mut response: ProvisionResponse, role_name: &str) -> Resul
 async fn send_json<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
     what: &str,
-) -> Result<T> {
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("{what} request"))?;
+) -> std::result::Result<T, JoinError> {
+    let resp = req.send().await.map_err(|e| {
+        JoinError::Transient(anyhow::Error::new(e).context(format!("{what} request")))
+    })?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{what} returned {status}: {body}");
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<response body unreadable: {e}>"));
+        return Err(refusal_outcome(what, status, &body));
     }
-    resp.json()
-        .await
-        .with_context(|| format!("decoding {what} response"))
+    // A 200 that won't decode is our-side drift, surfaced but retryable, exactly
+    // as `fetch` treats the router's: a flaky body must not kill the migration.
+    resp.json().await.map_err(|e| {
+        JoinError::Transient(anyhow::Error::new(e).context(format!("decoding {what} response")))
+    })
+}
+
+/// Classify a non-2xx by the joining service's OWN error code, the way [`fetch`]
+/// classifies the router's, rather than by the HTTP status alone.
+///
+/// Two signals have to agree before a failure counts as permanent. The body must
+/// carry the service's error envelope, since a 404 is also what the tunnel in
+/// front of it answers while its route is still coming up, and that is nobody
+/// refusing anything. The status must be a client error, since a 5xx is the
+/// service failing rather than judging the request. Anything else retries.
+///
+/// [`fetch`]: crate::fetch
+fn refusal_outcome(what: &str, status: StatusCode, body: &str) -> JoinError {
+    let Ok(envelope) = serde_json::from_str::<ErrorEnvelope>(body) else {
+        return JoinError::Transient(anyhow!("{what} returned {status}: {body}"));
+    };
+    let code = envelope.error.code;
+    let message = if envelope.error.message.is_empty() {
+        code.clone()
+    } else {
+        envelope.error.message
+    };
+    let reported = anyhow!("{what} returned {status} {code}: {message}");
+    if status.is_client_error() && !joining_code_is_retryable(&code) {
+        JoinError::Permanent(reported)
+    } else {
+        JoinError::Transient(reported)
+    }
+}
+
+/// The `POST /join` body. `network` is the joining service's OWN field name for
+/// the happ_id a joiner asks to join, so the wire key stays theirs while our
+/// side carries the name automation uses for the same value.
+#[derive(Serialize)]
+struct JoinRequest<'a> {
+    agent_key: &'a str,
+    #[serde(rename = "network")]
+    joining_service_happ_id: &'a str,
 }
 
 /// Run the full join + provision flow against `joining_url` for `agent_key`,
-/// signing the challenge nonce with `signer`. `network` is the release's
-/// registered `happ_id` (`publish-joining-modifiers.sh`), sent on `POST /join`
+/// signing the challenge nonce with `signer`. `joining_service_happ_id` is the
+/// happ_id the release registered on that service
+/// (`publish-joining-modifiers.sh`), sent as the `network` field on `POST /join`
 /// so the join lands on the release's own network rather than the joining
 /// service's static default. Returns `role_name`'s membrane proof + modifiers
 /// for the install, erroring if the response's `roles` map carries no entry
@@ -220,16 +302,17 @@ pub async fn join_and_provision(
     agent_key: &AgentPubKey,
     signer: &dyn NonceSigner,
     role_name: &str,
-    network: &str,
-) -> Result<Provision> {
+    joining_service_happ_id: &str,
+) -> std::result::Result<Provision, JoinError> {
     let base = joining_url.trim_end_matches('/');
     let agent_b64 = AgentPubKeyB64::from(agent_key.clone()).to_string();
 
     // Step 1: POST /join.
     let join: JoinResponse = send_json(
-        client
-            .post(format!("{base}/join"))
-            .json(&serde_json::json!({ "agent_key": agent_b64, "network": network })),
+        client.post(format!("{base}/join")).json(&JoinRequest {
+            agent_key: &agent_b64,
+            joining_service_happ_id,
+        }),
         "POST /join",
     )
     .await?;
@@ -239,17 +322,24 @@ pub async fn join_and_provision(
             // Already cleared (e.g. an allow-list with no challenge) → provision.
             "ready" => join.session.clone(),
             "pending" => {
+                // The challenge set comes from the network's configured auth
+                // methods, so a set this flow cannot answer is the same set on
+                // every pass: permanent, like an unparseable one.
                 let challenge = join
                     .challenges
                     .iter()
                     .find(|c| c.challenge_type == "agent_allow_list")
-                    .context("no agent_allow_list challenge in /join response")?;
+                    .context("no agent_allow_list challenge in /join response")
+                    .map_err(JoinError::Permanent)?;
                 let nonce = challenge
                     .metadata
                     .as_ref()
                     .and_then(|m| m.nonce.as_deref())
-                    .context("agent_allow_list challenge missing nonce")?;
-                let signature = signer.sign_nonce(nonce)?;
+                    .context("agent_allow_list challenge missing nonce")
+                    .map_err(JoinError::Permanent)?;
+                // Retryable on purpose, unlike its neighbours: this is the local
+                // lair, which the droplet may still be bringing up.
+                let signature = signer.sign_nonce(nonce).map_err(JoinError::Transient)?;
 
                 // Step 3: POST /join/:session/verify.
                 let verify: VerifyResponse = send_json(
@@ -259,17 +349,42 @@ pub async fn join_and_provision(
                 "POST /join/:session/verify",
             )
             .await?;
+                // `ready` is the only status this flow can carry forward: a
+                // `rejected` verify is the service's no, and a `pending` one
+                // means a second challenge our single-challenge flow never
+                // answers. Neither changes on the next pass.
                 if verify.status != "ready" {
-                    bail!("join verify status {} (expected ready)", verify.status);
+                    return Err(JoinError::Permanent(anyhow!(
+                        "join verify status {} (expected ready)",
+                        verify.status
+                    )));
                 }
                 join.session.clone()
             }
+            // A 2xx `rejected` is the service's considered no: the agent is not on
+            // the network's allow list, no configured auth method can admit it, or
+            // its invite code is wrong. Each needs an operator, so none of them
+            // clears by asking again.
+            "rejected" => {
+                let detail = join
+                    .reason
+                    .map(|r| format!(" (reason: {r})"))
+                    .unwrap_or_default();
+                return Err(JoinError::Permanent(anyhow!(
+                    "the joining service rejected this join{detail}"
+                )));
+            }
+            // `status` is a fixed enum upstream, so an unknown value is contract
+            // drift. Surfaced rather than retried, the same call `fetch` makes
+            // for a router error code this binary has never seen.
             other => {
                 let detail = join
                     .reason
                     .map(|r| format!(" (reason: {r})"))
                     .unwrap_or_default();
-                bail!("unexpected join status {other}{detail}");
+                return Err(JoinError::Permanent(anyhow!(
+                    "unexpected join status {other}{detail}"
+                )));
             }
         };
 
@@ -307,6 +422,15 @@ mod tests {
     impl NonceSigner for NeverCalledSigner {
         fn sign_nonce(&self, _nonce_b64: &str) -> Result<String> {
             unreachable!("an already-ready join issues no challenge to sign")
+        }
+    }
+
+    /// Stands in for lair, deriving the signature from the nonce so a test can
+    /// assert WHICH nonce was signed without a keystore.
+    struct EchoSigner;
+    impl NonceSigner for EchoSigner {
+        fn sign_nonce(&self, nonce_b64: &str) -> Result<String> {
+            Ok(format!("signed:{nonce_b64}"))
         }
     }
 
@@ -357,12 +481,13 @@ mod tests {
         write_response(socket, "200 OK", body).await;
     }
 
-    /// The wire-level proof for this change: `join_and_provision` must send the
-    /// release's registered network on `POST /join` alongside the agent key —
-    /// omitting it is exactly what makes the joining service silently resolve
-    /// its static default network instead of the release's own.
-    #[tokio::test]
-    async fn join_and_provision_sends_the_configured_network_on_join() {
+    fn test_agent_key() -> AgentPubKey {
+        AgentPubKey::from_raw_36(vec![9; 36])
+    }
+
+    /// Drives the happy path against a fixture answering an already-ready join
+    /// and then a one-role provision, returning the `POST /join` body it sent.
+    async fn captured_join_body(joining_service_happ_id: &str) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(None));
         let captured_writer = captured.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -385,15 +510,14 @@ mod tests {
         });
 
         let client = http_client().unwrap();
-        let agent_key = AgentPubKey::from_raw_36(vec![9; 36]);
         let base = format!("http://{addr}");
         let provision = join_and_provision(
             &client,
             &base,
-            &agent_key,
+            &test_agent_key(),
             &NeverCalledSigner,
             "alliance",
-            "v0.99.0",
+            joining_service_happ_id,
         )
         .await
         .expect("join_and_provision succeeds against the fixture");
@@ -405,19 +529,234 @@ mod tests {
             .unwrap()
             .clone()
             .expect("the join request body was captured");
-        let json: serde_json::Value = serde_json::from_str(&body).expect("join body is JSON");
-        assert_eq!(json["network"], "v0.99.0");
-        assert_eq!(
-            json["agent_key"],
-            AgentPubKeyB64::from(agent_key).to_string()
+        serde_json::from_str(&body).expect("join body is JSON")
+    }
+
+    /// Runs `POST /join` against a fixture answering `status_line` with `body`,
+    /// and returns the failure that came back.
+    async fn join_failure(status_line: &'static str, body: &'static str) -> JoinError {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_response(&mut socket, status_line, body).await;
+        });
+
+        let client = http_client().unwrap();
+        join_and_provision(
+            &client,
+            &format!("http://{addr}"),
+            &test_agent_key(),
+            &NeverCalledSigner,
+            "alliance",
+            "v0.2.0",
+        )
+        .await
+        .expect_err("the fixture answers a failure")
+    }
+
+    /// The wire-level proof for this change: `join_and_provision` must send the
+    /// release's registered happ_id under the joining service's own `network`
+    /// key, alongside the agent key. Omitting it is exactly what makes that
+    /// service silently resolve its static default network instead of the
+    /// release's own. Both shapes a fleet really configures are covered: prod
+    /// registers under `release_version` verbatim (a happ_id that merely reads
+    /// like a version), local-testnet under the static literal `unyt`.
+    #[tokio::test]
+    async fn join_sends_the_configured_happ_id_as_the_services_network_field() {
+        for happ_id in ["v0.99.0", "unyt"] {
+            let body = captured_join_body(happ_id).await;
+            assert_eq!(body["network"], happ_id);
+            assert_eq!(
+                body["agent_key"],
+                AgentPubKeyB64::from(test_agent_key()).to_string()
+            );
+        }
+    }
+
+    /// A 4xx names a configuration this joining service will go on refusing (an
+    /// unregistered happ_id, a key off the allow list), so it must come back
+    /// PERMANENT: on the caller's retry arm the open service asks again forever.
+    /// It must also still carry the service's own reason: `error_for_status()`
+    /// alone would discard the body holding it.
+    #[tokio::test]
+    async fn a_4xx_join_is_permanent_and_keeps_the_error_bodys_reason() {
+        let err = join_failure(
+            "400 Bad Request",
+            r#"{"error":{"code":"unknown_network","message":"network not registered"}}"#,
+        )
+        .await;
+        let msg = format!("{:#}", err.cause());
+        assert!(matches!(err, JoinError::Permanent(_)), "{msg}");
+        assert!(msg.contains("unknown_network"), "{msg}");
+        assert!(msg.contains("network not registered"), "{msg}");
+    }
+
+    /// The joining service's considered no comes back on a 2xx: an agent off the
+    /// release's allow list produces no challenges, which it reports as a
+    /// `rejected` status with a reason. Only an operator can lift it.
+    #[tokio::test]
+    async fn a_rejected_join_status_is_permanent() {
+        let err = join_failure(
+            "201 Created",
+            r#"{"session":"s1","status":"rejected","reason":"Agent is not eligible for this auth method"}"#,
+        )
+        .await;
+        let msg = format!("{:#}", err.cause());
+        assert!(matches!(err, JoinError::Permanent(_)), "{msg}");
+        assert!(msg.contains("Agent is not eligible"), "{msg}");
+    }
+
+    /// A service failing, rather than judging the request, keeps the unbounded
+    /// retry it has always had: its own 5xx, and the codes scoped to one session
+    /// or challenge that the next pass re-creates from `POST /join`.
+    #[tokio::test]
+    async fn a_server_side_or_session_scoped_refusal_stays_transient() {
+        for (status_line, body) in [
+            (
+                "503 Service Unavailable",
+                r#"{"error":{"code":"service_unavailable","message":"Auth service check failed"}}"#,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"error":{"code":"internal_error","message":"Internal server error"}}"#,
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"code":"rate_limited","message":"Too many verification attempts"}}"#,
+            ),
+            (
+                "401 Unauthorized",
+                r#"{"error":{"code":"invalid_session","message":"Session not found or expired"}}"#,
+            ),
+            (
+                "410 Gone",
+                r#"{"error":{"code":"challenge_expired","message":"Challenge has expired"}}"#,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":{"code":"not_ready","message":"Session status is pending"}}"#,
+            ),
+        ] {
+            let err = join_failure(status_line, body).await;
+            assert!(
+                matches!(err, JoinError::Transient(_)),
+                "{status_line} must stay retryable: {:#}",
+                err.cause()
+            );
+        }
+    }
+
+    /// The tunnel in front of the joining service answers 404 from its catch-all
+    /// while its route is still coming up, and a proxy answers HTML. Neither is
+    /// the service refusing anything, and the missing error envelope is what says
+    /// so: a 4xx nobody can attribute to the service must not end the run.
+    #[tokio::test]
+    async fn a_4xx_without_the_services_error_envelope_stays_transient() {
+        let err = join_failure("404 Not Found", "<html><body>404 not found</body></html>").await;
+        assert!(
+            matches!(err, JoinError::Transient(_)),
+            "an unattributable 404 must stay retryable: {:#}",
+            err.cause()
         );
     }
 
-    /// A rejected join (e.g. an unregistered `network`) must surface the
-    /// joining service's own reason in the error, not just the bare status
-    /// code — `error_for_status()` alone would discard the body carrying it.
+    /// A joining service that isn't answering yet (the new droplet coming up
+    /// beside it) is the transient case the retry arm exists for.
     #[tokio::test]
-    async fn join_and_provision_surfaces_the_error_bodys_reason() {
+    async fn an_unreachable_joining_service_is_transient() {
+        // Bind then drop, so the port is one nothing is listening on.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = http_client().unwrap();
+        let err = join_and_provision(
+            &client,
+            &format!("http://{addr}"),
+            &test_agent_key(),
+            &NeverCalledSigner,
+            "alliance",
+            "unyt",
+        )
+        .await
+        .expect_err("nothing is listening on that port");
+        let msg = format!("{:#}", err.cause());
+        assert!(matches!(err, JoinError::Transient(_)), "{msg}");
+        assert!(
+            msg.contains("POST /join request"),
+            "it must fail at the transport, not somewhere later: {msg}"
+        );
+    }
+
+    /// A network configured with auth methods this flow cannot answer issues a
+    /// challenge set with no `agent_allow_list` entry, and issues the same set on
+    /// every pass. Same for a challenge carrying no nonce, and for a status
+    /// upstream has added since this binary was built.
+    #[tokio::test]
+    async fn a_join_this_flow_cannot_carry_forward_is_permanent() {
+        for body in [
+            r#"{"session":"s1","status":"pending","challenges":[{"id":"c1","type":"invite_code"}]}"#,
+            r#"{"session":"s1","status":"pending","challenges":[{"id":"c1","type":"agent_allow_list"}]}"#,
+            r#"{"session":"s1","status":"some_status_added_upstream"}"#,
+        ] {
+            let err = join_failure("201 Created", body).await;
+            assert!(
+                matches!(err, JoinError::Permanent(_)),
+                "must not retry a join it can never carry forward: {:#}",
+                err.cause()
+            );
+        }
+    }
+
+    /// The last step has its own refusals, and their classification has to reach
+    /// the caller the way `POST /join`'s does rather than being swallowed or
+    /// re-wrapped on the way out.
+    #[tokio::test]
+    async fn a_refusal_at_the_provision_step_propagates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_json_response(&mut socket, r#"{"session":"s1","status":"ready"}"#).await;
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_response(
+                &mut socket,
+                "403 Forbidden",
+                r#"{"error":{"code":"agent_revoked","message":"Agent has been blocked by administrator"}}"#,
+            )
+            .await;
+        });
+
+        let client = http_client().unwrap();
+        let err = join_and_provision(
+            &client,
+            &format!("http://{addr}"),
+            &test_agent_key(),
+            &NeverCalledSigner,
+            "alliance",
+            "unyt",
+        )
+        .await
+        .expect_err("a revoked agent cannot be provisioned");
+        let msg = format!("{:#}", err.cause());
+        assert!(matches!(err, JoinError::Permanent(_)), "{msg}");
+        assert!(msg.contains("agent_revoked"), "{msg}");
+        assert!(msg.contains("provision"), "{msg}");
+    }
+
+    /// The fleet's real path, which no other test drives: a pending join whose
+    /// `agent_allow_list` nonce is signed with the carried key, verified, then
+    /// provisioned. It pins what each step sends, since a wrong challenge id or
+    /// an unsigned nonce otherwise fails only against a live service.
+    #[tokio::test]
+    async fn the_allow_list_challenge_is_signed_verified_and_provisioned() {
+        let verify_body = Arc::new(Mutex::new(None));
+        let captured = verify_body.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -425,29 +764,48 @@ mod tests {
             let _ = read_request_body(&mut socket).await;
             write_response(
                 &mut socket,
-                "400 Bad Request",
-                r#"{"error":{"code":"unknown_network","message":"network not registered"}}"#,
+                "201 Created",
+                r#"{"session":"s1","status":"pending","challenges":[{"id":"ch_1","type":"agent_allow_list","metadata":{"nonce":"bm9uY2U="}}]}"#,
+            )
+            .await;
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            *captured.lock().unwrap() = Some(read_request_body(&mut socket).await);
+            write_json_response(&mut socket, r#"{"status":"ready"}"#).await;
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request_body(&mut socket).await;
+            write_json_response(
+                &mut socket,
+                r#"{"roles":{"alliance":{"membrane_proof":"cHJvb2Y="}}}"#,
             )
             .await;
         });
 
         let client = http_client().unwrap();
-        let agent_key = AgentPubKey::from_raw_36(vec![9; 36]);
-        let base = format!("http://{addr}");
-        let err = join_and_provision(
+        let provision = join_and_provision(
             &client,
-            &base,
-            &agent_key,
-            &NeverCalledSigner,
+            &format!("http://{addr}"),
+            &test_agent_key(),
+            &EchoSigner,
             "alliance",
-            "v0.2.0",
+            "unyt",
         )
         .await
-        .expect_err("a 400 from /join must fail the call");
+        .expect("the signed challenge clears the join");
+        assert_eq!(provision.membrane_proof.as_deref(), Some("cHJvb2Y="));
 
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unknown_network"), "{msg}");
-        assert!(msg.contains("network not registered"), "{msg}");
+        let body = verify_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("verify was sent");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("verify body is JSON");
+        assert_eq!(json["challenge_id"], "ch_1");
+        assert_eq!(
+            json["response"], "signed:bm9uY2U=",
+            "the nonce from THAT challenge is what gets signed"
+        );
     }
 
     /// The decisive regression test: a payload shaped exactly like the real
@@ -522,22 +880,27 @@ mod tests {
         let err = provision_for_role(decode(old_shape), "alliance")
             .expect_err("the old shape carries no `roles` key and must not resolve a role");
         assert!(
-            format!("{err:#}").contains("alliance"),
-            "the error must name the role that could not be resolved: {err:#}"
+            format!("{:#}", err.cause()).contains("alliance"),
+            "the error must name the role that could not be resolved: {:#}",
+            err.cause()
         );
+        assert!(matches!(err, JoinError::Permanent(_)));
     }
 
     /// A `roles` map present but missing the migrating role (e.g. the network
     /// configured a different role name) must error by name, not silently hand
-    /// back `None`s for a role that in fact exists under a different key.
+    /// back `None`s for a role that in fact exists under a different key. It is
+    /// PERMANENT: the service serves the same roles map to every later pass, so
+    /// naming the role carefully is wasted if the caller then retries forever.
     #[test]
-    fn a_roles_map_missing_the_configured_role_errors_by_name() {
+    fn a_roles_map_missing_the_configured_role_is_a_permanent_error_by_name() {
         let body = r#"{ "roles": { "some_other_role": { "membrane_proof": "cHJvb2Y=" } } }"#;
         let err = provision_for_role(decode(body), "alliance")
             .expect_err("alliance is not in the roles map");
-        let msg = format!("{err:#}");
+        let msg = format!("{:#}", err.cause());
         assert!(msg.contains("alliance"), "{msg}");
         assert!(msg.contains("some_other_role"), "{msg}");
+        assert!(matches!(err, JoinError::Permanent(_)), "{msg}");
     }
 
     /// A `roles` map carrying MORE than one role must resolve the NAMED one, not

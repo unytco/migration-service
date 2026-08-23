@@ -36,7 +36,7 @@
 //! LIVE_AGENT_KEY=<uhCAk...carried> \
 //! LIVE_HAPP_PATH=<path/to/new.happ> \
 //! LIVE_JOINING_URL=<https://target-joining> \
-//! LIVE_NETWORK=<release-happ_id> \
+//! LIVE_JOINING_SERVICE_HAPP_ID=<release-happ_id> \
 //! LIVE_LAIR_URL=<unix:///.../lair/socket?k=...> LIVE_LAIR_PASSPHRASE=<pass> \
 //! cargo test --test live_roundtrip -- --ignored --nocapture
 //! ```
@@ -105,7 +105,7 @@ fn load_live_env() -> Result<LiveEnv> {
         happ_path: var("LIVE_HAPP_PATH")?.into(),
         joining_url: var("LIVE_JOINING_URL")?,
         network_seed: std::env::var("LIVE_NETWORK_SEED").ok(),
-        network: var("LIVE_NETWORK")?,
+        joining_service_happ_id: var("LIVE_JOINING_SERVICE_HAPP_ID")?,
         gd_wait_timeout: std::time::Duration::from_secs(1800),
     };
 

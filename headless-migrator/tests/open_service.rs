@@ -20,14 +20,17 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Serve exactly one HTTP request with `status_line` + JSON `body`, then close.
-/// Returns the bound base URL. (Mirrors `tests/fetch.rs`'s helper; each test
-/// crate is standalone, so it carries its own.)
-async fn one_shot_server(status_line: &'static str, body: &'static str) -> String {
+/// Serve `script` in order, one HTTP response per request, then close. Returns
+/// the bound base URL. (Mirrors `tests/fetch.rs`'s helper; each test crate is
+/// standalone, so it carries its own.)
+async fn serve(script: Vec<(&'static str, &'static str)>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        if let Ok((mut socket, _)) = listener.accept().await {
+        for (status_line, body) in script {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = [0u8; 4096];
             let _ = socket.read(&mut buf).await;
             let response = format!(
@@ -39,6 +42,16 @@ async fn one_shot_server(status_line: &'static str, body: &'static str) -> Strin
         }
     });
     format!("http://{addr}")
+}
+
+/// One request answered, which is all a test reaching its fixture once needs.
+async fn one_shot_server(status_line: &'static str, body: &'static str) -> String {
+    serve(vec![(status_line, body)]).await
+}
+
+/// The same answer to `responses` requests, for a test that drives several passes.
+async fn server(status_line: &'static str, body: &'static str, responses: usize) -> String {
+    serve(vec![(status_line, body); responses]).await
 }
 
 fn tmp_state(name: &str) -> std::path::PathBuf {
@@ -126,7 +139,7 @@ async fn gd_wait_exhaustion_reports_a_config_fault_not_a_raw_genesis_error() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
-        network: "v0.99.0".into(),
+        joining_service_happ_id: "v0.99.0".into(),
         // Zero budget: the FIRST too-early exhausts immediately (single pass,
         // single fetch), so the one-shot router suffices.
         gd_wait_timeout: Duration::ZERO,
@@ -230,7 +243,7 @@ async fn an_already_installed_app_on_the_wrong_dna_hard_stops_immediately() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
-        network: "v0.99.0".into(),
+        joining_service_happ_id: "v0.99.0".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
@@ -304,7 +317,7 @@ async fn an_installed_app_for_the_wrong_agent_hard_stops() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
-        network: "v0.99.0".into(),
+        joining_service_happ_id: "v0.99.0".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
@@ -339,6 +352,240 @@ async fn an_installed_app_for_the_wrong_agent_hard_stops() {
     assert!(
         mock.calls().contains(&Call::InstalledCellId),
         "the loop read the installed cell: {:?}",
+        mock.calls()
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// The rail proof that a permanent joining fault ENDS the run. A release whose
+/// happ_id the joining service has never registered answers `POST /join` with a
+/// 400, and no later pass gets a different answer: mapped onto the transient arm
+/// the open service would back off and ask again until an operator noticed, so
+/// the whole supervised loop must return instead, with the service's own reason.
+#[tokio::test]
+async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
+    let state_file = tmp_state("unknown-network");
+
+    // Nothing installed yet, so the pass fetches the package and goes to
+    // install, which starts by joining the target release's network.
+    let mock = Arc::new(MockConductor::default());
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Absent));
+
+    let router = one_shot_server("200 OK", package_body()).await;
+    let joining = one_shot_server(
+        "400 Bad Request",
+        r#"{"error":{"code":"unknown_network","message":"network is not registered with this service"}}"#,
+    )
+    .await;
+
+    let happ = tmp_state("dummy-happ-unknown-network");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: joining,
+        network_seed: None,
+        // The local-testnet shape of this id: every local joining instance
+        // registers the one static happ.id "unyt".
+        joining_service_happ_id: "unyt".into(),
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: router,
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+        lair_url: "unix:///nonexistent".into(),
+        lair_passphrase: "x".into(),
+    };
+
+    // Bounded, so a regression to the retry arm fails this test rather than
+    // hanging it: that arm's whole failure mode is looping without end.
+    let mut sd = never_shutdown();
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
+    )
+    .await
+    .expect("the open service must return, not keep retrying a refusal")
+    .expect_err("a joining service that will never provision must end the run")
+    .to_string();
+
+    assert!(
+        err.contains("unknown_network") && err.contains("not registered with this service"),
+        "the failure carries the joining service's own reason: {err}"
+    );
+    assert!(
+        err.contains("MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID") && err.contains("unyt"),
+        "the failure names the config that has to change: {err}"
+    );
+
+    // It never reached the install: the app would have landed on the wrong
+    // network's DNA without the modifiers the join was there to fetch.
+    assert!(
+        !mock.calls().contains(&Call::InstallApp),
+        "no install without a provision: {:?}",
+        mock.calls()
+    );
+
+    let state = State::read(&state_file).unwrap();
+    assert_eq!(state.step, Step::Failed);
+    assert!(
+        state.message.contains("unknown_network"),
+        "the persisted message carries the reason the rail cats out: {}",
+        state.message
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// The other half of the classification, at rail level: a joining service that
+/// is merely unwell must still be waited out. Without this, a change that made
+/// every joining failure terminal would pass every other test in this file.
+#[tokio::test]
+async fn a_joining_service_outage_keeps_the_run_waiting() {
+    let state_file = tmp_state("joining-outage");
+
+    let mock = Arc::new(MockConductor::default());
+    for _ in 0..20 {
+        mock.presence
+            .lock()
+            .unwrap()
+            .push_back(Ok(AppPresence::Absent));
+    }
+
+    let router = server("200 OK", package_body(), 20).await;
+    let joining = server(
+        "503 Service Unavailable",
+        r#"{"error":{"code":"service_unavailable","message":"Auth service check failed"}}"#,
+        20,
+    )
+    .await;
+
+    let happ = tmp_state("dummy-happ-joining-outage");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    // A backoff long enough that the window below holds a handful of passes,
+    // not hundreds: the scripted mock has to outlast the run.
+    let mut cfg = cfg(state_file.clone());
+    cfg.retry_initial = Duration::from_millis(50);
+    cfg.retry_max = Duration::from_millis(50);
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: joining,
+        network_seed: None,
+        joining_service_happ_id: "unyt".into(),
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: router,
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+        lair_url: "unix:///nonexistent".into(),
+        lair_passphrase: "x".into(),
+    };
+
+    // The sender stays in scope: dropping it closes the channel, which the loop
+    // reads as a shutdown and returns on, hiding whether it would have retried.
+    let (_shutdown_tx, mut sd) = tokio::sync::watch::channel(false);
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(250),
+        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the run must still be retrying the outage, not have returned: {:?}",
+        outcome.map(|r| r.map_err(|e| e.to_string()))
+    );
+
+    let state = State::read(&state_file).unwrap();
+    assert_ne!(state.step, Step::Failed);
+    assert!(
+        state.message.contains("service_unavailable"),
+        "the persisted message names what it is waiting on: {}",
+        state.message
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+    let _ = std::fs::remove_file(&happ);
+}
+
+/// A provision whose membrane proof is not base64 is the same string on every
+/// pass, so it must stop the run rather than join the retry arm: the install
+/// cannot be attempted without it.
+#[tokio::test]
+async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
+    let state_file = tmp_state("bad-proof");
+
+    let mock = Arc::new(MockConductor::default());
+    mock.presence
+        .lock()
+        .unwrap()
+        .push_back(Ok(AppPresence::Absent));
+
+    let router = one_shot_server("200 OK", package_body()).await;
+    let joining = serve(vec![
+        ("200 OK", r#"{"session":"s1","status":"ready"}"#),
+        (
+            "200 OK",
+            r#"{"roles":{"alliance":{"membrane_proof":"not base64 !!"}}}"#,
+        ),
+    ])
+    .await;
+
+    let happ = tmp_state("dummy-happ-bad-proof");
+    std::fs::write(&happ, b"not a real happ").unwrap();
+
+    let connector = MockConnector::shared(mock.clone());
+    let cfg = cfg(state_file.clone());
+    let open_cfg = OpenConfig {
+        happ_path: happ.clone(),
+        joining_url: joining,
+        network_seed: None,
+        joining_service_happ_id: "unyt".into(),
+        gd_wait_timeout: Duration::from_secs(1800),
+    };
+    let params = OpenParams {
+        router_url: router,
+        from_dna: dna_b64(1),
+        to_dna: dna_b64(2),
+        agent_key: agent(3),
+        lair_url: "unix:///nonexistent".into(),
+        lair_passphrase: "x".into(),
+    };
+
+    let mut sd = never_shutdown();
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        open::run_with(&connector, &cfg, &open_cfg, &params, &mut sd),
+    )
+    .await
+    .expect("the open service must return, not keep retrying a proof it cannot decode")
+    .expect_err("an undecodable membrane proof must end the run")
+    .to_string();
+
+    assert!(
+        err.contains("not valid base64"),
+        "the failure says what is wrong with the proof: {err}"
+    );
+    assert!(
+        err.contains("alliance"),
+        "the failure names the role it was served for: {err}"
+    );
+    assert!(
+        !mock.calls().contains(&Call::InstallApp),
+        "no install without a decodable proof: {:?}",
         mock.calls()
     );
 
