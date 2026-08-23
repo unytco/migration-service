@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking.** The open service joins the release's own registered network and reads the joining service's roles-keyed provision, and a refusal it can never act on ends the run instead of retrying forever. An existing deployment fails at startup until its environment sets `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`.
 - **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
 - `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
 - **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.
@@ -53,10 +54,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Breaking. headless-migrator: the open service now joins the release's own registered network, not the joining service's static default.** `OpenConfig` gains a required `joining_service_happ_id` (`MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`, the happ_id the release registered, named as `automation` names it), sent as the joining service's `network` field on `POST /v1/join`. An existing open-service deployment fails at startup until its environment sets it.
-- **headless-migrator: a joining answer the open service can never act on now ends the run instead of retrying forever.** A refusal carrying the joining service's own error code, a `rejected` join, a challenge set it cannot answer, and a provision naming no membrane proof or role for it each hard-stop with that service's reason; an outage, a transport failure and a session-scoped refusal still retry.
-- **headless-migrator: the migrating install now decodes the joining-service's real `roles`-keyed provision shape.** The old top-level `membrane_proofs`/`dna_modifiers` struct silently decoded the new `GET /v1/join/:session/provision` response to empty defaults, installing without the network's DNA properties and landing the agent alone on an isolated DHT; a response with no entry for the migrating role now errors by name instead (B139).
 - headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
+
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.
 - **headless-migrator: a rejected membrane proof is now terminal, not an infinite retry** — `genesis_self_check`'s four verdicts join the init hard-failure table instead of falling through to the unbounded transient arm.
