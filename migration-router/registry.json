@@ -108,6 +108,18 @@
         }
       ],
       "published": true
+    },
+    {
+      "dna_hash": "uhC0kjXaHxVB699_dWv4CB9-DUlydfeuPKp72CVvLISDi3MGtb0fd",
+      "version": "alliance-v0.102.0",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.102.0",
+      "notaries": [
+        {
+          "url": "https://notary-1-v0-102-0.unyt.dev",
+          "api": "v1"
+        }
+      ],
+      "published": true
     }
   ]
 }
