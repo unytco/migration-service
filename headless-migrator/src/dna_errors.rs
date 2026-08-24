@@ -404,6 +404,11 @@ pub fn joining_code_is_retryable(code: &str) -> bool {
         | "challenge_not_found"
         | "not_ready"
         | "timestamp_out_of_range"
+        // Upstream documents this 410 but has never implemented it, so a grep of
+        // that repo finds it only in `JOINING_SERVICE_API.md`. Listed against the
+        // documented contract: shipped later and unlisted, it would hard-stop a
+        // run over a session the next pass simply re-creates.
+        | "session_expired"
     )
 }
 
@@ -444,6 +449,7 @@ mod tests {
             "challenge_not_found",
             "not_ready",
             "timestamp_out_of_range",
+            "session_expired",
         ] {
             assert!(joining_code_is_retryable(code), "{code} is waitable");
         }
