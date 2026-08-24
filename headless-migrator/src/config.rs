@@ -1,10 +1,10 @@
 //! Agent configuration, read from the environment (mirrors notary-daemon's
 //! `Config::from_env`). The `automation/` installer renders these into the
 //! systemd `EnvironmentFile`; every field has a sensible default except the
-//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and — for the
-//! open service — `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL`,
-//! validated by the open command itself, not here, so close/status need no
-//! open-only vars).
+//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and for the
+//! open service, `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
+//! `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`, validated by the open command
+//! itself, not here, so close/status need no open-only vars).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -56,6 +56,11 @@ pub struct OpenConfig {
     /// Network seed for the new DNA's app install. The joining service may also
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
+    /// The `happ_id` the release registered on the joining service
+    /// (`publish-joining-modifiers.sh`), sent as that service's `network` field.
+    /// Unrelated to `network_seed` above, and required: with no value the service
+    /// silently resolves its own static default network, not the release's.
+    pub joining_service_happ_id: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
     /// gossiped in, or before its effective date) for longer than this, the open
@@ -158,6 +163,9 @@ impl OpenConfig {
             joining_url: var("MIGRATION_AGENT_JOINING_URL")
                 .context("MIGRATION_AGENT_JOINING_URL is required for the open service")?,
             network_seed: var("MIGRATION_AGENT_NETWORK_SEED"),
+            joining_service_happ_id: var("MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID").context(
+                "MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID is required for the open service",
+            )?,
             gd_wait_timeout: Duration::from_secs(gd_wait_secs),
         })
     }
@@ -165,7 +173,96 @@ impl OpenConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_backoff_bounds;
+    use super::{validate_backoff_bounds, OpenConfig};
+
+    const HAPP_PATH: &str = "MIGRATION_AGENT_HAPP_PATH";
+    const JOINING_URL: &str = "MIGRATION_AGENT_JOINING_URL";
+    const JOINING_SERVICE_HAPP_ID: &str = "MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID";
+
+    /// Puts an env var back as it was on scope exit, including the unwind out of
+    /// a failed assertion: a cleanup line at the end of a test never runs on that
+    /// path, and the value is process-global to every other test here.
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let guard = Self {
+                key,
+                original: std::env::var(key).ok(),
+            };
+            std::env::set_var(key, value);
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn env_var_guard_restores_what_it_found_even_on_a_panic() {
+        const KEY: &str = "MIGRATION_AGENT_ENV_GUARD_SELF_CHECK";
+
+        std::env::set_var(KEY, "original");
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::set(KEY, "overwritten");
+            assert_eq!(std::env::var(KEY).unwrap(), "overwritten");
+            panic!("deliberate: the guard must restore on the unwind path too");
+        });
+        assert!(outcome.is_err(), "the closure panicked as written");
+        assert_eq!(std::env::var(KEY).unwrap(), "original");
+
+        std::env::remove_var(KEY);
+        let outcome = std::panic::catch_unwind(|| {
+            let _guard = EnvVarGuard::set(KEY, "temporary");
+            assert_eq!(std::env::var(KEY).unwrap(), "temporary");
+            panic!("deliberate: an unset variable must come back unset");
+        });
+        assert!(outcome.is_err(), "the closure panicked as written");
+        assert!(
+            std::env::var(KEY).is_err(),
+            "a variable that was unset must be unset again, not left empty"
+        );
+    }
+
+    /// Deliberately ONE test: the environment is process-global, `set_var` is not
+    /// thread-safe against another thread reading it, and libtest runs a binary's
+    /// tests in parallel. This is the only test here that touches the
+    /// environment, so the mutation stays sequential.
+    #[test]
+    fn open_config_from_env_requires_the_joining_service_happ_id() {
+        env_var_guard_restores_what_it_found_even_on_a_panic();
+
+        let _happ_path = EnvVarGuard::set(HAPP_PATH, "/tmp/unyt.happ");
+        let _joining_url = EnvVarGuard::set(JOINING_URL, "https://joining.example/v1");
+        let _happ_id = EnvVarGuard::set(JOINING_SERVICE_HAPP_ID, "");
+
+        let err = OpenConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains(JOINING_SERVICE_HAPP_ID), "{err}");
+
+        std::env::remove_var(JOINING_SERVICE_HAPP_ID);
+        let err = OpenConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains(JOINING_SERVICE_HAPP_ID), "{err}");
+
+        // The only two shapes a deployed fleet puts here: prod falls back to
+        // `release_version` verbatim when release.json names no happ_id, and every
+        // local-testnet joining instance is the one static happ.id "unyt". Both
+        // are opaque ids here, including the one that reads like a version.
+        for happ_id in ["v0.99.0", "unyt"] {
+            std::env::set_var(JOINING_SERVICE_HAPP_ID, happ_id);
+            assert_eq!(
+                OpenConfig::from_env().unwrap().joining_service_happ_id,
+                happ_id
+            );
+        }
+    }
 
     #[test]
     fn valid_backoff_bounds_pass() {

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
+use headless_migrator::joining::NonceSigner;
 use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
 use holochain_types::prelude::CellId;
@@ -65,6 +66,9 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
+    /// Answered once the scripted queue runs out: a supervised loop has no last
+    /// pass, so otherwise the script's length is what ends the run.
+    pub presence_after_script: Mutex<Option<AppPresence>>,
     /// The `CellId` each scripted install reports the provisioned cell landed on
     /// — the open service checks it against the migration target (DNA + agent).
     pub install_result: Mutex<VecDeque<anyhow::Result<CellId>>>,
@@ -72,6 +76,10 @@ pub struct MockConductor {
     /// "can't be read", which the open service treats as unknown rather than a
     /// mismatch — so the existing already-installed tests are unaffected.
     pub installed_cell: Mutex<Option<CellId>>,
+    /// Every `InstallSpec` the loop installed with. The proof and the modifiers
+    /// inside are what the install has to receive, and counting installs cannot
+    /// see them.
+    pub install_specs: Mutex<Vec<InstallSpec>>,
 }
 
 impl MockConductor {
@@ -167,7 +175,11 @@ impl Conductor for MockConductor {
 
     async fn app_presence(&self, _app_id: &str) -> anyhow::Result<AppPresence> {
         self.record(Call::AppPresence);
-        Self::pop(&self.presence, "app_presence")
+        let after_script = self.presence_after_script.lock().unwrap().clone();
+        match after_script {
+            Some(presence) if self.presence.lock().unwrap().is_empty() => Ok(presence),
+            _ => Self::pop(&self.presence, "app_presence"),
+        }
     }
 
     async fn installed_cell_id(
@@ -179,8 +191,9 @@ impl Conductor for MockConductor {
         Ok(self.installed_cell.lock().unwrap().clone())
     }
 
-    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<CellId> {
+    async fn install_app(&self, spec: &InstallSpec) -> anyhow::Result<CellId> {
         self.record(Call::InstallApp);
+        self.install_specs.lock().unwrap().push(spec.clone());
         Self::pop(&self.install_result, "install_app")
     }
 }
@@ -216,6 +229,16 @@ impl Connector for MockConnector {
     async fn connect_ham(&self, _shutdown: &mut ham::ShutdownRx) -> Option<Arc<dyn Conductor>> {
         let c: Arc<dyn Conductor> = self.ham.clone();
         Some(c)
+    }
+}
+
+/// Stands in for lair: the real `LairSigner` shells out to `lair-sign`, which is
+/// on no test runner's PATH.
+pub struct EchoSigner;
+
+impl NonceSigner for EchoSigner {
+    fn sign_nonce(&self, nonce_b64: &str) -> anyhow::Result<String> {
+        Ok(format!("signed:{nonce_b64}"))
     }
 }
 

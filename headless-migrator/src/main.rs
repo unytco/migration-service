@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
 
 use headless_migrator::config::{Config, OpenConfig};
+use headless_migrator::joining::LairSigner;
 use headless_migrator::open::OpenParams;
 use headless_migrator::status::StatusParams;
 use headless_migrator::verify::VerifyParams;
@@ -153,16 +154,16 @@ async fn run() -> Result<()> {
             lair_passphrase,
         } => {
             let open_cfg = OpenConfig::from_env().context("loading open-service config")?;
+            let agent_key = parse_agent(&agent_key)?;
+            let signer = LairSigner::new(&agent_key, lair_url, lair_passphrase);
             let params = OpenParams {
                 router_url,
                 from_dna: parse_dna(&from_dna, "from_dna")?,
                 to_dna: parse_dna(&to_dna, "to_dna")?,
-                agent_key: parse_agent(&agent_key)?,
-                lair_url,
-                lair_passphrase,
+                agent_key,
             };
             let mut shutdown = ham::install_shutdown_handler();
-            open::run(&cfg, &open_cfg, &params, &mut shutdown).await
+            open::run(&cfg, &open_cfg, &params, &signer, &mut shutdown).await
         }
 
         Command::Verify {

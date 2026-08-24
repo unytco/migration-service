@@ -19,6 +19,7 @@ use headless_migrator::config::{Config, OpenConfig};
 use headless_migrator::open::{self, OpenParams};
 use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{Phase, State, Step};
+use support::EchoSigner;
 
 /// A `Config` whose conductor ports point nowhere, with a unique temp state file
 /// and snappy retries.
@@ -85,6 +86,7 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         happ_path: happ.clone(),
         joining_url: "http://127.0.0.1:1".into(),
         network_seed: None,
+        joining_service_happ_id: "v0.99.0".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
@@ -92,8 +94,6 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         from_dna: support::dna_b64(1),
         to_dna: support::dna_b64(2),
         agent_key: support::agent(3),
-        lair_url: "unix:///nonexistent".into(),
-        lair_passphrase: "x".into(),
     };
 
     // Fire shutdown shortly after the first pass so `run` returns from the
@@ -108,7 +108,7 @@ async fn open_restart_does_not_clobber_persisted_safe_to_teardown() {
         let _ = tx.send(true);
     });
 
-    let result = open::run(&cfg, &open_cfg, &params, &mut shutdown).await;
+    let result = open::run(&cfg, &open_cfg, &params, &EchoSigner, &mut shutdown).await;
     assert!(
         result.is_err(),
         "an incomplete open interrupted by shutdown exits nonzero (not Ok)"

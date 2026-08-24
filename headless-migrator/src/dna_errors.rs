@@ -380,9 +380,97 @@ pub fn router_code_is_retryable(code: &str) -> bool {
     )
 }
 
+/// Whether a joining-service error `code` is one a later pass can clear.
+///
+/// An explicit ALLOWLIST, for the same reason as [`router_code_is_retryable`]:
+/// an unrecognized code is surfaced rather than retried forever. An entry is
+/// retryable because the open service builds what it names afresh on every pass,
+/// a new session, challenge answer or signed timestamp. A refusal of the request
+/// ITSELF (an unregistered network, an agent off the allow list) is not, since
+/// the next pass asks the identical question. That is about asking the same way
+/// again, not about the run being over: [`AGENT_ALREADY_JOINED`] is not
+/// retryable and is still recovered, by asking a different way.
+pub fn joining_code_is_retryable(code: &str) -> bool {
+    matches!(
+        code,
+        "service_unavailable" | "internal_error"
+        | "rate_limited"
+        // Scoped to a session, a challenge, or a timestamp the next pass
+        // re-creates. The open service runs beside a droplet's first clock sync,
+        // so an instant outside the service's tolerance clears the way an expired
+        // challenge does: the next pass signs a new one.
+        | "invalid_session"
+        | "challenge_expired"
+        | "challenge_not_found"
+        | "not_ready"
+        | "timestamp_out_of_range"
+        // Upstream documents this 410 but has never implemented it, so a grep of
+        // that repo finds it only in `JOINING_SERVICE_API.md`. Listed against the
+        // documented contract: shipped later and unlisted, it would hard-stop a
+        // run over a session the next pass simply re-creates.
+        | "session_expired"
+    )
+}
+
+/// `POST /join` for a key that already holds a ready session on the network it
+/// names. The service's own 409 answers itself: reconnect instead.
+pub const AGENT_ALREADY_JOINED: &str = "agent_already_joined";
+
+/// `POST /reconnect` for a key holding no ready session.
+pub const AGENT_NOT_JOINED: &str = "agent_not_joined";
+
+/// The `{ "error": { "code", "message" } }` envelope the router and the joining
+/// service (`Holo-Host/joining-service`, its `errorJson` helper) both answer a
+/// fault in.
+#[derive(serde::Deserialize)]
+pub struct ErrorEnvelope {
+    pub error: ErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ErrorBody {
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joining_codes_split_into_wait_and_stop() {
+        for code in [
+            "service_unavailable",
+            "internal_error",
+            "rate_limited",
+            "invalid_session",
+            "challenge_expired",
+            "challenge_not_found",
+            "not_ready",
+            "timestamp_out_of_range",
+            "session_expired",
+        ] {
+            assert!(joining_code_is_retryable(code), "{code} is waitable");
+        }
+        for code in [
+            "unknown_network",
+            "join_rejected",
+            AGENT_ALREADY_JOINED,
+            AGENT_NOT_JOINED,
+            "invalid_agent_key",
+            "verification_failed",
+            "agent_revoked",
+            "missing_claims",
+        ] {
+            assert!(
+                !joining_code_is_retryable(code),
+                "{code} does not clear by repeating the same request"
+            );
+        }
+        // A code added upstream after this binary was built is not waitable.
+        assert!(!joining_code_is_retryable("some_code_added_upstream"));
+    }
 
     #[test]
     fn typed_codes_classify_regardless_of_wording() {
