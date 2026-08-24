@@ -1,30 +1,16 @@
-//! Fresh-membrane-proof acquisition from the TARGET release's joining service
-//! for the carried key. The old proof is never reused (proof requirements can
-//! change per version); only the agent key is continuous.
-//!
-//! Mirrors the fleet's existing `agent_allow_list` join flow
-//! (`automation/packages/unyt-deploy`), which is how a key that has NOT been
-//! here before gets its proof: `POST /join` → if pending, sign the
-//! challenge nonce with the carried key via lair → `POST /join/:session/verify`
-//! → `GET /join/:session/provision`, which returns the per-role membrane proofs
-//! and dna modifiers. Nonce signing is the same `lair-sign` invocation the
-//! fleet uses, factored behind [`NonceSigner`] so the HTTP flow is unit-tested
-//! without lair.
+//! Fresh membrane proof for the carried key from the TARGET release's joining
+//! service. The old proof is never reused, since proof requirements can change
+//! per version; only the agent key is continuous. The flow mirrors the fleet's
+//! own (`automation/packages/unyt-deploy`), down to the `lair-sign` invocation
+//! that answers the `agent_allow_list` challenge.
 //!
 //! `POST /join` is NOT idempotent: for a key that already holds a ready session
 //! it answers `409 agent_already_joined` and names `POST /reconnect` as the way
-//! through, and a ready session never expires. So [`provision_agent`] is the
-//! whole idempotent operation: it joins, or reconnects when the service says
-//! this key is already in. Every caller gets a provision whether or not the
-//! agent has been here before. Ordered the way the unyt app's own recovery is
-//! (its `network-manager.ts`, `recoverAlreadyJoined`): join first, reconnect
-//! only on the 409, so a key that has never been here pays nothing for it. The
-//! app ALSO reconnects before joining at startup, off local state saying it has
-//! joined; there is no such state here, so only the 409 can tell us.
-//!
-//! Every failure leaving this module is typed by whether a later pass could
-//! answer differently ([`JoinError`]), because the open service's retry of a
-//! transient one is unbounded.
+//! through, and a ready session never expires. So [`provision_agent`] joins, or
+//! reconnects when that 409 says this key is already in, the order the unyt
+//! app's `recoverAlreadyJoined` runs in. The app can also reconnect BEFORE
+//! joining (`tryReconnect`), off a locally held agent key; there is no such
+//! state here, so only the 409 can tell us.
 
 use std::process::Command;
 use std::time::Duration;
@@ -42,25 +28,21 @@ use crate::dna_errors::{
 /// A joining failure, typed by whether trying again could ever answer
 /// differently. The open service retries a transient failure without bound, so
 /// a refusal only an operator can lift has to be distinguishable HERE: mapped
-/// onto that arm it loops forever, one repeating back-off line where a nonzero
-/// exit and the joining service's own reason belong.
+/// onto that arm it loops forever on a back-off line, where a nonzero exit and
+/// the service's own reason belong.
 ///
-/// Deliberately NOT a `std::error::Error`. That impl would let anyhow's blanket
+/// Deliberately NOT a `std::error::Error`: that impl would let anyhow's blanket
 /// conversion absorb a `JoinError` on any caller's `?`, silently dropping the
-/// classification this type exists to carry; without it, every caller has to
-/// decide, and the module's own `?` cannot erase one either.
+/// classification this type exists to carry.
 #[derive(Debug)]
 pub enum JoinError {
-    /// The service refused this agent as it stands, and will keep refusing it:
-    /// an unregistered happ_id, an agent off the allow list, a signature it
-    /// rejects, or a provision response carrying no entry for the role.
+    /// The service refused this agent as it stands and will keep refusing it.
     Permanent(anyhow::Error),
     /// Transport failure, a 5xx, or a refusal scoped to one session or challenge.
     Transient(anyhow::Error),
 }
 
 impl JoinError {
-    /// The failure itself, for a caller adding context or rendering the chain.
     pub fn cause(&self) -> &anyhow::Error {
         match self {
             Self::Permanent(e) | Self::Transient(e) => e,
@@ -68,52 +50,42 @@ impl JoinError {
     }
 }
 
-/// What the joining service returns from `provision` for THIS migration's
-/// configured role: its membrane proof (base64) and the network's DNA
-/// modifiers. The seed takes precedence over any configured one at install;
-/// the properties have no configured counterpart, so this is their ONLY source,
-/// and the install applies them verbatim.
+/// What the joining service returns from `provision` for the migrating role.
 #[derive(Debug, Clone, Default)]
 pub struct Provision {
-    /// Base64 membrane proof for the role, or `None` if the role needs none:
-    /// the joining service omits it for a role with no configured DNA hash.
+    /// `None` where the role needs no proof: the joining service omits it for a
+    /// role with no configured DNA hash.
     pub membrane_proof: Option<String>,
     pub network_seed: Option<String>,
-    /// The network's DNA properties (`progenitor_pubkey` / `joining_server_signer`
-    /// on our fleet). Both modifiers are hashed into the DNA hash, so the install
-    /// must apply these — the happ manifest declares none, and every other fleet
-    /// installer supplies them from the same release config the joining service
-    /// serves here. Held as `YamlProperties` (a `serde_yaml::Value`, IndexMap-
-    /// backed) rather than a `serde_json::Value`, so the map keeps the wire order:
-    /// properties are msgpack-encoded into the hash and a reordered map is a
-    /// different DNA.
+    /// Both modifiers are hashed into the DNA hash, so the install must apply
+    /// these; the happ manifest declares none. `YamlProperties` rather than a
+    /// `serde_json::Value` because its IndexMap keeps the wire order, and a
+    /// reordered map msgpack-encodes to a different DNA.
     pub properties: Option<YamlProperties>,
 }
 
-/// Signs a freshness nonce with the carried key, returning the base64 ed25519
-/// signature. The seam between the HTTP flow and lair.
+/// Signs with the carried key, returning the base64 ed25519 signature.
 ///
 /// The argument is the base64 of the bytes to sign, and the signature covers
-/// those DECODED bytes: that is what `lair-sign --data` does, and what both
-/// verifiers check against (the join challenge's own base64 nonce, and the
-/// reconnect timestamp's UTF-8).
+/// those DECODED bytes: that is what `lair-sign --data` does. So the join
+/// passes the challenge's own base64 nonce, and the reconnect passes
+/// `base64(timestamp)`, because the service verifies that one over the
+/// timestamp's raw UTF-8.
 pub trait NonceSigner {
     fn sign_nonce(&self, nonce_b64: &str) -> Result<String>;
 }
 
-/// The production signer: shell out to `lair-sign` against the local lair (the
-/// same command the fleet's deploy runs, but local rather than over SSH — the
-/// open service is on the new droplet). Output is the trimmed base64 signature.
+/// The production signer: `lair-sign` against the local lair, the same command
+/// the fleet's deploy runs over SSH.
 pub struct LairSigner {
     pub connection_url: String,
     pub passphrase: String,
-    /// The carried key's ed25519 component, base64 (the 32 bytes after the
-    /// 3-byte holo_hash prefix), as `lair-sign --pub-key` expects.
+    /// The carried key's ed25519 component, base64, as `lair-sign --pub-key`
+    /// expects.
     pub pub_key_ed25519_b64: String,
 }
 
 impl LairSigner {
-    /// Build from the carried agent key + lair connection details.
     pub fn new(agent_key: &AgentPubKey, connection_url: String, passphrase: String) -> Self {
         Self {
             connection_url,
@@ -150,9 +122,8 @@ impl NonceSigner for LairSigner {
     }
 }
 
-/// The ed25519 portion of a holo_hash agent key, base64 — `lair-sign`'s
-/// `--pub-key`. A holo_hash `AgentPubKey` is `0x84 0x20 0x24` ++ 32 core bytes
-/// ++ 4-byte location; the raw signing key is those 32 core bytes.
+/// The ed25519 portion of a holo_hash agent key, base64, for `lair-sign`'s
+/// `--pub-key`: the 32 core bytes, without the prefix or the location suffix.
 pub fn agent_key_to_ed25519_b64(agent_key: &AgentPubKey) -> String {
     base64_of(agent_key.get_raw_32())
 }
@@ -216,12 +187,10 @@ struct DnaModifiers {
     properties: Option<YamlProperties>,
 }
 
-/// Pull `role_name`'s provisioning data out of the decoded response, erroring
-/// by name rather than defaulting when the role is missing. A response shaped
-/// for a different wire contract (e.g. the retired top-level
-/// `membrane_proofs`/`dna_modifiers` keys) decodes to an EMPTY `roles` map
-/// here, so this must fail rather than let an absent role's data flow to the
-/// install as `None`.
+/// Pull `role_name`'s data out of the decoded response. A body shaped for a
+/// different wire contract (the retired top-level `membrane_proofs` keys)
+/// decodes to an EMPTY `roles` map rather than failing, so a missing role has
+/// to error here instead of reaching the install as `None`s.
 fn provision_for_role(
     mut response: ProvisionResponse,
     role_name: &str,
@@ -244,12 +213,11 @@ fn provision_for_role(
     })
 }
 
-/// A failed call. What the answer WAS survives structurally, not only as text
-/// inside the message, because a caller may act on it rather than report it:
-/// `agent_already_joined` routes to the reconnect that answers it, and the
-/// status is how [`reconnect_outcome`] tells a missing route from a refusal.
-/// Both are `None` on a transport failure; `code` alone is `None` when the body
-/// carried no error envelope.
+/// A failed call, keeping what the answer WAS structurally rather than only as
+/// message text, because a caller may act on it: `agent_already_joined` routes
+/// to the reconnect, and the status is how [`reconnect_outcome`] tells a missing
+/// route from a refusal. Both are `None` on a transport failure, and `code`
+/// alone is `None` when the body carried no error envelope.
 struct WireFailure {
     status: Option<StatusCode>,
     code: Option<String>,
@@ -276,20 +244,16 @@ impl WireFailure {
     }
 }
 
-/// Every step but the join itself only wants the classification, so `?` erases
-/// the code for them rather than making each site say so.
+/// Every step but the join wants only the classification, so `?` drops the code.
 impl From<WireFailure> for JoinError {
     fn from(failure: WireFailure) -> Self {
         failure.error
     }
 }
 
-/// Sends `req` and decodes a successful response as `T`. A non-2xx status is
-/// reported WITH the response body, the joining service's structured error
-/// (`{ "error": { "code": ..., "message": ... } }`), rather than just the
-/// status code: `reqwest::Response::error_for_status()` alone discards the
-/// body, which is the only place a rejection reason (`unknown_network`,
-/// `join_rejected`, ...) is carried.
+/// Sends `req` and decodes a 2xx as `T`. A non-2xx is reported WITH its body:
+/// `error_for_status()` alone discards it, and it is the only place the service
+/// carries a rejection reason.
 async fn send_json<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
     what: &str,
@@ -305,8 +269,8 @@ async fn send_json<T: serde::de::DeserializeOwned>(
             .unwrap_or_else(|e| format!("<response body unreadable: {e}>"));
         return Err(refusal_outcome(what, status, &body));
     }
-    // A 200 that won't decode is our-side drift, surfaced but retryable, exactly
-    // as `fetch` treats the router's: a flaky body must not kill the migration.
+    // A 200 that won't decode is our-side drift: retryable, since a flaky body
+    // must not kill the migration.
     resp.json().await.map_err(|e| {
         WireFailure::transient(anyhow::Error::new(e).context(format!("decoding {what} response")))
     })
@@ -316,10 +280,10 @@ async fn send_json<T: serde::de::DeserializeOwned>(
 /// classifies the router's, rather than by the HTTP status alone.
 ///
 /// Two signals have to agree before a failure counts as permanent. The body must
-/// carry the service's error envelope, since a 404 is also what the tunnel in
-/// front of it answers while its route is still coming up, and that is nobody
-/// refusing anything. The status must be a client error, since a 5xx is the
-/// service failing rather than judging the request. Anything else retries.
+/// carry the service's error envelope, since a bare 404 is also what the tunnel
+/// in front of it answers from its `http_status:404` catch-all while the route
+/// is coming up, and that is nobody refusing anything. The status must be a
+/// client error, since a 5xx is the service failing rather than judging.
 ///
 /// [`fetch`]: crate::fetch
 fn refusal_outcome(what: &str, status: StatusCode, body: &str) -> WireFailure {
@@ -349,9 +313,9 @@ fn refusal_outcome(what: &str, status: StatusCode, body: &str) -> WireFailure {
     }
 }
 
-/// The `POST /join` body. `network` is the joining service's OWN field name for
-/// the happ_id a joiner asks to join, so the wire key stays theirs while our
-/// side carries the name automation uses for the same value.
+/// The `POST /join` body. `network` is the service's own field name for the
+/// happ_id a joiner asks to join, so the wire key stays theirs while our side
+/// carries the name `automation` uses for the same value.
 #[derive(Serialize)]
 struct JoinRequest<'a> {
     agent_key: &'a str,
@@ -359,14 +323,9 @@ struct JoinRequest<'a> {
     joining_service_happ_id: &'a str,
 }
 
-/// Get `role_name`'s membrane proof + DNA modifiers from `joining_url` for
-/// `agent_key`, whether or not that key has joined this network before: it joins
-/// when it has not, and reconnects when the service says it has. Challenge
-/// nonces are signed with `signer`. `joining_service_happ_id` is the happ_id the
-/// release registered on that service (`publish-joining-modifiers.sh`), sent as
-/// the `network` field so the request lands on the release's own network rather
-/// than the joining service's static default. Errors if the provision response's
-/// `roles` map carries no entry for `role_name`.
+/// Get `role_name`'s membrane proof and DNA modifiers for `agent_key`, joining
+/// or reconnecting as the service's answer requires. Errors if the provision
+/// response's `roles` map carries no entry for `role_name`.
 pub async fn provision_agent(
     client: &reqwest::Client,
     joining_url: &str,
@@ -408,8 +367,6 @@ pub async fn provision_agent(
     provision_for_role(provision, role_name)
 }
 
-/// Carry a `POST /join` response through to the ready session its provision
-/// hangs off, answering the `agent_allow_list` challenge when there is one.
 async fn session_from_join(
     client: &reqwest::Client,
     base: &str,
@@ -417,12 +374,10 @@ async fn session_from_join(
     signer: &dyn NonceSigner,
 ) -> std::result::Result<String, JoinError> {
     match join.status.as_str() {
-        // Already cleared (e.g. an allow-list with no challenge) → provision.
         "ready" => Ok(join.session),
         "pending" => {
-            // The challenge set comes from the network's configured auth
-            // methods, so a set this flow cannot answer is the same set on
-            // every pass: permanent, like an unparseable one.
+            // The challenge set comes from the network's configured auth methods,
+            // so a set this flow cannot answer is the same on every pass.
             let challenge = join
                 .challenges
                 .iter()
@@ -449,10 +404,9 @@ async fn session_from_join(
                 "POST /join/:session/verify",
             )
             .await?;
-            // `ready` is the only status this flow can carry forward: a
-            // `rejected` verify is the service's no, and a `pending` one
-            // means a second challenge our single-challenge flow never
-            // answers. Neither changes on the next pass.
+            // Neither other status changes on the next pass: a `rejected`
+            // verify is the service's no, and a `pending` one means a second
+            // challenge this single-challenge flow never answers.
             if verify.status != "ready" {
                 return Err(JoinError::Permanent(anyhow!(
                     "join verify status {} (expected ready)",
@@ -461,10 +415,8 @@ async fn session_from_join(
             }
             Ok(join.session)
         }
-        // A 2xx `rejected` is the service's considered no: the agent is not on
-        // the network's allow list, no configured auth method can admit it, or
-        // its invite code is wrong. Each needs an operator, so none of them
-        // clears by asking again.
+        // The service's considered no arrives on a 2xx, and needs an operator:
+        // not on the allow list, no auth method that admits it, a wrong invite.
         "rejected" => {
             let detail = join
                 .reason
@@ -475,8 +427,7 @@ async fn session_from_join(
             )))
         }
         // `status` is a fixed enum upstream, so an unknown value is contract
-        // drift. Surfaced rather than retried, the same call `fetch` makes
-        // for a router error code this binary has never seen.
+        // drift: surfaced rather than retried forever.
         other => {
             let detail = join
                 .reason
@@ -489,10 +440,9 @@ async fn session_from_join(
     }
 }
 
-/// The `POST /reconnect` body. `network` selects which of this agent's own ready
-/// sessions to hand back, so it must be the SAME value the join sent: the
-/// service scopes both lookups by it, and a reconnect naming another network
-/// answers `agent_not_joined` for a key that has plainly joined.
+/// The `POST /reconnect` body. `network` must be the SAME value the join sent:
+/// the service scopes its session lookup by it, and another network answers
+/// `agent_not_joined` for a key that has plainly joined.
 #[derive(Serialize)]
 struct ReconnectRequest<'a> {
     agent_key: &'a str,
@@ -508,10 +458,9 @@ struct ReconnectResponse {
     session: Option<String>,
 }
 
-/// Recover the ready session of a key the service has already admitted, so its
-/// provision can be re-fetched. Proof of possession is a signature over a fresh
-/// timestamp rather than a server-issued nonce, so nothing cached from the
-/// original join is needed.
+/// Recover the ready session of a key the service has already admitted. Proof
+/// of possession is a signature over a fresh timestamp rather than a
+/// server-issued nonce, so nothing cached from the original join is needed.
 async fn reconnect_session(
     client: &reqwest::Client,
     base: &str,
@@ -546,23 +495,19 @@ async fn reconnect_session(
     })
 }
 
-/// Classify a reconnect refusal. Two answers are read differently here than the
-/// shared rules read them, because reaching this step at all is evidence the
-/// shared rules do not have.
+/// Classify a reconnect refusal. Two answers read differently here than under
+/// the shared rules, because reaching this step at all is evidence they do not
+/// have: `POST /join` answered in the service's own envelope on this same pass,
+/// so the service, its router and the tunnel are all up.
 ///
-/// A missing route is one. [`refusal_outcome`] keeps an unattributable 404
-/// retryable because that is also what the tunnel in front of the service
-/// answers while its route is still coming up. That ambiguity is already
-/// discharged by the time we are here: `POST /join` answered in the service's
-/// own envelope on this same pass, so the service, its router and the tunnel are
-/// all up. A 404 or 405 now means the route is absent, which no retry creates,
-/// and treating it as transient loops until an operator notices.
+/// A 404 or 405 is therefore an absent route, not the warming tunnel
+/// [`refusal_outcome`] keeps retryable, and no retry creates a route.
 ///
-/// `agent_not_joined` is the other: permanent as an ANSWER but not as a
-/// SITUATION, since it contradicts the 409 that sent us here. Upstream's
-/// joined-at-all lookup prefers a ready session over a pending one across every
-/// network, and its scoped lookup is byte-identical to the join's, so the two
-/// can only disagree while the store is changing under us.
+/// `agent_not_joined` is permanent as an ANSWER but not as a SITUATION, since it
+/// contradicts the 409 that sent us here. Upstream's joined-at-all lookup prefers
+/// a ready session over a pending one across every network, and its scoped lookup
+/// is byte-identical to the join's, so the two can only disagree while the store
+/// is changing under us.
 fn reconnect_outcome(failure: WireFailure) -> JoinError {
     let route_is_absent = failure.unattributable()
         && matches!(
@@ -591,16 +536,14 @@ fn cause_of(error: JoinError) -> anyhow::Error {
     }
 }
 
-/// The reconnect's freshness token, as a whole-second UTC RFC 3339 instant. The
-/// service parses it with JavaScript's `Date`, whose specified format carries at
-/// most millisecond precision, so the sub-second digits `Timestamp` would print
-/// are dropped rather than left to a parser's leniency.
+/// The reconnect's freshness token, whole seconds because the service parses it
+/// with JavaScript's `Date`, whose specified format stops at millisecond
+/// precision.
 fn reconnect_timestamp() -> String {
     let whole_seconds = crate::state_file::now_us().div_euclid(1_000_000);
     Timestamp::from_micros(whole_seconds * 1_000_000).to_string()
 }
 
-/// A `reqwest` client with a sane timeout for the joining-service calls.
 pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -627,8 +570,8 @@ mod tests {
         }
     }
 
-    /// Stands in for lair, deriving the signature from the nonce so a test can
-    /// assert WHICH nonce was signed without a keystore.
+    /// Derives the signature from the nonce, so a test can assert WHICH nonce
+    /// was signed without a keystore.
     struct EchoSigner;
     impl NonceSigner for EchoSigner {
         fn sign_nonce(&self, nonce_b64: &str) -> Result<String> {
@@ -636,16 +579,13 @@ mod tests {
         }
     }
 
-    /// One request as a fixture sees it. The request LINE matters as much as the
-    /// body here: it is the only place the session a step was addressed to
-    /// appears, and which session that is decides whether a recovery worked.
+    /// One request as a fixture sees it. The request LINE is the only place the
+    /// session a step was addressed to appears.
     struct Request {
         line: String,
         body: String,
     }
 
-    /// Reads one HTTP/1.1 request off `socket`, using Content-Length to know how
-    /// far past the header terminator to read.
     async fn read_request(socket: &mut TcpStream) -> Request {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -699,21 +639,17 @@ mod tests {
         AgentPubKey::from_raw_36(vec![9; 36])
     }
 
-    /// Drives the happy path against a fixture answering an already-ready join
-    /// and then a one-role provision, returning the `POST /join` body it sent.
     async fn captured_join_body(joining_service_happ_id: &str) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(None));
         let captured_writer = captured.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            // POST /join: capture the body, answer already-ready (no challenge).
             let (mut socket, _) = listener.accept().await.unwrap();
             let body = read_request(&mut socket).await.body;
             *captured_writer.lock().unwrap() = Some(body);
             write_json_response(&mut socket, r#"{"session":"s1","status":"ready"}"#).await;
 
-            // GET /join/s1/provision.
             let (mut socket, _) = listener.accept().await.unwrap();
             let _ = read_request(&mut socket).await;
             write_json_response(
@@ -746,8 +682,6 @@ mod tests {
         serde_json::from_str(&body).expect("join body is JSON")
     }
 
-    /// Runs `POST /join` against a fixture answering `status_line` with `body`,
-    /// and returns the failure that came back.
     async fn join_failure(status_line: &'static str, body: &'static str) -> JoinError {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -770,13 +704,8 @@ mod tests {
         .expect_err("the fixture answers a failure")
     }
 
-    /// The wire-level proof for this change: `provision_agent` must send the
-    /// release's registered happ_id under the joining service's own `network`
-    /// key, alongside the agent key. Omitting it is exactly what makes that
-    /// service silently resolve its static default network instead of the
-    /// release's own. Both shapes a fleet really configures are covered: prod
-    /// registers under `release_version` verbatim (a happ_id that merely reads
-    /// like a version), local-testnet under the static literal `unyt`.
+    /// Both shapes a fleet configures go through verbatim: a prod happ_id that
+    /// merely reads like a version, and local-testnet's literal `unyt`.
     #[tokio::test]
     async fn join_sends_the_configured_happ_id_as_the_services_network_field() {
         for happ_id in ["v0.99.0", "unyt"] {
@@ -789,11 +718,6 @@ mod tests {
         }
     }
 
-    /// A 4xx names a configuration this joining service will go on refusing (an
-    /// unregistered happ_id, a key off the allow list), so it must come back
-    /// PERMANENT: on the caller's retry arm the open service asks again forever.
-    /// It must also still carry the service's own reason: `error_for_status()`
-    /// alone would discard the body holding it.
     #[tokio::test]
     async fn a_4xx_join_is_permanent_and_keeps_the_error_bodys_reason() {
         let err = join_failure(
@@ -807,9 +731,7 @@ mod tests {
         assert!(msg.contains("network not registered"), "{msg}");
     }
 
-    /// The joining service's considered no comes back on a 2xx: an agent off the
-    /// release's allow list produces no challenges, which it reports as a
-    /// `rejected` status with a reason. Only an operator can lift it.
+    /// The service's considered no comes back on a 2xx, not an error status.
     #[tokio::test]
     async fn a_rejected_join_status_is_permanent() {
         let err = join_failure(
@@ -822,9 +744,6 @@ mod tests {
         assert!(msg.contains("Agent is not eligible"), "{msg}");
     }
 
-    /// A service failing, rather than judging the request, keeps the unbounded
-    /// retry it has always had: its own 5xx, and the codes scoped to one session
-    /// or challenge that the next pass re-creates from `POST /join`.
     #[tokio::test]
     async fn a_server_side_or_session_scoped_refusal_stays_transient() {
         for (status_line, body) in [
@@ -862,10 +781,6 @@ mod tests {
         }
     }
 
-    /// The tunnel in front of the joining service answers 404 from its catch-all
-    /// while its route is still coming up, and a proxy answers HTML. Neither is
-    /// the service refusing anything, and the missing error envelope is what says
-    /// so: a 4xx nobody can attribute to the service must not end the run.
     #[tokio::test]
     async fn a_4xx_without_the_services_error_envelope_stays_transient() {
         let err = join_failure("404 Not Found", "<html><body>404 not found</body></html>").await;
@@ -876,8 +791,6 @@ mod tests {
         );
     }
 
-    /// A joining service that isn't answering yet (the new droplet coming up
-    /// beside it) is the transient case the retry arm exists for.
     #[tokio::test]
     async fn an_unreachable_joining_service_is_transient() {
         // Bind then drop, so the port is one nothing is listening on.
@@ -904,10 +817,9 @@ mod tests {
         );
     }
 
-    /// A network configured with auth methods this flow cannot answer issues a
-    /// challenge set with no `agent_allow_list` entry, and issues the same set on
-    /// every pass. Same for a challenge carrying no nonce, and for a status
-    /// upstream has added since this binary was built.
+    /// Two a network's auth-method config produces on every pass, no
+    /// `agent_allow_list` challenge and no nonce, plus a status upstream added
+    /// after this binary was built.
     #[tokio::test]
     async fn a_join_this_flow_cannot_carry_forward_is_permanent() {
         for body in [
@@ -924,9 +836,6 @@ mod tests {
         }
     }
 
-    /// The last step has its own refusals, and their classification has to reach
-    /// the caller the way `POST /join`'s does rather than being swallowed or
-    /// re-wrapped on the way out.
     #[tokio::test]
     async fn a_refusal_at_the_provision_step_propagates() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -963,10 +872,8 @@ mod tests {
         assert!(msg.contains("provision"), "{msg}");
     }
 
-    /// The fleet's real path, which no other test drives: a pending join whose
-    /// `agent_allow_list` nonce is signed with the carried key, verified, then
-    /// provisioned. It pins what each step sends, since a wrong challenge id or
-    /// an unsigned nonce otherwise fails only against a live service.
+    /// The fleet's real path, which no other test drives: a wrong challenge id
+    /// or an unsigned nonce otherwise fails only against a live service.
     #[tokio::test]
     async fn the_allow_list_challenge_is_signed_verified_and_provisioned() {
         let verify_body = Arc::new(Mutex::new(None));
@@ -1024,12 +931,11 @@ mod tests {
 
     // ── The already-joined recovery ───────────────────────────────────────
 
-    /// The network every recovery fixture below asks for, so the reconnect can
-    /// be asserted to name the SAME one the join did.
+    /// What every recovery fixture asks for, join and reconnect alike.
     const NETWORK: &str = "v0.99.0";
 
-    /// Runs the whole flow against a fixture answering `script` in order,
-    /// handing back the outcome and every request that reached it.
+    /// Runs the whole flow against a fixture answering `script` in order, handing
+    /// back the outcome and the request line and body of everything that arrived.
     async fn provision_against(
         script: Vec<(&'static str, String)>,
     ) -> (
@@ -1065,9 +971,8 @@ mod tests {
         (outcome, received)
     }
 
-    /// Upstream's own refusal of a re-join: the code, wording and status of its
-    /// `POST /v1/join` already-joined guard, in the envelope its `errorJson`
-    /// helper renders (`joining-service/src/app.ts`).
+    /// Upstream's own refusal of a re-join, verbatim: the status, code and
+    /// wording its `POST /v1/join` guard renders (`joining-service/src/app.ts`).
     fn already_joined_409() -> (&'static str, String) {
         (
             "409 Conflict",
@@ -1080,12 +985,9 @@ mod tests {
         ("200 OK", body.to_string())
     }
 
-    /// The whole point of the change: the carried key joined on an earlier pass
-    /// whose install then failed, so `POST /join` refuses it. The flow must
-    /// still come back with a usable provision, because the run's bounded GD wait
-    /// is spent re-attempting exactly this. The provision has to be fetched
-    /// against the session the RECONNECT named: any other and the recovery has
-    /// only moved the failure.
+    /// The scenario the reconnect exists for: the key joined on an earlier pass
+    /// whose install then failed, and the run's bounded GD wait is spent
+    /// re-attempting exactly this.
     #[tokio::test]
     async fn a_key_that_already_joined_reconnects_for_a_usable_provision() {
         let (outcome, received) = provision_against(vec![
@@ -1117,11 +1019,6 @@ mod tests {
         );
     }
 
-    /// What the reconnect sends, which nothing but a live service would
-    /// otherwise check: the same agent and network the join named, and a
-    /// signature over the TIMESTAMP'S OWN BYTES. The service verifies ed25519
-    /// against `TextEncoder().encode(timestamp)`, so signing anything
-    /// else (the base64 text, a nonce) comes back `invalid_signature`.
     #[tokio::test]
     async fn the_reconnect_proves_key_possession_over_its_timestamp() {
         let (outcome, received) = provision_against(vec![
@@ -1150,10 +1047,6 @@ mod tests {
         );
     }
 
-    /// The timestamp is read by JavaScript's `Date`, whose specified format
-    /// stops at millisecond precision, so this must not hand it the microsecond
-    /// digits a `Timestamp` prints by default, and must be the current instant
-    /// (the service rejects anything more than 300s from its own clock).
     #[test]
     fn the_reconnect_timestamp_is_a_whole_second_utc_instant() {
         let rendered = reconnect_timestamp();
@@ -1176,9 +1069,6 @@ mod tests {
         );
     }
 
-    /// A reconnect the service refuses on its merits is as permanent as the join
-    /// refusals beside it: an operator has to act, and on the retry arm the open
-    /// service would ask forever instead of saying so.
     #[tokio::test]
     async fn a_reconnect_the_service_refuses_is_permanent() {
         let (outcome, _) = provision_against(vec![
@@ -1200,11 +1090,8 @@ mod tests {
         );
     }
 
-    /// A reconnect that cannot find the session the 409 was based on contradicts
-    /// that 409. Both read one store, so they only disagree while it is changing:
-    /// the next pass's join acts on whichever is then true, which makes this the
-    /// retry arm rather than a stop. Both shapes the service has for it are
-    /// covered: the explicit refusal, and a 200 naming no session.
+    /// Both shapes a reconnect that finds no session takes: the explicit
+    /// refusal, and a 200 naming no session.
     #[tokio::test]
     async fn a_reconnect_that_finds_no_session_re_joins_on_the_next_pass() {
         for (second, says) in [
@@ -1228,13 +1115,11 @@ mod tests {
                 "a contradiction between the two calls must be retried, not fatal: {msg}"
             );
             // Transient is the fallthrough for almost everything here, so the
-            // arm alone would also pass for a body that simply failed to decode.
+            // arm alone would pass for a body that simply failed to decode.
             assert!(msg.contains(says), "expected {says:?} in: {msg}");
         }
     }
 
-    /// The reconnect inherits the shared classification for everything else: a
-    /// service that is merely unwell is waited out, exactly as on the join step.
     #[tokio::test]
     async fn a_reconnect_hitting_an_outage_stays_transient() {
         let (outcome, _) = provision_against(vec![
@@ -1256,10 +1141,6 @@ mod tests {
         );
     }
 
-    /// A clock the droplet has not stepped yet is the one reconnect-only refusal
-    /// the shared allowlist had never seen: the signature is over an instant this
-    /// flow mints fresh on every pass, so it must WAIT, not end the run. Ending
-    /// it aborts a migration over a fault that chrony clears in minutes.
     #[tokio::test]
     async fn a_clock_the_service_will_not_accept_yet_waits_rather_than_ending_the_run() {
         let (outcome, _) = provision_against(vec![
@@ -1284,13 +1165,8 @@ mod tests {
         );
     }
 
-    /// A joining service with no reconnect route can never provision a key it has
-    /// already admitted, so this must END the run. It arrives as a bare 404 in
-    /// nobody's envelope, which the shared rule keeps retryable because a warming
-    /// tunnel answers the same way. That ambiguity is spent here: `POST /join`
-    /// just answered in the service's own envelope, so the route is absent rather
-    /// than late, and retrying is an unbounded wait for something nobody is
-    /// bringing up.
+    /// An absent route arrives as a bare 404 in nobody's envelope, which the
+    /// shared rule keeps retryable and `reconnect_outcome` must not.
     #[tokio::test]
     async fn a_joining_service_with_no_reconnect_route_ends_the_run() {
         for absent in [
@@ -1311,21 +1187,14 @@ mod tests {
         }
     }
 
-    /// The join step keeps the opposite reading of the same shape: there, an
-    /// unattributable 404 IS the tunnel still coming up, and ending the run on
-    /// it is the regression that
-    /// `a_4xx_without_the_services_error_envelope_stays_transient` guards.
-    /// Asserted beside the reconnect case so the two never drift into one rule.
+    /// The opposite reading of the same shape, asserted beside the reconnect
+    /// case so the two never drift into one rule.
     #[tokio::test]
     async fn an_unattributable_404_at_the_join_step_still_waits() {
         let err = join_failure("404 Not Found", "<html><body>404 not found</body></html>").await;
         assert!(matches!(err, JoinError::Transient(_)), "{:#}", err.cause());
     }
 
-    /// Lair is local and may still be coming up on a fresh droplet, so a signing
-    /// failure waits. Every OTHER refusal at this step is the service's judgement
-    /// and ends the run, so without this the arm is one `map_err` away from
-    /// killing a migration over a keystore that appears seconds later.
     #[tokio::test]
     async fn a_signer_that_cannot_reach_lair_yet_stays_transient() {
         struct FailingSigner;
@@ -1360,13 +1229,9 @@ mod tests {
         assert!(msg.contains("lair-sign failed"), "{msg}");
     }
 
-    /// The decisive regression test: a payload shaped exactly like the real
-    /// `roles`-keyed endpoint round-trips a role's proof and properties through
-    /// to the `Provision` the install path consumes, proving the fix reaches
-    /// where the DNA hash is decided, not just the decode step.
     #[test]
     fn a_real_roles_shaped_payload_reaches_the_install_path() {
-        // Deliberately NOT alphabetical — a decode through a sorted map would
+        // Deliberately NOT alphabetical: a decode through a sorted map would
         // swap these two and silently change the hash.
         let body = r#"{
             "linker_urls": [],
@@ -1394,10 +1259,9 @@ mod tests {
             Some("unyt-local-testnet-b")
         );
 
-        // Hand-computed msgpack for that map in WIRE order — an INDEPENDENT
-        // oracle. Re-encoding the same JSON through the same decoder would pass
-        // even if it sorted the keys, which is precisely the failure to catch.
-        // 0x82 = 2-entry fixmap; 0xb1 / 0xb5 / 0xa9 = fixstr of 17 / 21 / 9 bytes.
+        // Hand-computed msgpack in WIRE order, an INDEPENDENT oracle: re-encoding
+        // the same JSON through the same decoder would pass even if it sorted the
+        // keys. 0x82 = 2-entry fixmap; 0xb1 / 0xb5 / 0xa9 = fixstr of 17 / 21 / 9.
         let mut expected = vec![0x82_u8, 0xb1];
         expected.extend_from_slice(b"progenitor_pubkey");
         expected.push(0xa9);
@@ -1416,10 +1280,6 @@ mod tests {
         );
     }
 
-    /// The regression this whole fix is for: the RETIRED top-level
-    /// `membrane_proofs`/`dna_modifiers` shape must not decode to an empty
-    /// `roles` map that then silently yields `None`s. Pointed at the old shape,
-    /// resolving any role must error, not install on absent modifiers.
     #[test]
     fn the_retired_top_level_shape_errors_instead_of_decoding_to_empty() {
         let old_shape = r#"{
@@ -1439,11 +1299,8 @@ mod tests {
         assert!(matches!(err, JoinError::Permanent(_)));
     }
 
-    /// A `roles` map present but missing the migrating role (e.g. the network
-    /// configured a different role name) must error by name, not silently hand
-    /// back `None`s for a role that in fact exists under a different key. It is
-    /// PERMANENT: the service serves the same roles map to every later pass, so
-    /// naming the role carefully is wasted if the caller then retries forever.
+    /// Permanent because the service serves the same roles map to every later
+    /// pass, so naming the role carefully is wasted if the caller retries.
     #[test]
     fn a_roles_map_missing_the_configured_role_is_a_permanent_error_by_name() {
         let body = r#"{ "roles": { "some_other_role": { "membrane_proof": "cHJvb2Y=" } } }"#;
@@ -1455,10 +1312,8 @@ mod tests {
         assert!(matches!(err, JoinError::Permanent(_)), "{msg}");
     }
 
-    /// A `roles` map carrying MORE than one role must resolve the NAMED one, not
-    /// whichever entry a map iterator happens to yield first. With every other
-    /// fixture in this file a single-entry map, only this one would catch a
-    /// regression to an order-dependent lookup (e.g. `.values().next()`).
+    /// Every other fixture here is a single-entry map, so only this one catches
+    /// a regression to an order-dependent lookup (e.g. `.values().next()`).
     #[test]
     fn provision_for_role_picks_the_named_role_out_of_several() {
         let body = r#"{
@@ -1472,13 +1327,10 @@ mod tests {
         assert_eq!(provision.membrane_proof.as_deref(), Some("cHJvb2Y="));
     }
 
-    /// A provision body with no modifiers at all leaves both fields unset — the
-    /// install then sends no override and the manifest's values stand.
+    /// Three shapes that all mean "no properties to apply", so the install sends
+    /// no override and the manifest's value stands.
     #[test]
     fn provision_without_modifiers_yields_no_properties() {
-        // Three shapes a joining service can legitimately send, all meaning "no
-        // properties to apply" — the install must send no properties override for
-        // each, leaving the manifest's value alone rather than overwriting it.
         let no_modifiers =
             provision_for_role(decode(r#"{ "roles": { "alliance": {} } }"#), "alliance")
                 .expect("alliance role present");
@@ -1499,10 +1351,8 @@ mod tests {
         assert!(explicit_null.properties.is_none());
     }
 
-    /// A role present with no `membrane_proof` key is legitimate (the joining
-    /// service omits it for a role with no configured DNA hash), and it must carry
-    /// through as `None`, for the install-time validator to accept or reject,
-    /// rather than erroring at decode time.
+    /// A role can legitimately carry no proof, so this must reach the
+    /// install-time validator rather than erroring at decode.
     #[test]
     fn a_role_with_no_membrane_proof_carries_through_as_none() {
         let provision = provision_for_role(
@@ -1513,10 +1363,8 @@ mod tests {
         assert!(provision.membrane_proof.is_none());
     }
 
-    /// An EMPTY properties map is not the same as absent: it is a real value the
-    /// DNA hashes (msgpack `0x80`), and the TS installer sends it too (`{}` is
-    /// truthy in JS), so parity requires carrying it through rather than
-    /// collapsing it to `None`.
+    /// An empty map is a real value the DNA hashes, and the TS installer sends
+    /// it too, so parity requires carrying it rather than collapsing it.
     #[test]
     fn an_empty_properties_map_is_carried_not_collapsed_to_none() {
         let provision = provision_for_role(

@@ -57,13 +57,9 @@ pub struct OpenConfig {
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
     /// The `happ_id` the release registered on the joining service
-    /// (`publish-joining-modifiers.sh`, `POST /v1/admin/networks`), sent as that
-    /// service's `network` field on `POST /v1/join`. Named as `automation`
-    /// names it, so one value has one name across both repos, and so it does not
-    /// read as a variant of `network_seed` above: the two are unrelated. Required,
-    /// unlike `network_seed`: the joining service has no fallback source for it,
-    /// and a missing value would silently resolve to the service's static default
-    /// network instead of the release's own.
+    /// (`publish-joining-modifiers.sh`), sent as that service's `network` field.
+    /// Unrelated to `network_seed` above, and required: with no value the service
+    /// silently resolves its own static default network, not the release's.
     pub joining_service_happ_id: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
@@ -183,10 +179,9 @@ mod tests {
     const JOINING_URL: &str = "MIGRATION_AGENT_JOINING_URL";
     const JOINING_SERVICE_HAPP_ID: &str = "MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID";
 
-    /// Puts an env var back the way it was when the guard goes out of scope,
-    /// including on the unwind out of a failed assertion. A cleanup line at the
-    /// end of a test never runs on that path, leaving a process-global value
-    /// behind for every other test in this binary.
+    /// Puts an env var back as it was on scope exit, including the unwind out of
+    /// a failed assertion: a cleanup line at the end of a test never runs on that
+    /// path, and the value is process-global to every other test here.
     struct EnvVarGuard {
         key: &'static str,
         original: Option<String>,
@@ -212,9 +207,6 @@ mod tests {
         }
     }
 
-    /// The guard's two restore paths, checked before the test below trusts it
-    /// with the real variables: a value it must put back, and a variable that
-    /// was never set, each through an unwind that skips any cleanup line.
     fn env_var_guard_restores_what_it_found_even_on_a_panic() {
         const KEY: &str = "MIGRATION_AGENT_ENV_GUARD_SELF_CHECK";
 
@@ -240,12 +232,10 @@ mod tests {
         );
     }
 
-    /// `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID` empty, unset, then set, plus the
-    /// guard the whole test leans on. Deliberately ONE test: the environment is
-    /// process-global, `set_var` is not thread-safe against another thread
-    /// reading it, and libtest runs a binary's tests in parallel. This is the
-    /// only test in this binary that touches the environment, so the mutation
-    /// stays sequential.
+    /// Deliberately ONE test: the environment is process-global, `set_var` is not
+    /// thread-safe against another thread reading it, and libtest runs a binary's
+    /// tests in parallel. This is the only test here that touches the
+    /// environment, so the mutation stays sequential.
     #[test]
     fn open_config_from_env_requires_the_joining_service_happ_id() {
         env_var_guard_restores_what_it_found_even_on_a_panic();
@@ -261,12 +251,10 @@ mod tests {
         let err = OpenConfig::from_env().unwrap_err().to_string();
         assert!(err.contains(JOINING_SERVICE_HAPP_ID), "{err}");
 
-        // The only two shapes a deployed fleet puts here, and they look nothing
-        // alike: prod leaves `joining_service_happ_id` out of release.json, so
-        // the registrar and the open service both fall back to `release_version`
-        // verbatim, while every local-testnet joining instance is one network
-        // with the static happ.id "unyt". Both are opaque ids to this config: a
-        // prod value that reads like a version is still a happ_id.
+        // The only two shapes a deployed fleet puts here: prod falls back to
+        // `release_version` verbatim when release.json names no happ_id, and every
+        // local-testnet joining instance is the one static happ.id "unyt". Both
+        // are opaque ids here, including the one that reads like a version.
         for happ_id in ["v0.99.0", "unyt"] {
             std::env::set_var(JOINING_SERVICE_HAPP_ID, happ_id);
             assert_eq!(

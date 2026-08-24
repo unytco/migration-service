@@ -20,7 +20,6 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Bind a local listener, handing back it and its base URL.
 async fn bind_local() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -28,7 +27,7 @@ async fn bind_local() -> (TcpListener, String) {
 }
 
 /// Answer one request. `false` once the listener can no longer accept, which
-/// ends whichever serving loop is driving it.
+/// ends the serving loop driving it.
 async fn answer(listener: &TcpListener, status_line: &str, body: &str) -> bool {
     let Ok((mut socket, _)) = listener.accept().await else {
         return false;
@@ -44,9 +43,8 @@ async fn answer(listener: &TcpListener, status_line: &str, body: &str) -> bool {
     true
 }
 
-/// Serve `script` in order, one HTTP response per request, then close. Returns
-/// the bound base URL. (Mirrors `tests/fetch.rs`'s helper; each test crate is
-/// standalone, so it carries its own.)
+/// Serve `script` in order, one response per request, then close. (Mirrors
+/// `tests/fetch.rs`'s; each test crate is standalone, so it carries its own.)
 async fn serve(script: Vec<(&'static str, &'static str)>) -> String {
     let (listener, url) = bind_local().await;
     tokio::spawn(async move {
@@ -59,13 +57,11 @@ async fn serve(script: Vec<(&'static str, &'static str)>) -> String {
     url
 }
 
-/// One request answered, which is all a test reaching its fixture once needs.
 async fn one_shot_server(status_line: &'static str, body: &'static str) -> String {
     serve(vec![(status_line, body)]).await
 }
 
-/// Serve `script` in order and then start it again, for a run with no last pass
-/// whose every pass makes the same sequence of calls.
+/// Serve `script` in order and start it again, for a run with no last pass.
 async fn cycling_server(script: Vec<(&'static str, &'static str)>) -> String {
     let (listener, url) = bind_local().await;
     tokio::spawn(async move {
@@ -80,7 +76,6 @@ async fn cycling_server(script: Vec<(&'static str, &'static str)>) -> String {
     url
 }
 
-/// The same answer to every request, for a run with no last pass.
 async fn endless_server(status_line: &'static str, body: &'static str) -> String {
     cycling_server(vec![(status_line, body)]).await
 }
@@ -102,8 +97,8 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 
 const KEEP_RETRYING_WINDOW: Duration = Duration::from_millis(150);
 
-/// Watch the state file until `accepts` takes the persisted record. On watchdog
-/// expiry it hands back the last record read, so a failure says what was there.
+/// Watch the state file until `accepts` takes the record. On expiry the `Err`
+/// carries the last record read, so a failure says what was there.
 async fn persisted_state_reaches(
     state_file: &std::path::Path,
     accepts: impl Fn(&State) -> bool,
@@ -409,17 +404,13 @@ async fn an_installed_app_for_the_wrong_agent_hard_stops() {
     let _ = std::fs::remove_file(&happ);
 }
 
-/// The rail proof that a permanent joining fault ENDS the run. A release whose
-/// happ_id the joining service has never registered answers `POST /join` with a
-/// 400, and no later pass gets a different answer: mapped onto the transient arm
-/// the open service would back off and ask again until an operator noticed, so
-/// the whole supervised loop must return instead, with the service's own reason.
+/// The rail proof that a permanent joining fault ends the run: an unregistered
+/// happ_id gets the same 400 on every pass, so the whole loop must return.
 #[tokio::test]
 async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
     let state_file = tmp_state("unknown-network");
 
-    // Nothing installed yet, so the pass fetches the package and goes to
-    // install, which starts by joining the target release's network.
+    // Nothing installed, so the pass reaches the install and its join.
     let mock = Arc::new(MockConductor::default());
     mock.presence
         .lock()
@@ -442,8 +433,7 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
         happ_path: happ.clone(),
         joining_url: joining,
         network_seed: None,
-        // The local-testnet shape of this id: every local joining instance
-        // registers the one static happ.id "unyt".
+        // The local-testnet shape of this id.
         joining_service_happ_id: "unyt".into(),
         gd_wait_timeout: Duration::from_secs(1800),
     };
@@ -473,8 +463,7 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
         "the failure names the config that has to change: {err}"
     );
 
-    // It never reached the install: the app would have landed on the wrong
-    // network's DNA without the modifiers the join was there to fetch.
+    // Without the join's modifiers the app would land on the wrong network's DNA.
     assert!(
         !mock.calls().contains(&Call::InstallApp),
         "no install without a provision: {:?}",
@@ -493,9 +482,8 @@ async fn an_unregistered_joining_happ_id_ends_the_run_instead_of_retrying() {
     let _ = std::fs::remove_file(&happ);
 }
 
-/// The other half of the classification, at rail level: a joining service that
-/// is merely unwell must still be waited out. Without this, a change that made
-/// every joining failure terminal would pass every other test in this file.
+/// The other half at rail level. Without it, a change making every joining
+/// failure terminal would pass every other test in this file.
 #[tokio::test]
 async fn a_joining_service_outage_keeps_the_run_waiting() {
     let state_file = tmp_state("joining-outage");
@@ -516,8 +504,7 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
     std::fs::write(&happ, b"not a real happ").unwrap();
 
     let connector = MockConnector::shared(mock.clone());
-    // A backoff long enough that the windows below hold a handful of passes,
-    // not hundreds.
+    // Long enough that the windows below hold a handful of passes, not hundreds.
     let mut cfg = cfg(state_file.clone());
     cfg.retry_initial = Duration::from_millis(50);
     cfg.retry_max = Duration::from_millis(50);
@@ -548,8 +535,7 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
     ));
 
     // Half one: the outage reaches the state file, raced against the run's own
-    // return. Every pass rewrites the message, so a single timed read asserts
-    // where that instant landed; the run returning first is the regression.
+    // return. The run returning first is the regression.
     tokio::select! {
         outcome = &mut run => panic!(
             "the run must still be retrying the outage, not have returned: {:?}",
@@ -577,9 +563,6 @@ async fn a_joining_service_outage_keeps_the_run_waiting() {
     let _ = std::fs::remove_file(&happ);
 }
 
-/// A provision whose membrane proof is not base64 is the same string on every
-/// pass, so it must stop the run rather than join the retry arm: the install
-/// cannot be attempted without it.
 #[tokio::test]
 async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
     let state_file = tmp_state("bad-proof");
@@ -647,17 +630,15 @@ async fn a_membrane_proof_that_is_not_base64_ends_the_run() {
     let _ = std::fs::remove_file(&happ);
 }
 
-/// How the joining service answers a re-join by a key it has already admitted,
-/// in the envelope its own handler renders (`joining-service/src/app.ts`).
+/// Upstream's own answer to a re-join by a key it has already admitted
+/// (`joining-service/src/app.ts`).
 const ALREADY_JOINED_409: (&str, &str) = (
     "409 Conflict",
     r#"{"error":{"code":"agent_already_joined","message":"This agent key has already completed joining this network. Use POST /v1/reconnect instead."}}"#,
 );
 
-/// The full recovery a re-entered install now meets: refused, reconnected,
-/// provisioned. The provision carries the modifiers a real one does, since those
-/// and the proof are what the install has to receive for the cell to land on the
-/// network's own DNA rather than beside it.
+/// The full recovery a re-entered install meets: refused, reconnected,
+/// provisioned, carrying the modifiers that decide the cell's DNA hash.
 fn already_joined_then_reconnected() -> Vec<(&'static str, &'static str)> {
     vec![
         ALREADY_JOINED_409,
@@ -672,26 +653,20 @@ fn already_joined_then_reconnected() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// The rail proof for B148, across the pass boundary the bug lives on. An
-/// install that fails on the successor GD is the EXPECTED case the bounded wait
-/// exists for, and it leaves the app uninstalled, so the next pass re-enters
-/// `install` and joins with a key that has already joined. A ready session never
-/// expires, so that 409 is the same answer on every later pass: without the
-/// reconnect the run ends at the first one and the GD budget it was meant to
-/// spend is never spent at all.
-///
-/// Two passes, ended deterministically by the second install's own verdict
-/// rather than by a clock, so what it proves is that the recovery REPEATS.
+/// The pass boundary the bug lives on: an install that fails on the successor
+/// GD leaves the app uninstalled, so the next pass re-enters `install` and joins
+/// with a key that has already joined, meeting that same 409 every time. Two
+/// passes, ended by the second install's own verdict rather than by a clock, so
+/// what it proves is that the recovery REPEATS.
 #[tokio::test]
 async fn a_re_entered_install_reconnects_on_every_pass() {
     let state_file = tmp_state("already-joined");
 
     let mock = Arc::new(MockConductor::default());
     *mock.presence_after_script.lock().unwrap() = Some(AppPresence::Absent);
-    // Pass one fails the way the budget is there for: the successor GD has not
-    // gossiped in yet, which leaves the app uninstalled and sends the loop back
-    // round. Pass two ends the run on a verdict of its own, so the test stops
-    // where it means to instead of on a timer.
+    // Pass one fails the way the budget is there for, leaving the app
+    // uninstalled and the loop going round. Pass two ends the run on a verdict of
+    // its own, so the test stops where it means to instead of on a timer.
     mock.install_result.lock().unwrap().extend([
         Err(anyhow::anyhow!("wasm error: No Global Definition found")),
         Err(anyhow::anyhow!(
@@ -712,8 +687,7 @@ async fn a_re_entered_install_reconnects_on_every_pass() {
         joining_url: joining,
         network_seed: None,
         joining_service_happ_id: "v0.99.0".into(),
-        // Ample, so a run that ends here ended on a verdict and not on the
-        // budget: the point is that the budget CAN be spent, not that it was.
+        // Ample, so this run ends on a verdict and not on the budget.
         gd_wait_timeout: Duration::from_secs(1800),
     };
     let params = OpenParams {
@@ -723,9 +697,8 @@ async fn a_re_entered_install_reconnects_on_every_pass() {
         agent_key: agent(3),
     };
 
-    // The sender stays in scope for the whole run: dropping it closes the
-    // channel, which the loop reads as a shutdown, and this test's point is the
-    // SECOND pass. `never_shutdown` drops it, so it suits single-pass tests only.
+    // The sender stays in scope: dropping it reads as a shutdown, and this test's
+    // point is the SECOND pass. `never_shutdown` drops it, so it suits one pass.
     let (_shutdown_tx, mut sd) = tokio::sync::watch::channel(false);
     let err = tokio::time::timeout(
         WATCHDOG,
@@ -745,9 +718,8 @@ async fn a_re_entered_install_reconnects_on_every_pass() {
         "every pass must recover its own provision and install with it: {:?}",
         mock.calls()
     );
-    // And what the recovery yielded is what the install used. The proof and the
-    // seed decide the cell's DNA hash, so counting installs would pass for a
-    // recovery that handed back nothing.
+    // And what the recovery yielded is what the install used: counting installs
+    // would pass for a recovery that handed back nothing.
     for (pass, spec) in specs.iter().enumerate() {
         assert_eq!(
             spec.membrane_proof.as_deref(),
@@ -770,14 +742,13 @@ async fn a_re_entered_install_reconnects_on_every_pass() {
 }
 
 /// The recovery inherits the classification rather than escaping it: a reconnect
-/// the service itself refuses is as final as a refused join, so the run ends
-/// with that reason instead of asking a service that has already answered.
+/// the service refuses is as final as a refused join.
 #[tokio::test]
 async fn a_reconnect_the_joining_service_refuses_ends_the_run() {
     let state_file = tmp_state("reconnect-refused");
 
-    // A second scripted pass, so a regression that retries fails on this test's
-    // own assertions rather than on an exhausted mock.
+    // The mock answers every pass, so a regression that retries fails on this
+    // test's own assertions rather than on an exhausted mock.
     let mock = Arc::new(MockConductor::default());
     *mock.presence_after_script.lock().unwrap() = Some(AppPresence::Absent);
 

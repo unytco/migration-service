@@ -37,10 +37,9 @@ use crate::probe::{probe_open_state, OpenState};
 use crate::state_file::{Phase, State, Step, VerifyReport};
 use crate::verify::verify_against_ledger;
 
-/// What this migration IS: where to fetch its package from, which DNAs it runs
-/// between, and whose chain it carries. How to reach the machine's own lair is
-/// deliberately not here: only [`run`] needs that, and it takes the signer built
-/// from it, so nothing below has to be handed credentials it never uses.
+/// What this migration IS: the router to fetch its package from, the DNAs it
+/// runs between, and whose chain it carries. Lair credentials are deliberately
+/// not here: only [`run`] needs them, to build the signer it passes down.
 pub struct OpenParams {
     pub router_url: String,
     pub from_dna: DnaHashB64,
@@ -209,7 +208,7 @@ fn gd_wait_exhausted_message(
 
 /// Run the open service to completion (or a hard stop) against the real local
 /// conductor. Thin wrapper over [`run_with`] that supplies the production
-/// [`HamConnector`]; `main.rs` calls this with a [`LairSigner`].
+/// [`HamConnector`]; `main.rs` calls this.
 pub async fn run(
     cfg: &Config,
     open_cfg: &OpenConfig,
@@ -230,13 +229,10 @@ pub async fn run(
 
 /// [`run`] with both external seams injected: the conductor factory, and the
 /// signer standing in for lair. The `shutdown` receiver is installed ONCE by the
-/// caller (`main.rs`) and threaded all the way down into every conductor
-/// (re)connect and sleep. The helpers never install their own handler (that
-/// would leak a task + watch channel each pass and detach the helpers from the
-/// real signal). The `ham`-backed conductor is rebuilt AFTER an install (it
-/// cannot attach until the app cell exists), reusing this same receiver. Tests
-/// supply a mock [`Connector`] + [`NonceSigner`] to drive the whole loop with
-/// neither a live conductor nor a keystore.
+/// caller (`main.rs`) and threaded down into every conductor (re)connect and
+/// sleep; a helper installing its own would leak a task + watch channel each pass
+/// and detach from the real signal. The `ham`-backed conductor is rebuilt AFTER
+/// an install, since it cannot attach until the app cell exists.
 pub async fn run_with(
     connector: &dyn Connector,
     signer: &dyn NonceSigner,
@@ -728,15 +724,10 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
 
 /// Map a joining-service failure onto the open outcome, the joining path's
 /// counterpart to [`install_error_outcome`]. A refusal the service will go on
-/// giving (an unregistered happ_id, an agent off the allow list, a provision
-/// response without the role) is a HARD stop: on the unbounded transient arm the
-/// open service asks again forever, so the operator gets one repeating back-off
-/// line instead of a nonzero exit carrying the service's own reason.
-///
-/// The remedies are listed per STEP because the carried key reaches this service
-/// two ways, and a key that has already joined fails at the reconnect for causes
-/// none of the join's remedies touch. The failure itself names which step it came
-/// from, so the operator reads the matching line rather than the only line.
+/// giving must HARD stop: the transient arm asks again without bound. The
+/// remedies are listed per STEP because a key that has already joined fails at
+/// the reconnect for causes none of the join's remedies touch, and the failure
+/// itself names which step it came from.
 fn join_error_outcome(e: JoinError, open_cfg: &OpenConfig, role_name: &str) -> OpenOutcome {
     match e {
         JoinError::Permanent(e) => OpenOutcome::HardStop(format!(
@@ -957,12 +948,8 @@ mod tests {
         }
     }
 
-    /// The permanent joining faults this classification exists for: a 4xx the
-    /// service will keep giving, and a provision response with no entry for the
-    /// migrating role. On the transient arm the open service backs off and asks
-    /// again with no bound, so the operator sees one line repeat instead of a
-    /// nonzero exit. It is the same reasoning that already makes a rejected
-    /// membrane proof terminal.
+    /// Both permanent shapes: a 4xx the service will keep giving, and a
+    /// provision response with no entry for the migrating role.
     #[test]
     fn a_permanent_joining_fault_hard_stops_and_says_what_to_check() {
         let cfg = open_cfg();
@@ -990,8 +977,6 @@ mod tests {
         ));
     }
 
-    /// A joining service that is unreachable or briefly unwell keeps the
-    /// unbounded back-off-and-re-probe it has always had.
     #[test]
     fn a_transient_joining_fault_stays_on_the_retry_arm() {
         let blip = JoinError::Transient(anyhow::anyhow!("POST /join request: connection refused"));

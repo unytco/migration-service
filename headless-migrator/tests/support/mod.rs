@@ -66,9 +66,8 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
-    /// Answered once the scripted queue runs out. A supervised loop under test
-    /// has no last pass, so without this the script's length is what ends the
-    /// run, in a panic naming the fixture.
+    /// Answered once the scripted queue runs out: a supervised loop has no last
+    /// pass, so otherwise the script's length is what ends the run.
     pub presence_after_script: Mutex<Option<AppPresence>>,
     /// The `CellId` each scripted install reports the provisioned cell landed on
     /// — the open service checks it against the migration target (DNA + agent).
@@ -77,9 +76,9 @@ pub struct MockConductor {
     /// "can't be read", which the open service treats as unknown rather than a
     /// mismatch — so the existing already-installed tests are unaffected.
     pub installed_cell: Mutex<Option<CellId>>,
-    /// Every `InstallSpec` the loop actually installed with. The membrane proof
-    /// and DNA modifiers inside decide the cell's DNA hash, so a test that only
-    /// counts installs cannot see whether the RIGHT ones arrived.
+    /// Every `InstallSpec` the loop installed with. The proof and the modifiers
+    /// inside are what the install has to receive, and counting installs cannot
+    /// see them.
     pub install_specs: Mutex<Vec<InstallSpec>>,
 }
 
@@ -233,9 +232,7 @@ impl Connector for MockConnector {
     }
 }
 
-/// Stands in for lair, deriving the signature from what it was asked to sign so
-/// the rail drives the joining service's signed steps with no keystore. The real
-/// [`headless_migrator::joining::LairSigner`] shells out to `lair-sign`, which is
+/// Stands in for lair: the real `LairSigner` shells out to `lair-sign`, which is
 /// on no test runner's PATH.
 pub struct EchoSigner;
 
