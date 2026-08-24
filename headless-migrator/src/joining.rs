@@ -71,11 +71,11 @@ impl JoinError {
 /// What the joining service returns from `provision` for THIS migration's
 /// configured role: its membrane proof (base64) and the network's DNA
 /// modifiers. The seed takes precedence over any configured one at install;
-/// the properties have no configured counterpart — this is their ONLY source,
+/// the properties have no configured counterpart, so this is their ONLY source,
 /// and the install applies them verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct Provision {
-    /// Base64 membrane proof for the role, or `None` if the role needs none —
+    /// Base64 membrane proof for the role, or `None` if the role needs none:
     /// the joining service omits it for a role with no configured DNA hash.
     pub membrane_proof: Option<String>,
     pub network_seed: Option<String>,
@@ -218,8 +218,8 @@ struct DnaModifiers {
 
 /// Pull `role_name`'s provisioning data out of the decoded response, erroring
 /// by name rather than defaulting when the role is missing. A response shaped
-/// for a different wire contract — e.g. the retired top-level
-/// `membrane_proofs`/`dna_modifiers` keys — decodes to an EMPTY `roles` map
+/// for a different wire contract (e.g. the retired top-level
+/// `membrane_proofs`/`dna_modifiers` keys) decodes to an EMPTY `roles` map
 /// here, so this must fail rather than let an absent role's data flow to the
 /// install as `None`.
 fn provision_for_role(
@@ -229,7 +229,7 @@ fn provision_for_role(
     let role = response.roles.remove(role_name).ok_or_else(|| {
         JoinError::Permanent(anyhow!(
             "joining-service provision response has no entry for role '{role_name}' in its \
-             roles map (roles present: {:?}) — its membrane proof and DNA modifiers are unknown",
+             roles map (roles present: {:?}), so its membrane proof and DNA modifiers are unknown",
             response.roles.keys().collect::<Vec<_>>()
         ))
     })?;
@@ -285,8 +285,8 @@ impl From<WireFailure> for JoinError {
 }
 
 /// Sends `req` and decodes a successful response as `T`. A non-2xx status is
-/// reported WITH the response body — the joining service's structured error
-/// (`{ "error": { "code": ..., "message": ... } }`) — rather than just the
+/// reported WITH the response body, the joining service's structured error
+/// (`{ "error": { "code": ..., "message": ... } }`), rather than just the
 /// status code: `reqwest::Response::error_for_status()` alone discards the
 /// body, which is the only place a rejection reason (`unknown_network`,
 /// `join_rejected`, ...) is carried.
@@ -707,7 +707,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            // POST /join — capture the body, answer already-ready (no challenge).
+            // POST /join: capture the body, answer already-ready (no challenge).
             let (mut socket, _) = listener.accept().await.unwrap();
             let body = read_request(&mut socket).await.body;
             *captured_writer.lock().unwrap() = Some(body);
@@ -1362,7 +1362,7 @@ mod tests {
 
     /// The decisive regression test: a payload shaped exactly like the real
     /// `roles`-keyed endpoint round-trips a role's proof and properties through
-    /// to the `Provision` the install path consumes — proving the fix reaches
+    /// to the `Provision` the install path consumes, proving the fix reaches
     /// where the DNA hash is decided, not just the decode step.
     #[test]
     fn a_real_roles_shaped_payload_reaches_the_install_path() {
@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     /// A role present with no `membrane_proof` key is legitimate (the joining
-    /// service omits it for a role with no configured DNA hash) — it must carry
+    /// service omits it for a role with no configured DNA hash), and it must carry
     /// through as `None`, for the install-time validator to accept or reject,
     /// rather than erroring at decode time.
     #[test]
