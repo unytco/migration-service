@@ -1,7 +1,7 @@
 //! Agent configuration, read from the environment (mirrors notary-daemon's
 //! `Config::from_env`). The `automation/` installer renders these into the
 //! systemd `EnvironmentFile`; every field has a sensible default except the
-//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and — for the
+//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and for the
 //! open service, `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
 //! `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`, validated by the open command
 //! itself, not here, so close/status need no open-only vars).
