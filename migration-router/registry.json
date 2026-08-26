@@ -27,6 +27,7 @@
           "api": "v1"
         }
       ],
+<<<<<<< Updated upstream
       "published": true,
       "upgrade_targets": [
         "uhC0kOLOyaJ5ZVB6eD6Ucc5fSN0FSYu0I6zTfc9GcakWGRpEMeRQ0"
@@ -40,11 +41,23 @@
       "notaries": [
         {
           "url": "https://notary-1-v0-96-0.unyt.dev",
+=======
+      "published": true
+    },
+    {
+      "dna_hash": "uhC0kjXaHxVB699_dWv4CB9-DUlydfeuPKp72CVvLISDi3MGtb0fd",
+      "version": "alliance-v0.102.0",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.102.0",
+      "notaries": [
+        {
+          "url": "https://notary-1-v0-102-0.unyt.dev",
+>>>>>>> Stashed changes
           "api": "v1"
         }
       ],
       "published": true,
       "upgrade_targets": [
+<<<<<<< Updated upstream
         "uhC0kuFGOovGmmQbKLxaEGZJT6KuU0UuVwf98Rk_l7fXoiik_JKck"
       ]
     },
@@ -104,6 +117,19 @@
       "notaries": [
         {
           "url": "https://notary-1-v0-100-0.unyt.dev",
+=======
+        "uhC0kDevx4e9dXB1ZhQRK2dr7QUa-6nShTBd4ZaO-MHnarnHsxe7r"
+      ]
+    },
+    {
+      "dna_hash": "uhC0kDevx4e9dXB1ZhQRK2dr7QUa-6nShTBd4ZaO-MHnarnHsxe7r",
+      "version": "alliance-v0.103.0",
+      "upgrades_from": "uhC0kjXaHxVB699_dWv4CB9-DUlydfeuPKp72CVvLISDi3MGtb0fd",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.103.0",
+      "notaries": [
+        {
+          "url": "https://notary-1-v0-103-0.unyt.dev",
+>>>>>>> Stashed changes
           "api": "v1"
         }
       ],
