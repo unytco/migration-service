@@ -14,8 +14,8 @@ use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{Phase, State, Step};
 use rave_engine::types::entries::migration::v0_1::SignClosingResponse;
 use rave_engine::types::ledger::CarryForwardUnits;
+use rave_engine::types::units::UnitMap;
 use support::*;
-use zfuel::fuel::ZFuel;
 
 /// A `Config` pointing at a unique temp state file, with snappy retries so the
 /// supervised loop's backoff doesn't slow the test.
@@ -55,6 +55,38 @@ fn tmp_state(name: &str) -> std::path::PathBuf {
 fn never_shutdown() -> ham::ShutdownRx {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     rx
+}
+
+/// Drive one close over an open chain whose ledger owes `fees_owed`, returning
+/// the calls the conductor saw. Everything but the fee gate is held fixed.
+async fn close_with_fees_owed(name: &str, fees_owed: UnitMap) -> Vec<Call> {
+    let tmp = tmp_state(name);
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
+        unit_map(0, 10),
+        CarryForwardUnits::new(),
+        fees_owed,
+    )));
+    *mock.drop_fees.lock().unwrap() = Some(Ok("Fees dropped off".into()));
+    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+    *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
+    mock.sign_responses
+        .lock()
+        .unwrap()
+        .push_back(Ok(SignClosingResponse::Signed {
+            signature: hdi::prelude::Signature([2u8; 64]),
+        }));
+
+    let mut sd = never_shutdown();
+    close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .expect("close run Ok");
+    let _ = std::fs::remove_file(&tmp);
+    mock.calls()
 }
 
 #[tokio::test]
@@ -127,11 +159,11 @@ async fn bad_to_dna_hard_stops_instead_of_looping() {
         .unwrap()
         .push_back(Err(anyhow::anyhow!("No closing state summary found")));
     // Ledger: no fees owed.
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 0),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
-    ));
+        UnitMap::new(),
+    )));
     // Prepare errors with the extern's target pre-check rejection.
     *mock.prepare.lock().unwrap() = Some(Err(anyhow::anyhow!(
         "prepare_closing_summary zome call failed: target DNA DnaHash(uhC0k) \
@@ -210,11 +242,11 @@ async fn fees_owed_drops_before_prepare() {
         .unwrap()
         .push_back(Err(anyhow::anyhow!("No closing state summary found")));
     // Ledger: fees owed → must drop first.
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::from(5i64),
-    ));
+        unit_map(0, 5),
+    )));
     *mock.drop_fees.lock().unwrap() = Some(Ok("Fees dropped off".into()));
     // Prepare: one notary, threshold 1.
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
@@ -256,19 +288,205 @@ async fn fees_owed_drops_before_prepare() {
 }
 
 #[tokio::test]
-async fn no_fee_drop_when_none_owed() {
-    let tmp = tmp_state("no-fee-drop");
+async fn fees_owed_on_a_non_base_unit_also_drops_before_prepare() {
+    // The behavioural gain of the per-unit shape: under a single `ZFuel` a
+    // service-unit debt was unrepresentable, so a chain owing only those would
+    // have prepared its summary with the fees still outstanding.
+    let calls = close_with_fees_owed("fees-non-base-unit", unit_map(3, 5)).await;
+    let drop_idx = calls.iter().position(|c| *c == Call::DropOffFees);
+    let prep_idx = calls
+        .iter()
+        .position(|c| matches!(c, Call::PrepareClosingSummary { .. }));
+    assert!(drop_idx.is_some(), "the debt must be dropped: {calls:?}");
+    assert!(prep_idx.is_some(), "the summary is prepared: {calls:?}");
+    assert!(
+        drop_idx < prep_idx,
+        "drop_off_fees must precede prepare_closing_summary: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn undecodable_ledger_hard_stops_instead_of_looping() {
+    let tmp = tmp_state("undecodable-ledger");
+    let mock = MockConductor::default();
+    // Two scripted probes, so a regression that loops fails on the assertion
+    // below rather than on the mock running out of script.
+    for _ in 0..2 {
+        mock.close_state
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    }
+    *mock.ledger.lock().unwrap() = Some(Err(anyhow::anyhow!(
+        "get_ledger zome call failed: Failed to deserialize response: \
+         invalid type: string \"5\", expected a map"
+    )));
+
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hard-stopped") && err.contains("reading ledger for fee check"),
+        "a schema mismatch must hard-stop, not loop: {err}"
+    );
+    assert!(
+        err.contains("Rebuild the migrator"),
+        "the hard stop names the only remedy: {err}"
+    );
+    assert!(
+        !mock
+            .calls()
+            .contains(&Call::PrepareClosingSummary { target: dna(2) }),
+        "nothing is prepared once the ledger cannot be read: {:?}",
+        mock.calls()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn a_transient_ledger_failure_still_retries() {
+    // The other half of the gate: only a DECODE failure is terminal. A websocket
+    // blip must keep backing off, or an ordinary hiccup mid-window aborts the
+    // close and pages an operator.
+    let tmp = tmp_state("transient-ledger");
     let mock = MockConductor::default();
     mock.close_state
         .lock()
         .unwrap()
         .push_back(Err(anyhow::anyhow!("No closing state summary found")));
-    // Zero fees → no drop.
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Err(anyhow::anyhow!(
+        "get_ledger zome call failed: Failed to call zome: Websocket error: \
+         Websocket closed: No connection"
+    )));
+
+    // `never_shutdown`'s sender is already dropped, so the first backoff ends the
+    // run: reaching it at all proves the failure was classed transient.
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
+        "a transport blip must back off, not hard-stop: {err}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn undecodable_close_state_hard_stops_instead_of_looping() {
+    // The same rule one step earlier: a probe response that will not decode
+    // leaves the chain's real state unknowable, so it must not be folded into
+    // "open, re-prepare" and driven at.
+    let tmp = tmp_state("undecodable-close-state");
+    let mock = MockConductor::default();
+    for _ in 0..2 {
+        mock.close_state
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::anyhow!(
+                "get_migration_close_state zome call failed: Failed to deserialize \
+                 response: missing field `agreement_carry_forward`"
+            )));
+    }
+
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hard-stopped") && err.contains("probing close state"),
+        "an undecodable close state must hard-stop, not loop: {err}"
+    );
+    assert!(
+        !mock.calls().contains(&Call::GetLedger),
+        "the close never proceeds past an unreadable probe: {:?}",
+        mock.calls()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn undecodable_signature_response_hard_stops_without_blaming_the_notaries() {
+    // Reachable when `PrepareCloseResponse` decodes and `SignClosingResponse`
+    // does not, e.g. upgraded notaries answering with a variant this binary does
+    // not know. Collapsed into a per-notary error it substitutes across the whole
+    // list and reports an exhausted N-list, sending the operator to check notary
+    // health for a fault in the binary they are running.
+    let tmp = tmp_state("undecodable-signature");
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
-    ));
+        UnitMap::new(),
+    )));
+    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+    *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(
+        3,
+        closing,
+        vec![agent(70), agent(71)],
+        1,
+    )));
+    // One per notary, so a regression that substitutes fails on the assertion.
+    for _ in 0..2 {
+        mock.sign_responses
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::anyhow!(
+                "request_closing_signature zome call failed: Failed to deserialize \
+                 response: unknown variant `Deferred`"
+            )));
+    }
+
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("hard-stopped") && err.contains("Rebuild the migrator"),
+        "a schema mismatch must hard-stop with its remedy: {err}"
+    );
+    assert!(
+        !err.contains("notary list exhausted"),
+        "the notaries must not be blamed for this binary's schema mismatch: {err}"
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| **c == Call::RequestClosingSignature)
+            .count(),
+        1,
+        "no substitution: {:?}",
+        mock.calls()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn an_undecodable_write_response_still_retries() {
+    // The read/write split: a WRITE whose response did not decode says nothing
+    // about whether the write landed, and the next pass's probe reads that back.
+    // Hard-stopping here would report a close that may well have succeeded as a
+    // failure.
+    let tmp = tmp_state("undecodable-write");
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!("No closing state summary found")));
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
+        unit_map(0, 10),
+        CarryForwardUnits::new(),
+        UnitMap::new(),
+    )));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
     mock.sign_responses
@@ -277,17 +495,41 @@ async fn no_fee_drop_when_none_owed() {
         .push_back(Ok(SignClosingResponse::Signed {
             signature: hdi::prelude::Signature([2u8; 64]),
         }));
+    *mock.close_result.lock().unwrap() = Some(Err(anyhow::anyhow!(
+        "close_agent_chain zome call failed: Failed to deserialize response: \
+         invalid length 32, expected 39"
+    )));
 
     let mut sd = never_shutdown();
-    close::run(&mock, &cfg(&tmp), &mut sd)
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
         .await
-        .expect("close run Ok");
+        .unwrap_err()
+        .to_string();
     assert!(
-        !mock.calls().contains(&Call::DropOffFees),
-        "no fee drop when none owed: {:?}",
-        mock.calls()
+        err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
+        "an undecodable write response must re-probe, not hard-stop: {err}"
     );
     let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn no_fee_drop_when_none_owed() {
+    // Both shapes of "owes nothing": the empty map the DNA keeps (it strips zero
+    // entries), and an explicit zero, so the gate does not rest on that invariant.
+    for (name, owed) in [
+        ("no-fee-drop-empty", UnitMap::new()),
+        ("no-fee-drop-zero", unit_map(0, 0)),
+    ] {
+        let calls = close_with_fees_owed(name, owed).await;
+        assert!(
+            !calls.contains(&Call::DropOffFees),
+            "{name}: no fee drop when none owed: {calls:?}"
+        );
+        assert!(
+            calls.contains(&Call::CloseAgentChain),
+            "{name}: the close still runs: {calls:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -304,11 +546,11 @@ async fn closed_state_retains_agent_and_signature_progress() {
         .lock()
         .unwrap()
         .push_back(Err(anyhow::anyhow!("No closing state summary found")));
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
-    ));
+        UnitMap::new(),
+    )));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(
         7,
@@ -413,11 +655,11 @@ async fn warranted_notary_hard_stops_the_close() {
         .lock()
         .unwrap()
         .push_back(Err(anyhow::anyhow!("No closing state summary found")));
-    *mock.ledger.lock().unwrap() = Some(ledger(
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
         unit_map(0, 10),
         CarryForwardUnits::new(),
-        ZFuel::zero(),
-    ));
+        UnitMap::new(),
+    )));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
     // The notary returns Warranted → the whole migration hard-stops.

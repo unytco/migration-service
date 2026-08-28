@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Tag-driven release workflow.** Pushing a semver tag builds both Rust binaries and publishes them — each with a `.sha256` — as fixed-name GitHub release assets. The tag must match the version in both crates' `Cargo.toml`; they release together, so one tag is one tested pairing of the close-side and open-side halves of a migration.
+- `--version` on `headless-migrator` and `migration-notary`, derived from the crate version. The release assets have fixed filenames, so this is how a deployed binary identifies itself.
 - **router: per-entry `published` visibility gate — customers-last migration surfacing.** Registry `DnaEntry` gains an optional `published` boolean (absent = unpublished): honored by `/v1/update-check`, ignored by `/v1/migrate` + `/v1/migration-options`. Additive + backward-compatible.
 - **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry point stays strict https-only.
 - **router: `latest_build.assets` — the release's downloadable installers, for the in-app updater (release-patterns task 07).** `/v1/update-check`'s `latest_build` carries each asset's `name` + `url` + optional `digest`; the router stays platform-agnostic. Additive + backward-compatible.
@@ -23,7 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Upgrade to Holochain 0.7 + `rave_engine` 0.9.0** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`, `zfuel 0.9.0`, `ham` on branch `main`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
+- **Breaking.** The open service joins the release's own registered network and reads the joining service's roles-keyed provision, and a refusal it can never act on ends the run instead of retrying forever. An existing deployment fails at startup until its environment sets `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`.
+- headless-migrator: an open service whose carried key has already joined reconnects for its membrane proof.
+- **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
+- `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
+- **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.
+- headless-migrator: a debt on any unit blocks a close, not just the base one (`rave_engine` 0.10.0).
+- headless-migrator: a global definition outside its validity window waits under the bounded deadline rather than retrying unbounded.
+- **Upgrade to Holochain 0.7** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`, `ham` on branch `main`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
 - **CI/deploy: every GitHub Actions `uses:` is pinned to an immutable commit SHA with `persist-credentials: false`, and CI now runs on pull requests to `main` as well as `develop`.** Router `compatibility_date` bumped `2024-09-23 → 2024-12-30`.
@@ -45,6 +54,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - router: registry now rejects a fork (two DNAs upgrading from the same predecessor) so forward lookup is unambiguous
 
 ### Fixed
+
+- headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
 
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.

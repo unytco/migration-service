@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use headless_migrator::conductor::{AppPresence, Conductor, InstallSpec};
+use headless_migrator::joining::NonceSigner;
 use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
 use holochain_types::prelude::CellId;
@@ -25,7 +26,6 @@ use rave_engine::types::entries::migration::v0_1::{
 use rave_engine::types::ledger::CarryForwardUnits;
 use rave_engine::types::ledger::Ledger;
 use rave_engine::types::units::UnitMap;
-use zfuel::fuel::ZFuel;
 
 /// Every interaction the mock records, so a test can assert ordering (e.g.
 /// `drop_off_fees` precedes `prepare_closing_summary`).
@@ -56,7 +56,9 @@ pub struct MockConductor {
     /// reports not-migrated — the safe default for mismatch-path tests).
     pub opened_agreement_state: Mutex<Option<headless_migrator::conductor::OpenedAgreementState>>,
     pub calls: Mutex<Vec<Call>>,
-    pub ledger: Mutex<Option<Ledger>>,
+    /// Persistent (never consumed), so a scripted `Err` is a read that fails on
+    /// every pass, the shape a schema mismatch actually has.
+    pub ledger: Mutex<Option<anyhow::Result<Ledger>>>,
     pub drop_fees: Mutex<Option<anyhow::Result<String>>>,
     pub prepare: Mutex<Option<anyhow::Result<PrepareCloseResponse>>>,
     pub sign_responses: Mutex<VecDeque<anyhow::Result<SignClosingResponse>>>,
@@ -64,6 +66,9 @@ pub struct MockConductor {
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
     pub presence: Mutex<VecDeque<anyhow::Result<AppPresence>>>,
+    /// Answered once the scripted queue runs out: a supervised loop has no last
+    /// pass, so otherwise the script's length is what ends the run.
+    pub presence_after_script: Mutex<Option<AppPresence>>,
     /// The `CellId` each scripted install reports the provisioned cell landed on
     /// — the open service checks it against the migration target (DNA + agent).
     pub install_result: Mutex<VecDeque<anyhow::Result<CellId>>>,
@@ -71,6 +76,10 @@ pub struct MockConductor {
     /// "can't be read", which the open service treats as unknown rather than a
     /// mismatch — so the existing already-installed tests are unaffected.
     pub installed_cell: Mutex<Option<CellId>>,
+    /// Every `InstallSpec` the loop installed with. The proof and the modifiers
+    /// inside are what the install has to receive, and counting installs cannot
+    /// see them.
+    pub install_specs: Mutex<Vec<InstallSpec>>,
 }
 
 impl MockConductor {
@@ -99,11 +108,11 @@ impl Conductor for MockConductor {
 
     async fn get_ledger(&self) -> anyhow::Result<Ledger> {
         self.record(Call::GetLedger);
-        self.ledger
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("mock: no ledger scripted"))
+        match self.ledger.lock().unwrap().as_ref() {
+            Some(Ok(l)) => Ok(l.clone()),
+            Some(Err(e)) => Err(anyhow::anyhow!("{e:#}")),
+            None => Err(anyhow::anyhow!("mock: no ledger scripted")),
+        }
     }
 
     async fn drop_off_fees(&self) -> anyhow::Result<String> {
@@ -166,7 +175,11 @@ impl Conductor for MockConductor {
 
     async fn app_presence(&self, _app_id: &str) -> anyhow::Result<AppPresence> {
         self.record(Call::AppPresence);
-        Self::pop(&self.presence, "app_presence")
+        let after_script = self.presence_after_script.lock().unwrap().clone();
+        match after_script {
+            Some(presence) if self.presence.lock().unwrap().is_empty() => Ok(presence),
+            _ => Self::pop(&self.presence, "app_presence"),
+        }
     }
 
     async fn installed_cell_id(
@@ -178,8 +191,9 @@ impl Conductor for MockConductor {
         Ok(self.installed_cell.lock().unwrap().clone())
     }
 
-    async fn install_app(&self, _spec: &InstallSpec) -> anyhow::Result<CellId> {
+    async fn install_app(&self, spec: &InstallSpec) -> anyhow::Result<CellId> {
         self.record(Call::InstallApp);
+        self.install_specs.lock().unwrap().push(spec.clone());
         Self::pop(&self.install_result, "install_app")
     }
 }
@@ -218,6 +232,16 @@ impl Connector for MockConnector {
     }
 }
 
+/// Stands in for lair: the real `LairSigner` shells out to `lair-sign`, which is
+/// on no test runner's PATH.
+pub struct EchoSigner;
+
+impl NonceSigner for EchoSigner {
+    fn sign_nonce(&self, nonce_b64: &str) -> anyhow::Result<String> {
+        Ok(format!("signed:{nonce_b64}"))
+    }
+}
+
 // ── Fixture builders ─────────────────────────────────────────────────────
 
 pub fn action_hash(seed: u8) -> ActionHash {
@@ -237,8 +261,8 @@ pub fn dna_b64(seed: u8) -> holo_hash::DnaHashB64 {
     holo_hash::DnaHashB64::from(dna(seed))
 }
 
-/// A ledger with the given balance/CFU and zero fees.
-pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: ZFuel) -> Ledger {
+/// A ledger with the given balance/CFU and per-unit fees owed.
+pub fn ledger(balance: UnitMap, cfu: CarryForwardUnits, fees_owed: UnitMap) -> Ledger {
     Ledger {
         balance,
         carry_forward_units: cfu,

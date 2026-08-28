@@ -74,9 +74,14 @@ impl CloseState {
 /// `"no CloseChain action found on chain"`); [`classify_close_error`] isolates
 /// that match so it is a single, testable place to update if the DNA reworks
 /// its messages.
+///
+/// `Err` is reserved for a response that did not DECODE: the close state is then
+/// unknowable to this binary, so it is raised for the caller to hard-stop on
+/// rather than folded into `Open` and driven at.
 pub async fn probe_close_state(conductor: &dyn Conductor) -> Result<CloseState> {
     match conductor.get_migration_close_state().await {
         Ok(close) => Ok(CloseState::Closed(Box::new(close))),
+        Err(e) if crate::dna_errors::is_response_decode_failure(&format!("{e:#}")) => Err(e),
         Err(e) => Ok(classify_close_error(&format!("{e:#}"))),
     }
 }

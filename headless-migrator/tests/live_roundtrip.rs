@@ -36,6 +36,7 @@
 //! LIVE_AGENT_KEY=<uhCAk...carried> \
 //! LIVE_HAPP_PATH=<path/to/new.happ> \
 //! LIVE_JOINING_URL=<https://target-joining> \
+//! LIVE_JOINING_SERVICE_HAPP_ID=<release-happ_id> \
 //! LIVE_LAIR_URL=<unix:///.../lair/socket?k=...> LIVE_LAIR_PASSPHRASE=<pass> \
 //! cargo test --test live_roundtrip -- --ignored --nocapture
 //! ```
@@ -47,6 +48,7 @@ use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
 
 use headless_migrator::conductor::HamConductor;
 use headless_migrator::config::{Config, OpenConfig};
+use headless_migrator::joining::LairSigner;
 use headless_migrator::open::{self, OpenParams};
 use headless_migrator::verify::VerifyParams;
 use headless_migrator::{close, verify};
@@ -58,6 +60,7 @@ struct LiveEnv {
     new_cfg: Config,
     open_cfg: OpenConfig,
     open_params: OpenParams,
+    signer: LairSigner,
     verify_params: VerifyParams,
 }
 
@@ -104,16 +107,20 @@ fn load_live_env() -> Result<LiveEnv> {
         happ_path: var("LIVE_HAPP_PATH")?.into(),
         joining_url: var("LIVE_JOINING_URL")?,
         network_seed: std::env::var("LIVE_NETWORK_SEED").ok(),
+        joining_service_happ_id: var("LIVE_JOINING_SERVICE_HAPP_ID")?,
         gd_wait_timeout: std::time::Duration::from_secs(1800),
     };
 
+    let signer = LairSigner::new(
+        &agent_key,
+        var("LIVE_LAIR_URL")?,
+        var("LIVE_LAIR_PASSPHRASE")?,
+    );
     let open_params = OpenParams {
         router_url: router_url.clone(),
         from_dna: from_dna.clone(),
         to_dna: to_dna.clone(),
         agent_key: agent_key.clone(),
-        lair_url: var("LIVE_LAIR_URL")?,
-        lair_passphrase: var("LIVE_LAIR_PASSPHRASE")?,
     };
 
     let verify_params = VerifyParams {
@@ -128,6 +135,7 @@ fn load_live_env() -> Result<LiveEnv> {
         new_cfg,
         open_cfg,
         open_params,
+        signer,
         verify_params,
     })
 }
@@ -151,9 +159,15 @@ async fn live_close_carry_open_verify() -> Result<()> {
         .context("close service")?;
 
     // ── Open (new conductor) — install for the carried key + migration_init ──
-    open::run(&env.new_cfg, &env.open_cfg, &env.open_params, &mut shutdown)
-        .await
-        .context("open service")?;
+    open::run(
+        &env.new_cfg,
+        &env.open_cfg,
+        &env.open_params,
+        &env.signer,
+        &mut shutdown,
+    )
+    .await
+    .context("open service")?;
 
     // ── Verify (new conductor) ──
     verify::run(&env.new_cfg, &env.verify_params)
@@ -178,15 +192,27 @@ async fn live_open_is_idempotent_across_restart() -> Result<()> {
     let mut shutdown = ham::install_shutdown_handler();
     // First run (assumes close already done by the arc test or fixture) — this
     // verifies and persists `safe_to_teardown = true`.
-    open::run(&env.new_cfg, &env.open_cfg, &env.open_params, &mut shutdown)
-        .await
-        .context("first open")?;
+    open::run(
+        &env.new_cfg,
+        &env.open_cfg,
+        &env.open_params,
+        &env.signer,
+        &mut shutdown,
+    )
+    .await
+    .context("first open")?;
     // Second run with the router DOWN: must short-circuit on the persisted
     // verify signal (no fetch) and still reach Done — the old-side-gone case.
     env.open_params.router_url = "http://127.0.0.1:1".into();
-    open::run(&env.new_cfg, &env.open_cfg, &env.open_params, &mut shutdown)
-        .await
-        .context("second open (must be a no-op, no router fetch)")?;
+    open::run(
+        &env.new_cfg,
+        &env.open_cfg,
+        &env.open_params,
+        &env.signer,
+        &mut shutdown,
+    )
+    .await
+    .context("second open (must be a no-op, no router fetch)")?;
     Ok(())
 }
 
