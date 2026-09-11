@@ -13,10 +13,16 @@
 
 use std::io::ErrorKind;
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_migration-notary");
+
+/// A bound on every wait here: long enough for a process start plus a TCP
+/// connect on a loaded CI box, short enough to fail rather than hang a job.
+const DEADLINE: Duration = Duration::from_secs(60);
+/// How often either wait re-checks; it leaves as soon as the condition lands.
+const POLL: Duration = Duration::from_millis(50);
 
 /// A listener standing in for the conductor's admin interface. Nothing ever
 /// answers on it; the test only asks whether the daemon tried to connect.
@@ -71,13 +77,35 @@ fn kill(mut child: Child) {
     let _ = child.wait();
 }
 
+/// Collect a refusal's output under [`DEADLINE`]. A plain `output()` would wait
+/// as long as the child does, so a service that regressed into connecting and
+/// retrying would hang this test instead of failing it.
+fn wait_for_exit(mut child: Child, what: &str) -> Output {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if child.try_wait().expect("polling the child").is_some() {
+            return child
+                .wait_with_output()
+                .expect("collecting the child's output");
+        }
+        if Instant::now() >= deadline {
+            kill(child);
+            panic!("{what} did not exit within {DEADLINE:?} — it is retrying a connection instead of refusing to start");
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 #[test]
 fn without_lair_signing_the_daemon_exits_instead_of_connecting() {
     let (listener, port) = admin_port_stub();
 
-    let out = daemon("refusal", port, &[])
-        .output()
-        .expect("running the notary daemon");
+    let child = daemon("refusal", port, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting the notary daemon");
+    let out = wait_for_exit(child, "the notary daemon");
 
     assert!(
         !out.status.success(),
@@ -118,10 +146,7 @@ fn the_cap_grant_opt_in_lets_the_daemon_connect() {
     .spawn()
     .expect("starting the notary daemon");
 
-    // Generous: this waits for a real process start plus a TCP connect, and a
-    // loaded CI box is slow. It is a bound on failure, not a sleep — the loop
-    // leaves as soon as the connection lands.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + DEADLINE;
     let connected = loop {
         if was_connected_to(&listener) {
             break true;
@@ -135,7 +160,7 @@ fn the_cap_grant_opt_in_lets_the_daemon_connect() {
         if Instant::now() >= deadline {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(POLL);
     };
 
     kill(child);
