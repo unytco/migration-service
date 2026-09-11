@@ -169,3 +169,40 @@ fn the_cap_grant_opt_in_lets_the_daemon_connect() {
         "with the opt-in set the daemon must take the cap-token path and connect"
     );
 }
+
+#[test]
+fn a_dotenv_file_cannot_turn_the_cap_grant_path_back_on_for_the_daemon() {
+    // The opt-in is the one variable that turns a chain write back on, so it
+    // must come from the environment an operator set and from nothing else. A
+    // `.env` beside the binary (or anywhere above its working directory) used to
+    // be enough, because both binaries loaded one before reading their config.
+    let (listener, port) = admin_port_stub();
+    let dir = scratch_dir("dotenv");
+    std::fs::write(
+        dir.join(".env"),
+        "MIGRATION_NOTARY_ALLOW_CAP_GRANT_SIGNING=1\n",
+    )
+    .expect("planting a .env in the child's working directory");
+
+    let child = daemon("dotenv", port, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting the notary daemon");
+    let out = wait_for_exit(child, "the notary daemon");
+
+    assert!(
+        !out.status.success(),
+        "a .env must not satisfy the opt-in (exit was {:?})",
+        out.status
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("refusing to connect"),
+        "the refusal must still fire; got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !was_connected_to(&listener),
+        "a .env-supplied opt-in let the service connect"
+    );
+}

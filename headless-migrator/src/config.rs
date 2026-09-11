@@ -1,5 +1,8 @@
-//! Agent configuration, read from the environment (mirrors notary-daemon's
-//! `Config::from_env`). The `automation/` installer renders these into the
+//! Agent configuration, read from the process environment and nowhere else
+//! (mirrors notary-daemon's `Config::from_env`). No `.env` file is loaded: it
+//! would fill an unset variable from a file found anywhere above the working
+//! directory, and one of these variables (`signing`'s opt-in) turns a chain
+//! write back on. The `automation/` installer renders these into the
 //! systemd `EnvironmentFile`; every field has a sensible default except the
 //! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, the lair
 //! credentials behind [`crate::signing`], and for the open service,

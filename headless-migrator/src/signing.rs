@@ -12,6 +12,7 @@
 //! [`ALLOW_CAP_GRANT_VAR`].
 
 use anyhow::{bail, Context, Result};
+use url::Url;
 
 use crate::config::var;
 
@@ -83,10 +84,19 @@ impl Signing {
             return Ok(Self::CapGrant);
         }
         match (lair_url, lair_passphrase) {
-            (Some(connection_url), Some(passphrase)) => Ok(Self::Lair {
-                connection_url,
-                passphrase,
-            }),
+            (Some(connection_url), Some(passphrase)) => {
+                // Parsed here, not at connect: an unusable URL is a
+                // misconfiguration, and a misconfiguration has to be fatal at
+                // startup. Left to `apply`, it surfaced as a connection the
+                // supervised loops retry forever. Same parser (`url`, the
+                // version lair itself resolves to), so the verdict is identical.
+                Url::parse(&connection_url)
+                    .with_context(|| format!("{LAIR_URL_VAR} is not a URL: `{connection_url}`"))?;
+                Ok(Self::Lair {
+                    connection_url,
+                    passphrase,
+                })
+            }
             (url, passphrase) => Err(refusal(url.is_some(), passphrase.is_some())),
         }
     }
@@ -179,10 +189,13 @@ mod tests {
     fn lair_credentials_reach_hams_lair_signer() {
         let signing = Signing::resolve(Some(URL.into()), Some("pass".into()), None).unwrap();
         let cfg = signing.apply(ham_cfg()).unwrap();
-        assert!(
-            cfg.lair.is_some(),
-            "lair credentials must configure ham's lair signer (the no-cap-grant path)"
-        );
+        let lair = cfg
+            .lair
+            .as_ref()
+            .expect("lair credentials must configure ham's lair signer (the no-cap-grant path)");
+        // The URL itself, not just "some lair": the keystore it reaches is the
+        // one whose key the cell is signed with.
+        assert_eq!(lair.connection_url.as_str(), URL);
     }
 
     #[test]
@@ -256,10 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_lair_url_errors_rather_than_signing_some_other_way() {
-        let signing =
-            Signing::resolve(Some("not a url".into()), Some("pass".into()), None).unwrap();
-        assert!(signing.apply(ham_cfg()).is_err());
+    fn a_malformed_lair_url_is_fatal_at_resolve_not_at_connect() {
+        let err = Signing::resolve(Some("not a url".into()), Some("pass".into()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(LAIR_URL_VAR), "{err}");
+        assert!(err.contains("not a url"), "{err}");
     }
 
     #[test]

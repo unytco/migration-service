@@ -1,5 +1,8 @@
-//! Daemon configuration, read from the environment (mirrors pricing_oracle's
-//! `HolochainConfig::from_env`).
+//! Daemon configuration, read from the process environment and nowhere else
+//! (mirrors pricing_oracle's `HolochainConfig::from_env`). No `.env` file is
+//! loaded: it would fill an unset variable from a file found anywhere above the
+//! working directory, and one of these variables (`signing`'s opt-in) turns a
+//! chain write back on.
 
 use anyhow::{Context, Result};
 

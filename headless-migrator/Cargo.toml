@@ -39,9 +39,11 @@ base64 = "0.22"
 
 # Utilities
 anyhow = "1"
+# Already in the graph via lair (the same 2.x entry), so declaring it adds no
+# build: it parses the lair connection URL at startup, where a bad one is fatal.
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dotenvy = "0.15"
 
 # Holochain bridge — same stack + pins as notary-daemon (one wire-type pin for
 # the whole migration-service repo). EXACT `=` pins on the 0.7 line: the app/DNA

@@ -17,7 +17,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
