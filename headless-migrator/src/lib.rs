@@ -19,6 +19,7 @@ pub mod joining;
 pub mod open;
 pub mod policy;
 pub mod probe;
+pub mod signing;
 pub mod state_file;
 pub mod status;
 pub mod verify;

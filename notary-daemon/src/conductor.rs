@@ -31,12 +31,28 @@ pub struct HamConductor {
     role_name: String,
 }
 
+/// The `HamConfig` every `ham` connection this daemon makes is built from: the
+/// conductor coordinates plus the signer [`Config`] resolved at startup. One
+/// home, so the daemon and the tests that assert which signer is configured are
+/// looking at the same thing.
+pub fn ham_config(cfg: &Config) -> Result<ham::HamConfig> {
+    cfg.signing.apply(
+        ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
+            .with_request_timeout_secs(cfg.request_timeout_secs),
+    )
+}
+
 impl HamConductor {
     /// Connect with exponential backoff until the conductor is reachable or
     /// shutdown fires (mirrors the unyt_cli daemon pattern).
     pub async fn connect(cfg: &Config, shutdown: &mut ham::ShutdownRx) -> Option<Self> {
-        let ham_cfg = ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-            .with_request_timeout_secs(cfg.request_timeout_secs);
+        let ham_cfg = match ham_config(cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "refusing to connect");
+                return None;
+            }
+        };
         let backoff = ham::BackoffConfig::default();
         let ham =
             ham::connect_with_backoff(|| ham::Ham::connect(ham_cfg.clone()), &backoff, shutdown)
@@ -71,5 +87,52 @@ impl Conductor for HamConductor {
             .call_zome(&self.role_name, "transactor", "whoami", ())
             .await
             .context("whoami zome call failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::signing::Signing;
+
+    const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
+
+    /// A `Config` shaped like a deployed notary, carrying the signer under
+    /// test. Built directly rather than through `from_env`, which reads the
+    /// process-global environment every other test shares.
+    fn config_with(signing: Signing) -> Config {
+        Config {
+            admin_port: 8800,
+            app_port: 30000,
+            app_id: "unyt".into(),
+            role_name: "alliance".into(),
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 8790,
+            bearer_token: "token".into(),
+            request_timeout_secs: 30,
+            signing,
+        }
+    }
+
+    #[test]
+    fn the_connection_is_built_with_the_lair_signer_the_config_resolved() {
+        let signing = Signing::resolve(Some(LAIR_URL.into()), Some("pass".into()), None).unwrap();
+        let ham_cfg = ham_config(&config_with(signing)).unwrap();
+        assert!(
+            ham_cfg.lair.is_some(),
+            "every ham connection this daemon makes must sign through lair"
+        );
+        assert_eq!(ham_cfg.admin_port, 8800);
+        assert_eq!(ham_cfg.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn the_opt_in_builds_the_connection_on_the_cap_grant_path() {
+        let signing = Signing::resolve(None, None, Some("1".into())).unwrap();
+        assert!(
+            ham_config(&config_with(signing)).unwrap().lair.is_none(),
+            "the escape hatch must actually reach ham as client signing"
+        );
     }
 }

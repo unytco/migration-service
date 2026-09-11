@@ -4,6 +4,7 @@
 pub mod conductor;
 pub mod config;
 pub mod http;
+pub mod signing;
 
 use std::sync::Arc;
 

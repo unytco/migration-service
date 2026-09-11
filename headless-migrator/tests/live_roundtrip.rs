@@ -26,6 +26,8 @@
 //! # ── close service (old conductor) ──
 //! MIGRATION_AGENT_STATE_FILE=/tmp/mig-close.json \
 //! HOLOCHAIN_ADMIN_PORT=<old-admin> HOLOCHAIN_APP_PORT=<old-app> \
+//! MIGRATION_AGENT_LAIR_URL=<OLD conductor's lair> \
+//! MIGRATION_AGENT_LAIR_PASSPHRASE=<OLD conductor's passphrase> \
 //! HOLOCHAIN_APP_ID=<old-app-id> HOLOCHAIN_ROLE_NAME=alliance \
 //! LIVE_OLD_ADMIN_PORT=<old-admin> LIVE_OLD_APP_PORT=<old-app> \
 //! LIVE_OLD_APP_ID=<old-app-id> \
@@ -37,7 +39,7 @@
 //! LIVE_HAPP_PATH=<path/to/new.happ> \
 //! LIVE_JOINING_URL=<https://target-joining> \
 //! LIVE_JOINING_SERVICE_HAPP_ID=<that joining service's static happ_id> \
-//! LIVE_LAIR_URL=<unix:///.../lair/socket?k=...> LIVE_LAIR_PASSPHRASE=<pass> \
+//! LIVE_LAIR_URL=<NEW droplet's lair> LIVE_LAIR_PASSPHRASE=<NEW droplet's passphrase> \
 //! cargo test --test live_roundtrip -- --ignored --nocapture
 //! ```
 
@@ -50,6 +52,7 @@ use headless_migrator::conductor::HamConductor;
 use headless_migrator::config::{Config, OpenConfig};
 use headless_migrator::joining::LairSigner;
 use headless_migrator::open::{self, OpenParams};
+use headless_migrator::signing::Signing;
 use headless_migrator::verify::VerifyParams;
 use headless_migrator::{close, verify};
 
@@ -102,6 +105,15 @@ fn load_live_env() -> Result<LiveEnv> {
         .context("LIVE_NEW_APP_PORT")?;
     new_cfg.app_id = var("LIVE_NEW_APP_ID")?;
     new_cfg.state_file = base("open");
+    // Two conductors, so two keystores: the close side signs through the OLD
+    // node's lair (what `from_env` read), the open side through the NEW node's.
+    // A deployed migration is two processes with an EnvironmentFile each and
+    // never meets this; driving both sides in one process does.
+    new_cfg.signing = Signing::resolve(
+        Some(var("LIVE_LAIR_URL")?),
+        Some(var("LIVE_LAIR_PASSPHRASE")?),
+        None,
+    )?;
 
     let open_cfg = OpenConfig {
         happ_path: var("LIVE_HAPP_PATH")?.into(),

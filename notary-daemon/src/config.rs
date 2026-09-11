@@ -3,6 +3,8 @@
 
 use anyhow::{Context, Result};
 
+use crate::signing::Signing;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Holochain conductor admin websocket port (local).
@@ -22,13 +24,20 @@ pub struct Config {
     pub bearer_token: String,
     /// `ham` per-request timeout (seconds).
     pub request_timeout_secs: u64,
+    /// How every `ham` connection this daemon makes signs its zome calls.
+    /// Resolved here so a daemon that cannot sign through lair dies at startup
+    /// rather than at connect, which is the moment it would write to its chain.
+    pub signing: Signing,
+}
+
+pub(crate) fn var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        fn var(key: &str) -> Option<String> {
-            std::env::var(key).ok().filter(|v| !v.is_empty())
-        }
+        // First, because it is the one misconfiguration that used to be survivable.
+        let signing = Signing::from_env()?;
         Ok(Self {
             admin_port: var("HOLOCHAIN_ADMIN_PORT")
                 .unwrap_or_else(|| "8800".into())
@@ -51,6 +60,7 @@ impl Config {
                 .unwrap_or_else(|| "30".into())
                 .parse()
                 .context("HAM_REQUEST_TIMEOUT_SECS")?,
+            signing,
         })
     }
 }
