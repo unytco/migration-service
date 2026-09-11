@@ -55,6 +55,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A migrating agent keeps its agreement credit limit (`rave_engine` 0.11.0 in both binaries).** A close carrying a per-agreement `credit_limit` lost it passing through the migrator and the notary daemon, and the notary's DNA then refused to sign the close as a state mismatch.
+
 - headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
 
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.

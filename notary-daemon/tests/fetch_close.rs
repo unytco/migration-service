@@ -18,9 +18,10 @@ use migration_notary::http::{router, AppState};
 
 use holo_hash::AgentPubKey;
 use rave_engine::types::entries::migration::v0_1::{
-    MigrationInitRequest, NotarySignature, ReadCloseResponse, SummaryState, SummaryStatePayload,
-    SummaryTx,
+    AgreementCarryForward, MigrationInitRequest, NotarySignature, ReadCloseResponse, SummaryState,
+    SummaryStatePayload, SummaryTx,
 };
+use rave_engine::types::units::UnitMap;
 
 const TOKEN: &str = "test-token";
 
@@ -195,8 +196,13 @@ fn dummy_signatures() -> Vec<NotarySignature> {
 }
 
 fn found() -> ReadCloseResponse {
+    found_with(dummy_payload())
+}
+
+/// A `Found` over `payload`, with the fixture's signatures and close action.
+fn found_with(payload: SummaryStatePayload) -> ReadCloseResponse {
     ReadCloseResponse::Found {
-        payload: dummy_payload(),
+        payload,
         notary_signatures: dummy_signatures(),
         close_action: holo_hash::ActionHash::from_raw_36(vec![6; 36]),
     }
@@ -313,6 +319,32 @@ fn found_envelope_round_trips_into_migration_init_request() {
     );
     assert_eq!(req.notary_signatures, notary_signatures);
     assert_eq!(req.close_action, close_action);
+}
+
+/// The daemon serves what it decoded, so a carry-forward field it cannot name
+/// never reaches the agent that has to reopen with it.
+#[tokio::test]
+async fn found_serves_the_agreement_credit_limit() {
+    let limit = UnitMap::from(vec![(0, "500")]);
+    let mut payload = dummy_payload();
+    payload.closing_state.agreement_carry_forward = vec![AgreementCarryForward {
+        smart_agreement_hash: holo_hash::ActionHash::from_raw_36(vec![10; 36]),
+        last_execution_action_hash: holo_hash::ActionHash::from_raw_36(vec![11; 36]),
+        carryover: serde_json::json!({ "streak": 3 }),
+        locked: None,
+        credit_limit: Some(limit.clone()),
+    }];
+
+    let c = MockConductor::with(Ok(found_with(payload)));
+    let (status, body) = send(c, fetch_close_req(Some(TOKEN))).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["payload"]["closing_state"]["agreement_carry_forward"][0]["credit_limit"],
+        serde_json::to_value(&limit).expect("render the credit limit"),
+        "the served package must carry the agreement's credit limit: without it a \
+         migrated agent reopens owing more than its limit allows"
+    );
 }
 
 // `/healthz` reflects BOTH the conductor and the app cell: either failing makes
