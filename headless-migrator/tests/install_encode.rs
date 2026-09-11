@@ -78,6 +78,29 @@ fn migrating_install_carries_the_package_as_role_init_properties() {
     );
 }
 
+/// The successor DNA decodes these bytes, so the whole payload must reach them
+/// intact. `credit_limit` is skipped when absent, so only a package carrying one
+/// exercises it.
+#[test]
+fn init_properties_carry_the_agreement_credit_limit() {
+    let mut pkg = migration_init_request(
+        7,
+        summary_state(unit_map(0, 10), CarryForwardUnits::new(), 1),
+    );
+    pkg.payload.closing_state.agreement_carry_forward[0].credit_limit = Some(unit_map(0, 500));
+    let served = pkg.payload.clone();
+
+    let encoded = only_role_init_properties(&alliance_spec(Some(pkg))).expect("init_properties");
+    let decoded =
+        MigrationInitRequest::try_from(encoded).expect("the DNA's decode of init_properties");
+    assert_eq!(
+        decoded.payload, served,
+        "the close payload, the agreement's credit limit included, must survive the \
+         init_properties encode: without it a migrated agent reopens owing more than \
+         its limit allows"
+    );
+}
+
 #[test]
 fn fresh_non_migrating_install_carries_no_init_properties() {
     assert_eq!(

@@ -298,6 +298,7 @@ pub fn summary_state(
                 last_execution_action_hash: action_hash(150 + i as u8),
                 carryover: serde_json::json!({ "i": i }),
                 locked: None,
+                credit_limit: None,
             })
             .collect(),
     }
