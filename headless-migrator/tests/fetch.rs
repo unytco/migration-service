@@ -7,6 +7,7 @@
 mod support;
 
 use headless_migrator::fetch::{self, is_hard_stop, is_retryable, FetchOutcome};
+use rave_engine::types::ledger::CarryForwardUnits;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -59,7 +60,7 @@ fn unknown_code_is_neither_retryable_nor_a_known_hard_stop() {
 
 /// Serve exactly one HTTP request with the given status + JSON body, then close.
 /// Returns the bound base URL.
-async fn one_shot_server(status_line: &'static str, body: &'static str) -> String {
+async fn one_shot_server(status_line: &'static str, body: String) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -90,7 +91,7 @@ fn agent_b64() -> String {
 async fn no_close_found_response_keeps_waiting() {
     let base = one_shot_server(
         "404 Not Found",
-        r#"{"error":{"code":"no_close_found","message":"close on the from-DNA first"}}"#,
+        r#"{"error":{"code":"no_close_found","message":"close on the from-DNA first"}}"#.into(),
     )
     .await;
     let client = fetch::http_client_for_status().unwrap();
@@ -106,7 +107,7 @@ async fn no_close_found_response_keeps_waiting() {
 async fn warranted_response_hard_stops() {
     let base = one_shot_server(
         "422 Unprocessable Entity",
-        r#"{"error":{"code":"warranted","message":"chain carries warrants"}}"#,
+        r#"{"error":{"code":"warranted","message":"chain carries warrants"}}"#.into(),
     )
     .await;
     let client = fetch::http_client_for_status().unwrap();
@@ -125,7 +126,7 @@ async fn unrecognized_error_code_response_hard_stops() {
     // stop, not spin forever as a keep-waiting.
     let base = one_shot_server(
         "418 I'm a teapot",
-        r#"{"error":{"code":"brand_new_unforeseen_code","message":"the contract drifted"}}"#,
+        r#"{"error":{"code":"brand_new_unforeseen_code","message":"the contract drifted"}}"#.into(),
     )
     .await;
     let client = fetch::http_client_for_status().unwrap();
@@ -140,33 +141,57 @@ async fn unrecognized_error_code_response_hard_stops() {
     }
 }
 
-#[tokio::test]
-async fn package_response_decodes() {
-    // A 200 carrying a valid MigrationInitRequest decodes to Package.
-    let payload = support::payload(
-        3,
-        support::summary_state(
-            support::unit_map(0, 5),
-            rave_engine::types::ledger::CarryForwardUnits::new(),
-            0,
+async fn fetch_served_package(body: String) -> FetchOutcome {
+    let base = one_shot_server("200 OK", body).await;
+    let client = fetch::http_client_for_status().unwrap();
+    fetch::fetch_package(&client, &base, &dna_b64(1), &dna_b64(2), &agent_b64()).await
+}
+
+/// The package envelope the router forwards verbatim, for `agreements` agreement
+/// carry-forward entries.
+fn served_package(agreements: usize) -> serde_json::Value {
+    serde_json::json!({
+        "payload": support::payload(
+            3,
+            support::summary_state(support::unit_map(0, 5), CarryForwardUnits::new(), agreements),
         ),
-    );
-    let body = serde_json::json!({
-        "payload": payload,
         "notary_signatures": [],
         "close_action": support::action_hash(6),
     })
-    .to_string();
-    // Leak so the &'static str the helper wants is satisfied (test-only).
-    let body: &'static str = Box::leak(body.into_boxed_str());
-    let base = one_shot_server("200 OK", body).await;
-    let client = fetch::http_client_for_status().unwrap();
-    let outcome =
-        fetch::fetch_package(&client, &base, &dna_b64(1), &dna_b64(2), &agent_b64()).await;
+}
+
+#[tokio::test]
+async fn package_response_decodes() {
+    // A 200 carrying a valid MigrationInitRequest decodes to Package.
+    let outcome = fetch_served_package(served_package(0).to_string()).await;
     assert!(
         matches!(outcome, FetchOutcome::Package(_)),
         "a valid 200 must decode to a package, got {}",
         describe(&outcome)
+    );
+}
+
+/// A field these types cannot name is dropped by serde silently, so the fetched
+/// package must re-render as exactly what the router served.
+#[tokio::test]
+async fn fetched_package_keeps_every_carry_forward_field() {
+    let mut served = served_package(1);
+    // Placed on the wire, not on the struct, so the fixture is what a DNA
+    // carrying the field emits rather than what this binary can express.
+    served["payload"]["closing_state"]["agreement_carry_forward"][0]["credit_limit"] =
+        serde_json::to_value(support::unit_map(0, 500)).expect("render the credit limit");
+
+    let outcome = fetch_served_package(served.to_string()).await;
+    let FetchOutcome::Package(fetched) = outcome else {
+        panic!(
+            "a valid 200 must decode to a package, got {}",
+            describe(&outcome)
+        );
+    };
+    assert_eq!(
+        serde_json::to_value(&*fetched).expect("re-render the fetched package"),
+        served,
+        "every field the router served must survive the fetch decode"
     );
 }
 

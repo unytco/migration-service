@@ -64,7 +64,7 @@ hdi = "=0.8.0"
 # Exact-pinned for the same reason as the stack above — this is THE wire-type
 # crate the byte-parity rule is about, so a caret drifting it ahead of the
 # deployed DNA is exactly what must not happen.
-rave_engine = "=0.10.0"
+rave_engine = "=0.11.0"
 # Not used directly; the exact pin holds the graph to the DNA's serialization.
 zfuel = "=0.9.1"
 
