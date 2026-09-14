@@ -248,8 +248,8 @@ impl NonceSigner for EchoSigner {
 /// service may use, so a test config that stood for anything else would be
 /// standing for a service that must not run. Nothing here opens a connection,
 /// so the credentials are never dialed.
-pub fn signing() -> headless_migrator::signing::Signing {
-    headless_migrator::signing::Signing::resolve(
+pub fn signing() -> ham::SigningPolicy {
+    headless_migrator::signing::resolve(
         Some("unix:///var/lib/holochain/lair/socket?k=test".into()),
         Some("test-passphrase".into()),
         None,

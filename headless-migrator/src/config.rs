@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use holo_hash::DnaHashB64;
 
 use crate::policy::PolicyOpts;
-use crate::signing::Signing;
+use ham::SigningPolicy;
 
 /// How the supervised loops connect to the local conductor and where they
 /// record progress, plus the M-of-N collection policy knobs.
@@ -45,7 +45,7 @@ pub struct Config {
     /// How every `ham` connection this service makes signs its zome calls.
     /// Resolved here so a service that cannot sign through lair dies at startup
     /// rather than at connect, which is the moment the damage was done.
-    pub signing: Signing,
+    pub signing: SigningPolicy,
     /// The successor DNA a close binds to (`prepare_closing_summary(to_dna)`).
     /// Read from `MIGRATION_AGENT_TO_DNA`; `None` for the open / verify / status
     /// commands (which take from/to as CLI args) — the close command requires it.
@@ -134,7 +134,7 @@ impl Config {
 
     pub fn from_env() -> Result<Self> {
         // First, because it is the one misconfiguration that used to be survivable.
-        let signing = Signing::from_env()?;
+        let signing = crate::signing::from_env()?;
         let state_file = var("MIGRATION_AGENT_STATE_FILE")
             .context("MIGRATION_AGENT_STATE_FILE is required (the report collector reads it)")?
             .into();

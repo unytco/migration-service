@@ -1,17 +1,16 @@
-//! How this daemon's zome calls are signed, decided from the environment before
-//! anything connects.
+//! The lair credentials and the opt-in this daemon reads from its environment.
 //!
 //! The daemon only reads (`read_predecessor_close`, `whoami`), but connecting is
 //! not free: through lair a zome call is signed with the cell's own agent key
 //! and nothing is written, while without it `ham` authorizes a throwaway signing
-//! key by committing a capability grant to the notary's chain on EVERY connect —
+//! key by committing a capability grant to the notary's chain on EVERY connect,
 //! so a restart loop writes to the chain of the agent whose signatures the whole
-//! migration depends on. Lair is therefore the only default, a daemon that
-//! cannot get it refuses to start, and the chain-writing path is reachable only
-//! by setting [`ALLOW_CAP_GRANT_VAR`].
+//! migration depends on.
+//!
+//! The decision itself is `ham`'s.
 
-use anyhow::{bail, Context, Result};
-use url::Url;
+use anyhow::{Context, Result};
+use ham::{CapGrantOptIn, LairCredentials, SigningPolicy};
 
 use crate::config::var;
 
@@ -20,7 +19,8 @@ use crate::config::var;
 pub const LAIR_URL_VAR: &str = "MIGRATION_NOTARY_LAIR_URL";
 /// The passphrase that unlocks that keystore.
 pub const LAIR_PASSPHRASE_VAR: &str = "MIGRATION_NOTARY_LAIR_PASSPHRASE";
-/// Opt in to the signing path that commits a capability grant per connect.
+/// Permit the signing path that commits a capability grant per connect, for a
+/// node with no lair to reach. Lair still wins wherever it resolves.
 pub const ALLOW_CAP_GRANT_VAR: &str = "MIGRATION_NOTARY_ALLOW_CAP_GRANT_SIGNING";
 
 /// Where a deployed droplet keeps the two lair values, named in the refusal so
@@ -29,150 +29,48 @@ pub const ALLOW_CAP_GRANT_VAR: &str = "MIGRATION_NOTARY_ALLOW_CAP_GRANT_SIGNING"
 const CONDUCTOR_CONFIG_PATH: &str = "/etc/holochain/conductor-config.yaml";
 const PASSPHRASE_FILE_PATH: &str = "/var/lib/holochain/lair-passphrase";
 
-/// The signer every `ham` connection this daemon makes is built with.
-#[derive(Clone)]
-pub enum Signing {
-    /// Sign with the cell's own agent key through lair. Commits nothing.
-    Lair {
-        connection_url: String,
-        passphrase: String,
-    },
-    /// Authorize a throwaway signing key, committing one capability grant to
-    /// the notary's chain per connect. Reachable only through the opt-in.
-    CapGrant,
-}
-
-/// Hand-written: `Config` derives `Debug`, and a passphrase must not be one
-/// `{:?}` away from the journal.
-impl std::fmt::Debug for Signing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lair { connection_url, .. } => f
-                .debug_struct("Lair")
-                .field("connection_url", connection_url)
-                .field("passphrase", &"<redacted>")
-                .finish(),
-            Self::CapGrant => f.write_str("CapGrant"),
-        }
-    }
-}
-
-impl Signing {
-    /// Read the environment this daemon was started with.
-    pub fn from_env() -> Result<Self> {
-        Self::resolve(
-            var(LAIR_URL_VAR),
-            var(LAIR_PASSPHRASE_VAR),
-            var(ALLOW_CAP_GRANT_VAR),
-        )
-    }
-
-    /// Decide the signer from the three raw values. Pure, so the refusal is
-    /// tested without mutating the process environment.
-    ///
-    /// The opt-in wins over present lair credentials: a deployed daemon always
-    /// has both rendered into its EnvironmentFile, so an operator reaching for
-    /// the escape hatch is asking for it on top of them, not instead of them.
-    pub fn resolve(
-        lair_url: Option<String>,
-        lair_passphrase: Option<String>,
-        allow_cap_grant: Option<String>,
-    ) -> Result<Self> {
-        if opted_in(allow_cap_grant)? {
-            return Ok(Self::CapGrant);
-        }
-        match (lair_url, lair_passphrase) {
-            (Some(connection_url), Some(passphrase)) => {
-                // Parsed here, not at connect: an unusable URL is a
-                // misconfiguration, and a misconfiguration has to be fatal at
-                // startup. Left to `apply`, it surfaced as a connection the
-                // supervised loops retry forever. Same parser (`url`, the
-                // version lair itself resolves to), so the verdict is identical.
-                Url::parse(&connection_url)
-                    .with_context(|| format!("{LAIR_URL_VAR} is not a URL: `{connection_url}`"))?;
-                Ok(Self::Lair {
-                    connection_url,
-                    passphrase,
-                })
-            }
-            (url, passphrase) => Err(refusal(url.is_some(), passphrase.is_some())),
-        }
-    }
-
-    /// Build the `HamConfig` a connection is about to be made with.
-    pub fn apply(&self, cfg: ham::HamConfig) -> Result<ham::HamConfig> {
-        match self {
-            Self::Lair {
-                connection_url,
-                passphrase,
-            } => cfg
-                .with_lair_signing(connection_url, passphrase.clone().into_bytes())
-                .with_context(|| format!("{LAIR_URL_VAR} is not a usable lair connection URL")),
-            // ham refuses this path unless it is asked for by name, and the
-            // reconnect loop retries that refusal instead of exiting.
-            Self::CapGrant => {
-                tracing::warn!(
-                    event = "signing.cap_grant",
-                    opt_in = ALLOW_CAP_GRANT_VAR,
-                    "signing WITHOUT lair: this connect commits a capability grant to the \
-                     notary's chain"
-                );
-                Ok(cfg.allow_cap_grant_signing())
-            }
-        }
-    }
-}
-
-/// The error a daemon without lair signing dies with. It carries everything an
-/// operator needs at 3am: which variable was missing, what the consequence of
-/// continuing would have been, where the values come from on a droplet, and the
-/// one way to ask for the other path on purpose.
-fn refusal(url_present: bool, passphrase_present: bool) -> anyhow::Error {
-    anyhow::anyhow!(
-        "refusing to connect: lair signing is required and unavailable ({LAIR_URL_VAR} is {}, \
-         {LAIR_PASSPHRASE_VAR} is {}).\n\
-         Without lair, connecting authorizes a throwaway signing key by committing a capability \
-         grant to this notary's chain — a write from a daemon that is supposed to only read, on \
-         every restart.\n\
-         On a droplet both values sit with the conductor: keystore.connection_url in \
-         {CONDUCTOR_CONFIG_PATH}, and the passphrase in {PASSPHRASE_FILE_PATH}. The automation \
-         installer (setup-migration-notary.sh) reads them off the node and renders them into \
-         this daemon's EnvironmentFile.\n\
-         Set {ALLOW_CAP_GRANT_VAR}=1 only to allow that chain write deliberately.",
-        set_or_unset(url_present),
-        set_or_unset(passphrase_present),
+/// Read the environment this daemon was started with.
+pub fn from_env() -> Result<SigningPolicy> {
+    resolve(
+        var(LAIR_URL_VAR),
+        var(LAIR_PASSPHRASE_VAR),
+        var(ALLOW_CAP_GRANT_VAR),
     )
 }
 
-fn set_or_unset(present: bool) -> &'static str {
-    if present {
-        "set"
-    } else {
-        "unset"
-    }
+/// Hand `ham` the three raw values and name them on whatever it says back.
+/// Pure, so the refusal is tested without mutating the process environment.
+pub fn resolve(
+    lair_url: Option<String>,
+    lair_passphrase: Option<String>,
+    allow_cap_grant: Option<String>,
+) -> Result<SigningPolicy> {
+    let opt_in =
+        CapGrantOptIn::from_value(allow_cap_grant.as_deref()).context(ALLOW_CAP_GRANT_VAR)?;
+    SigningPolicy::resolve(
+        LairCredentials::Values {
+            connection_url: lair_url,
+            passphrase: lair_passphrase.map(String::into_bytes),
+        },
+        opt_in,
+    )
+    .with_context(operator_guidance)
 }
 
-/// Parse the opt-in. Only explicit affirmatives enable it, and an unrecognized
-/// value is an error rather than a silent "off": the variable is a request for
-/// the path that writes to the chain, so it is never guessed at.
-fn opted_in(raw: Option<String>) -> Result<bool> {
-    let Some(value) = raw else {
-        return Ok(false);
-    };
-    let value = value.trim();
-    if ["1", "true", "yes", "on"]
-        .iter()
-        .any(|on| value.eq_ignore_ascii_case(on))
-    {
-        return Ok(true);
-    }
-    if ["", "0", "false", "no", "off"]
-        .iter()
-        .any(|off| value.eq_ignore_ascii_case(off))
-    {
-        return Ok(false);
-    }
-    bail!("{ALLOW_CAP_GRANT_VAR}: expected one of 1/true/yes/on or 0/false/no/off, got `{value}`")
+/// What an operator needs at 3am that `ham` cannot say: which variables carry
+/// the credentials on this service, where their values come from on a droplet,
+/// and which variable permits the other path.
+fn operator_guidance() -> String {
+    format!(
+        "{LAIR_URL_VAR} and {LAIR_PASSPHRASE_VAR} are how this daemon is given lair signing.\n\
+         On a droplet both values sit with the conductor: keystore.connection_url in \
+         {CONDUCTOR_CONFIG_PATH}, and the passphrase in {PASSPHRASE_FILE_PATH}. The automation \
+         installer (setup-migration-notary.sh) reads them off the node and renders \
+         them into this daemon's EnvironmentFile.\n\
+         Set {ALLOW_CAP_GRANT_VAR}=1 only to permit the capability-grant path on a node with no \
+         lair to reach. Lair wins wherever it resolves, so taking that path also means leaving \
+         {LAIR_URL_VAR} and {LAIR_PASSPHRASE_VAR} unset."
+    )
 }
 
 #[cfg(test)]
@@ -187,8 +85,9 @@ mod tests {
 
     #[test]
     fn lair_credentials_reach_hams_lair_signer() {
-        let signing = Signing::resolve(Some(URL.into()), Some("pass".into()), None).unwrap();
-        let cfg = signing.apply(ham_cfg()).unwrap();
+        let cfg = resolve(Some(URL.into()), Some("pass".into()), None)
+            .unwrap()
+            .apply(ham_cfg());
         let lair = cfg
             .lair
             .as_ref()
@@ -200,12 +99,16 @@ mod tests {
 
     #[test]
     fn no_lair_and_no_opt_in_refuses() {
-        let err = Signing::resolve(None, None, None).unwrap_err().to_string();
-        for expected in [LAIR_URL_VAR, LAIR_PASSPHRASE_VAR, ALLOW_CAP_GRANT_VAR] {
+        let err = format!("{:#}", resolve(None, None, None).unwrap_err());
+        for expected in [
+            LAIR_URL_VAR,
+            LAIR_PASSPHRASE_VAR,
+            ALLOW_CAP_GRANT_VAR,
+            CONDUCTOR_CONFIG_PATH,
+            PASSPHRASE_FILE_PATH,
+        ] {
             assert!(err.contains(expected), "{err}");
         }
-        assert!(err.contains(CONDUCTOR_CONFIG_PATH), "{err}");
-        assert!(err.contains(PASSPHRASE_FILE_PATH), "{err}");
     }
 
     #[test]
@@ -214,77 +117,88 @@ mod tests {
             (Some(URL.to_string()), None),
             (None, Some("pass".to_string())),
         ] {
-            let err = Signing::resolve(url.clone(), passphrase.clone(), None)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("refusing to connect"), "{err}");
+            let err = format!(
+                "{:#}",
+                resolve(url.clone(), passphrase.clone(), None).unwrap_err()
+            );
+            // The refusal names both variables, and ham says which half is
+            // missing, so the operator is not sent looking at both.
+            assert!(err.contains(LAIR_URL_VAR), "{err}");
+            assert!(err.contains(LAIR_PASSPHRASE_VAR), "{err}");
             let expected = if url.is_some() {
-                format!("{LAIR_URL_VAR} is set")
+                "connection URL is set"
             } else {
-                format!("{LAIR_URL_VAR} is unset")
+                "passphrase is set"
             };
-            assert!(err.contains(&expected), "{err}");
+            assert!(err.contains(expected), "{err}");
         }
     }
 
     #[test]
     fn the_opt_in_selects_the_cap_grant_path() {
-        for raw in ["1", "true", "YES", "On"] {
-            let signing = Signing::resolve(None, None, Some(raw.into())).unwrap();
-            assert!(matches!(signing, Signing::CapGrant), "{raw}");
-            let cfg = signing.apply(ham_cfg()).unwrap();
-            assert!(
-                cfg.lair.is_none(),
-                "{raw}: the opt-in must leave ham on the client-signing (cap grant) path"
-            );
-            assert!(
-                cfg.allow_cap_grant_signing,
-                "{raw}: the opt-in must reach ham's own flag, or ham refuses the connect"
-            );
-        }
+        let cfg = resolve(None, None, Some("1".into()))
+            .unwrap()
+            .apply(ham_cfg());
+        assert!(
+            cfg.lair.is_none(),
+            "the opt-in must leave ham on the client-signing (cap grant) path"
+        );
+        assert!(
+            cfg.allow_cap_grant_signing,
+            "and it must reach ham's own flag, or ham refuses the connect"
+        );
     }
 
     #[test]
-    fn the_opt_in_wins_over_present_lair_credentials() {
-        let signing =
-            Signing::resolve(Some(URL.into()), Some("pass".into()), Some("1".into())).unwrap();
-        let cfg = signing.apply(ham_cfg()).unwrap();
-        assert!(cfg.lair.is_none());
-        assert!(cfg.allow_cap_grant_signing);
+    fn lair_wins_over_the_opt_in() {
+        let cfg = resolve(Some(URL.into()), Some("pass".into()), Some("1".into()))
+            .unwrap()
+            .apply(ham_cfg());
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            URL,
+            "the opt-in permits the chain write where there is no other way, it does not ask \
+             for one"
+        );
+        assert!(!cfg.allow_cap_grant_signing);
     }
 
     #[test]
     fn an_off_opt_in_still_requires_lair() {
         for raw in ["0", "false", "no", "OFF", ""] {
             assert!(
-                Signing::resolve(None, None, Some(raw.into())).is_err(),
-                "{raw}"
+                resolve(None, None, Some(raw.into())).is_err(),
+                "{raw}: an explicitly off opt-in is not permission to write to the chain"
             );
         }
     }
 
     #[test]
     fn an_unrecognized_opt_in_value_is_an_error_not_a_guess() {
-        let err = Signing::resolve(None, None, Some("maybe".into()))
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            resolve(None, None, Some("maybe".into())).unwrap_err()
+        );
         assert!(err.contains(ALLOW_CAP_GRANT_VAR), "{err}");
         assert!(err.contains("maybe"), "{err}");
     }
 
     #[test]
     fn a_malformed_lair_url_is_fatal_at_resolve_not_at_connect() {
-        let err = Signing::resolve(Some("not a url".into()), Some("pass".into()), None)
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            resolve(Some("not a url".into()), Some("pass".into()), None).unwrap_err()
+        );
         assert!(err.contains(LAIR_URL_VAR), "{err}");
         assert!(err.contains("not a url"), "{err}");
     }
 
     #[test]
-    fn the_debug_of_lair_signing_never_renders_the_passphrase() {
-        let signing = Signing::resolve(Some(URL.into()), Some("s3cr3t".into()), None).unwrap();
-        let rendered = format!("{signing:?}");
+    fn the_debug_of_the_resolved_policy_never_renders_the_passphrase() {
+        let policy = resolve(Some(URL.into()), Some("s3cr3t".into()), None).unwrap();
+        // `Config` derives Debug and carries this, so a passphrase must not be
+        // one `{:?}` away from the journal.
+        let rendered = format!("{policy:?}");
         assert!(!rendered.contains("s3cr3t"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
     }

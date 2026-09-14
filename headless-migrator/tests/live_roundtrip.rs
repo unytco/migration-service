@@ -52,7 +52,7 @@ use headless_migrator::conductor::HamConductor;
 use headless_migrator::config::{Config, OpenConfig};
 use headless_migrator::joining::LairSigner;
 use headless_migrator::open::{self, OpenParams};
-use headless_migrator::signing::Signing;
+use headless_migrator::signing;
 use headless_migrator::verify::VerifyParams;
 use headless_migrator::{close, verify};
 
@@ -109,7 +109,7 @@ fn load_live_env() -> Result<LiveEnv> {
     // node's lair (what `from_env` read), the open side through the NEW node's.
     // A deployed migration is two processes with an EnvironmentFile each and
     // never meets this; driving both sides in one process does.
-    new_cfg.signing = Signing::resolve(
+    new_cfg.signing = signing::resolve(
         Some(var("LIVE_LAIR_URL")?),
         Some(var("LIVE_LAIR_PASSPHRASE")?),
         None,
