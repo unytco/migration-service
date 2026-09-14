@@ -520,9 +520,14 @@ mod tests {
     #[test]
     fn the_opt_in_builds_the_connection_on_the_cap_grant_path() {
         let signing = Signing::resolve(None, None, Some("1".into())).unwrap();
+        let cfg = ham_config(&config_with(signing)).unwrap();
         assert!(
-            ham_config(&config_with(signing)).unwrap().lair.is_none(),
+            cfg.lair.is_none(),
             "the escape hatch must actually reach ham as client signing"
+        );
+        assert!(
+            cfg.allow_cap_grant_signing,
+            "and ham refuses that path unless the config asks for it by name"
         );
     }
 

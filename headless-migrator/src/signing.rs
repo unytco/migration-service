@@ -110,6 +110,8 @@ impl Signing {
             } => cfg
                 .with_lair_signing(connection_url, passphrase.clone().into_bytes())
                 .with_context(|| format!("{LAIR_URL_VAR} is not a usable lair connection URL")),
+            // ham refuses this path unless it is asked for by name, and the
+            // reconnect loop retries that refusal instead of exiting.
             Self::CapGrant => {
                 tracing::warn!(
                     event = "signing.cap_grant",
@@ -117,7 +119,7 @@ impl Signing {
                     "signing WITHOUT lair: this connect commits a capability grant to the \
                      agent's chain, which is invalid on a closed chain"
                 );
-                Ok(cfg)
+                Ok(cfg.allow_cap_grant_signing())
             }
         }
     }
@@ -239,6 +241,10 @@ mod tests {
                 cfg.lair.is_none(),
                 "{raw}: the opt-in must leave ham on the client-signing (cap grant) path"
             );
+            assert!(
+                cfg.allow_cap_grant_signing,
+                "{raw}: the opt-in must reach ham's own flag, or ham refuses the connect"
+            );
         }
     }
 
@@ -246,7 +252,9 @@ mod tests {
     fn the_opt_in_wins_over_present_lair_credentials() {
         let signing =
             Signing::resolve(Some(URL.into()), Some("pass".into()), Some("1".into())).unwrap();
-        assert!(signing.apply(ham_cfg()).unwrap().lair.is_none());
+        let cfg = signing.apply(ham_cfg()).unwrap();
+        assert!(cfg.lair.is_none());
+        assert!(cfg.allow_cap_grant_signing);
     }
 
     #[test]
