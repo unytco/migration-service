@@ -37,7 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # EXACT `=` pins on the 0.7 line: the app/DNA pin `=0.9.0` (src-tauri), and a
 # caret would resolve *ahead* of the deployed DNA — breaking notary-signature /
 # init_properties byte parity.
-ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+ham = { git = "https://github.com/unytco/ham.git", rev = "5bef5c239dec3fd26cfbc472d73b78f0c1ce8831" }
 holochain_client = "=0.9.0"
 holo_hash = { version = "=0.7.0", features = ["encoding"] }
 # Same hdi the unyt workspace pins (rave_engine uses hdi 0.8.0) so Signature /
