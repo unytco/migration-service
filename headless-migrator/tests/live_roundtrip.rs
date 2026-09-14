@@ -36,7 +36,7 @@
 //! LIVE_AGENT_KEY=<uhCAk...carried> \
 //! LIVE_HAPP_PATH=<path/to/new.happ> \
 //! LIVE_JOINING_URL=<https://target-joining> \
-//! LIVE_JOINING_SERVICE_HAPP_ID=<release-happ_id> \
+//! LIVE_JOINING_SERVICE_HAPP_ID=<that joining service's static happ_id> \
 //! LIVE_LAIR_URL=<unix:///.../lair/socket?k=...> LIVE_LAIR_PASSPHRASE=<pass> \
 //! cargo test --test live_roundtrip -- --ignored --nocapture
 //! ```

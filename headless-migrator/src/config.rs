@@ -56,10 +56,13 @@ pub struct OpenConfig {
     /// Network seed for the new DNA's app install. The joining service may also
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
-    /// The `happ_id` the release registered on the joining service
-    /// (`publish-joining-modifiers.sh`), sent as that service's `network` field.
-    /// Unrelated to `network_seed` above, and required: with no value the service
-    /// silently resolves its own static default network, not the release's.
+    /// The `happ_id` sent as the joining service's `network` field. Pin it to
+    /// that service's own static happ id, which its `GET /v1/info` reports as
+    /// `happ.id`: the service collapses that id onto its static default
+    /// network, where the release writes its modifiers. Any other name resolves
+    /// only a separately registered network, and is refused `unknown_network`
+    /// with no fallback. Unrelated to `network_seed` above, and required, so
+    /// the config names the network the install lands on.
     pub joining_service_happ_id: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
