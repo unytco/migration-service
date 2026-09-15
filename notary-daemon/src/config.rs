@@ -1,7 +1,12 @@
-//! Daemon configuration, read from the environment (mirrors pricing_oracle's
-//! `HolochainConfig::from_env`).
+//! Daemon configuration, read from the process environment and nowhere else
+//! (mirrors pricing_oracle's `HolochainConfig::from_env`). No `.env` file is
+//! loaded: it would fill an unset variable from a file found anywhere above the
+//! working directory, and one of these variables (`signing`'s opt-in) turns a
+//! chain write back on.
 
 use anyhow::{Context, Result};
+
+use ham::SigningPolicy;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,13 +27,20 @@ pub struct Config {
     pub bearer_token: String,
     /// `ham` per-request timeout (seconds).
     pub request_timeout_secs: u64,
+    /// How every `ham` connection this daemon makes signs its zome calls.
+    /// Resolved here so a daemon that cannot sign through lair dies at startup
+    /// rather than at connect, which is the moment it would write to its chain.
+    pub signing: SigningPolicy,
+}
+
+pub(crate) fn var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        fn var(key: &str) -> Option<String> {
-            std::env::var(key).ok().filter(|v| !v.is_empty())
-        }
+        // First, because it is the one misconfiguration that used to be survivable.
+        let signing = crate::signing::from_env()?;
         Ok(Self {
             admin_port: var("HOLOCHAIN_ADMIN_PORT")
                 .unwrap_or_else(|| "8800".into())
@@ -51,6 +63,7 @@ impl Config {
                 .unwrap_or_else(|| "30".into())
                 .parse()
                 .context("HAM_REQUEST_TIMEOUT_SECS")?,
+            signing,
         })
     }
 }

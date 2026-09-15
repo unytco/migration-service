@@ -227,13 +227,23 @@ pub struct HamConductor {
     role_name: String,
 }
 
+/// The `HamConfig` every `ham` connection this service makes is built from:
+/// the conductor coordinates plus the signer [`Config`] resolved at startup. One
+/// home, so the close / status / verify path and the tests that assert which
+/// signer is configured are looking at the same thing.
+pub fn ham_config(cfg: &Config) -> ham::HamConfig {
+    cfg.signing.apply(
+        ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
+            .with_request_timeout_secs(cfg.request_timeout_secs),
+    )
+}
+
 impl HamConductor {
     /// Connect both `ham` (with backoff until the conductor + app cell are
     /// reachable, or shutdown fires) and the admin socket. The close / status /
     /// verify services use this — the app is already installed.
     pub async fn connect(cfg: &Config, shutdown: &mut ham::ShutdownRx) -> Option<Self> {
-        let ham_cfg = ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-            .with_request_timeout_secs(cfg.request_timeout_secs);
+        let ham_cfg = ham_config(cfg);
         let backoff = ham::BackoffConfig::default();
         let ham =
             ham::connect_with_backoff(|| ham::Ham::connect(ham_cfg.clone()), &backoff, shutdown)
@@ -464,6 +474,56 @@ pub fn assert_happ_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::policy::PolicyOpts;
+    use crate::signing;
+
+    const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
+
+    /// A `Config` shaped like a deployed close service, carrying the signer
+    /// under test. Built directly rather than through `from_env`, which reads
+    /// the process-global environment every other test shares.
+    fn config_with(signing: ham::SigningPolicy) -> Config {
+        Config {
+            admin_port: 8800,
+            app_port: 30000,
+            app_id: "unyt".into(),
+            role_name: "alliance".into(),
+            request_timeout_secs: 60,
+            signing,
+            state_file: "/var/lib/headless-migrator/close-state.json".into(),
+            retry_initial: Duration::from_millis(1000),
+            retry_max: Duration::from_millis(30000),
+            policy: PolicyOpts::default(),
+            to_dna: None,
+        }
+    }
+
+    #[test]
+    fn the_connection_is_built_with_the_lair_signer_the_config_resolved() {
+        let signing = signing::resolve(Some(LAIR_URL.into()), Some("pass".into()), None).unwrap();
+        let ham_cfg = ham_config(&config_with(signing));
+        assert!(
+            ham_cfg.lair.is_some(),
+            "every ham connection this service makes must sign through lair"
+        );
+        assert_eq!(ham_cfg.admin_port, 8800);
+        assert_eq!(ham_cfg.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn the_opt_in_builds_the_connection_on_the_cap_grant_path() {
+        let signing = signing::resolve(None, None, Some("1".into())).unwrap();
+        let cfg = ham_config(&config_with(signing));
+        assert!(
+            cfg.lair.is_none(),
+            "the escape hatch must actually reach ham as client signing"
+        );
+        assert!(
+            cfg.allow_cap_grant_signing,
+            "and ham refuses that path unless the config asks for it by name"
+        );
+    }
 
     /// A unique scratch path under the temp dir (no `tempfile` dev-dep, matching
     /// the integration tests' convention).

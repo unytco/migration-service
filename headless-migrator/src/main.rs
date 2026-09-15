@@ -16,6 +16,7 @@ use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHashB64};
 use headless_migrator::config::{Config, OpenConfig};
 use headless_migrator::joining::LairSigner;
 use headless_migrator::open::OpenParams;
+use headless_migrator::signing::{LAIR_PASSPHRASE_VAR, LAIR_URL_VAR};
 use headless_migrator::status::StatusParams;
 use headless_migrator::verify::VerifyParams;
 use headless_migrator::{close, open, status, verify};
@@ -74,10 +75,13 @@ enum Command {
         #[arg(long)]
         agent_key: String,
         /// Lair connection URL on this droplet (for signing the join nonce).
-        #[arg(long, env = "MIGRATION_AGENT_LAIR_URL")]
+        #[arg(long, env = LAIR_URL_VAR)]
         lair_url: String,
         /// Lair passphrase on this droplet.
-        #[arg(long, env = "MIGRATION_AGENT_LAIR_PASSPHRASE")]
+        // `hide_env_values` (a plain comment, so it stays out of --help): clap
+        // renders an env-backed value into the help text by default, and this
+        // service's environment holds the node's keystore passphrase.
+        #[arg(long, env = LAIR_PASSPHRASE_VAR, hide_env_values = true)]
         lair_passphrase: String,
     },
 
@@ -101,7 +105,6 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _ = dotenvy::dotenv();
     // Logs to stderr (journald captures it); not JSON by default so journald
     // lines stay readable, but env-filter still applies.
     tracing_subscriber::fmt()

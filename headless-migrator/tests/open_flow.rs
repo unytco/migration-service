@@ -39,6 +39,7 @@ fn down_cfg(state_file: std::path::PathBuf) -> Config {
             retry_initial: Duration::from_millis(1),
             retry_max: Duration::from_millis(2),
         },
+        signing: support::signing(),
         to_dna: None,
     }
 }

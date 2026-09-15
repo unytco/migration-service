@@ -820,12 +820,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1158,10 +1152,11 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 [[package]]
 name = "ham"
 version = "0.1.0"
-source = "git+https://github.com/unytco/ham.git?branch=main#4737d6ed676baf6d45cc30d893b7b560568f093d"
+source = "git+https://github.com/unytco/ham.git?rev=4e1063602045e1b2a8aceacd5d75eedc3e3ecba3#4e1063602045e1b2a8aceacd5d75eedc3e3ecba3"
 dependencies = [
  "anyhow",
  "holochain_client",
+ "holochain_conductor_api",
  "lair_keystore_api",
  "rmp-serde",
  "serde",
@@ -1299,7 +1294,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "clap",
- "dotenvy",
  "ham",
  "hdi",
  "holo_hash",
@@ -1314,6 +1308,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zfuel",
 ]
 

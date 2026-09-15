@@ -2,7 +2,7 @@
 name = "migration-notary"
 version = "0.1.0"
 edition = "2021"
-description = "Notary daemon for unyt DNA migration — serves an agent's committed closing summary from the notary's own conductor so the migration-service can hand it to that agent for opening on the successor DNA; read-only, no signing capability"
+description = "Notary daemon for unyt DNA migration — serves an agent's committed closing summary from the notary's own conductor so the migration-service can hand it to that agent for opening on the successor DNA; read-only, and it signs for nobody but itself"
 license = "CAL-1.0"
 
 [lib]
@@ -27,15 +27,17 @@ async-trait = "0.1"
 
 # Utilities
 anyhow = "1"
+# Already in the graph via lair (the same 2.x entry), so declaring it adds no
+# build: it parses the lair connection URL at startup, where a bad one is fatal.
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dotenvy = "0.15"
 
 # Holochain bridge — same stack as pricing_oracle / watchtower-observer.
 # EXACT `=` pins on the 0.7 line: the app/DNA pin `=0.9.0` (src-tauri), and a
 # caret would resolve *ahead* of the deployed DNA — breaking notary-signature /
 # init_properties byte parity.
-ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+ham = { git = "https://github.com/unytco/ham.git", rev = "4e1063602045e1b2a8aceacd5d75eedc3e3ecba3" }
 holochain_client = "=0.9.0"
 holo_hash = { version = "=0.7.0", features = ["encoding"] }
 # Same hdi the unyt workspace pins (rave_engine uses hdi 0.8.0) so Signature /
