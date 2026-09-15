@@ -187,7 +187,7 @@
           "api": "v1"
         }
       ],
-      "published": false
+      "published": true
     }
   ]
 }
