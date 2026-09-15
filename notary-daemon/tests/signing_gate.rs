@@ -133,6 +133,52 @@ fn without_lair_signing_the_daemon_exits_instead_of_connecting() {
 }
 
 #[test]
+fn lair_credentials_let_the_daemon_connect() {
+    // The other half of the gate: that `from_env` reads the two variables the
+    // installer actually renders. Nothing else pins the wiring, so a service
+    // that read the wrong name would refuse for the wrong reason and still look
+    // correct. Signing is settled before the admin socket is dialled, so
+    // reaching the stub port is the evidence the credentials were accepted.
+    let (listener, port) = admin_port_stub();
+
+    let mut child = daemon(
+        "lair",
+        port,
+        &[
+            (
+                "MIGRATION_NOTARY_LAIR_URL",
+                "unix:///var/lib/holochain/lair/socket?k=abc123",
+            ),
+            ("MIGRATION_NOTARY_LAIR_PASSPHRASE", "deadbeef"),
+        ],
+    )
+    .stderr(Stdio::null())
+    .stdout(Stdio::null())
+    .spawn()
+    .expect("starting the notary daemon");
+
+    let deadline = Instant::now() + DEADLINE;
+    let connected = loop {
+        if was_connected_to(&listener) {
+            break true;
+        }
+        if let Some(status) = child.try_wait().expect("polling the notary daemon") {
+            panic!("the notary daemon exited ({status:?}) instead of connecting: it did not accept the lair credentials");
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(POLL);
+    };
+
+    kill(child);
+    assert!(
+        connected,
+        "with both lair variables set the notary daemon must get past the refusal"
+    );
+}
+
+#[test]
 fn the_cap_grant_opt_in_lets_the_daemon_connect() {
     let (listener, port) = admin_port_stub();
 

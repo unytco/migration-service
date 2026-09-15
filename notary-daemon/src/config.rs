@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::signing::Signing;
+use ham::SigningPolicy;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -30,7 +30,7 @@ pub struct Config {
     /// How every `ham` connection this daemon makes signs its zome calls.
     /// Resolved here so a daemon that cannot sign through lair dies at startup
     /// rather than at connect, which is the moment it would write to its chain.
-    pub signing: Signing,
+    pub signing: SigningPolicy,
 }
 
 pub(crate) fn var(key: &str) -> Option<String> {
@@ -40,7 +40,7 @@ pub(crate) fn var(key: &str) -> Option<String> {
 impl Config {
     pub fn from_env() -> Result<Self> {
         // First, because it is the one misconfiguration that used to be survivable.
-        let signing = Signing::from_env()?;
+        let signing = crate::signing::from_env()?;
         Ok(Self {
             admin_port: var("HOLOCHAIN_ADMIN_PORT")
                 .unwrap_or_else(|| "8800".into())
