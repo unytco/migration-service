@@ -36,7 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - headless-migrator: a debt on any unit blocks a close, not just the base one (`rave_engine` 0.10.0).
 - headless-migrator: a global definition outside its validity window waits under the bounded deadline rather than retrying unbounded.
 - **Upgrade to Holochain 0.7** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
-- Both crates pin `ham` to an exact revision (`5bef5c2`) rather than its `main` branch, so a change to it reaches them only in a commit that names the new revision.
+- Both crates pin `ham` to an exact revision (`d59abb33`) rather than its `main` branch, so a change to it reaches them only in a commit that names the new revision.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
 - **CI/deploy: every GitHub Actions `uses:` is pinned to an immutable commit SHA with `persist-credentials: false`, and CI now runs on pull requests to `main` as well as `develop`.** Router `compatibility_date` bumped `2024-09-23 → 2024-12-30`.
