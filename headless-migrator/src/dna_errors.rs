@@ -386,10 +386,11 @@ pub fn router_code_is_retryable(code: &str) -> bool {
 /// an unrecognized code is surfaced rather than retried forever. An entry is
 /// retryable because the open service builds what it names afresh on every pass,
 /// a new session, challenge answer or signed timestamp. A refusal of the request
-/// ITSELF (an unregistered network, an agent off the allow list) is not, since
-/// the next pass asks the identical question. That is about asking the same way
-/// again, not about the run being over: [`AGENT_ALREADY_JOINED`] is not
-/// retryable and is still recovered, by asking a different way.
+/// ITSELF (a network name the service does not resolve, an agent off the allow
+/// list) is not, since the next pass asks the identical question. That is about
+/// asking the same way again, not about the run being over:
+/// [`AGENT_ALREADY_JOINED`] is not retryable and is still recovered, by asking
+/// a different way.
 pub fn joining_code_is_retryable(code: &str) -> bool {
     matches!(
         code,

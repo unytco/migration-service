@@ -1,8 +1,12 @@
-//! Agent configuration, read from the environment (mirrors notary-daemon's
-//! `Config::from_env`). The `automation/` installer renders these into the
+//! Agent configuration, read from the process environment and nowhere else
+//! (mirrors notary-daemon's `Config::from_env`). No `.env` file is loaded: it
+//! would fill an unset variable from a file found anywhere above the working
+//! directory, and one of these variables (`signing`'s opt-in) turns a chain
+//! write back on. The `automation/` installer renders these into the
 //! systemd `EnvironmentFile`; every field has a sensible default except the
-//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, and for the
-//! open service, `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
+//! ones that have no safe default (`MIGRATION_AGENT_STATE_FILE`, the lair
+//! credentials behind [`crate::signing`], and for the open service,
+//! `MIGRATION_AGENT_HAPP_PATH` / `MIGRATION_AGENT_JOINING_URL` /
 //! `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID`, validated by the open command
 //! itself, not here, so close/status need no open-only vars).
 
@@ -13,6 +17,7 @@ use anyhow::{Context, Result};
 use holo_hash::DnaHashB64;
 
 use crate::policy::PolicyOpts;
+use ham::SigningPolicy;
 
 /// How the supervised loops connect to the local conductor and where they
 /// record progress, plus the M-of-N collection policy knobs.
@@ -37,6 +42,10 @@ pub struct Config {
     pub retry_max: Duration,
     /// The signature-collection policy (open question knobs all live here).
     pub policy: PolicyOpts,
+    /// How every `ham` connection this service makes signs its zome calls.
+    /// Resolved here so a service that cannot sign through lair dies at startup
+    /// rather than at connect, which is the moment the damage was done.
+    pub signing: SigningPolicy,
     /// The successor DNA a close binds to (`prepare_closing_summary(to_dna)`).
     /// Read from `MIGRATION_AGENT_TO_DNA`; `None` for the open / verify / status
     /// commands (which take from/to as CLI args) — the close command requires it.
@@ -56,10 +65,13 @@ pub struct OpenConfig {
     /// Network seed for the new DNA's app install. The joining service may also
     /// return one in `dna_modifiers`; that takes precedence when present.
     pub network_seed: Option<String>,
-    /// The `happ_id` the release registered on the joining service
-    /// (`publish-joining-modifiers.sh`), sent as that service's `network` field.
-    /// Unrelated to `network_seed` above, and required: with no value the service
-    /// silently resolves its own static default network, not the release's.
+    /// The `happ_id` sent as the joining service's `network` field. Pin it to
+    /// that service's own static happ id, which its `GET /v1/info` reports as
+    /// `happ.id`: the service collapses that id onto its static default
+    /// network, where the release writes its modifiers. Any other name resolves
+    /// only a separately registered network, and is refused `unknown_network`
+    /// with no fallback. Unrelated to `network_seed` above, and required, so
+    /// the config names the network the install lands on.
     pub joining_service_happ_id: String,
     /// Bounded deadline for the too-early-install wait: if `init` keeps failing
     /// because the successor `GlobalDefinition` is not yet in effect (not
@@ -69,7 +81,7 @@ pub struct OpenConfig {
     pub gd_wait_timeout: Duration,
 }
 
-fn var(key: &str) -> Option<String> {
+pub(crate) fn var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
@@ -121,6 +133,8 @@ impl Config {
     }
 
     pub fn from_env() -> Result<Self> {
+        // First, because it is the one misconfiguration that used to be survivable.
+        let signing = crate::signing::from_env()?;
         let state_file = var("MIGRATION_AGENT_STATE_FILE")
             .context("MIGRATION_AGENT_STATE_FILE is required (the report collector reads it)")?
             .into();
@@ -133,6 +147,7 @@ impl Config {
             app_id: var("HOLOCHAIN_APP_ID").unwrap_or_else(|| "unyt".into()),
             role_name: var("HOLOCHAIN_ROLE_NAME").unwrap_or_else(|| "alliance".into()),
             request_timeout_secs: parse_var("HAM_REQUEST_TIMEOUT_SECS", "60")?,
+            signing,
             state_file,
             retry_initial: Duration::from_millis(retry_initial_ms),
             retry_max: Duration::from_millis(retry_max_ms),

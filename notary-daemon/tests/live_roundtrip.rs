@@ -15,6 +15,8 @@
 //! HOLOCHAIN_APP_ID=<installed-app-id> \
 //! HOLOCHAIN_ROLE_NAME=alliance \
 //! MIGRATION_NOTARY_BIND_PORT=8790 \
+//! MIGRATION_NOTARY_LAIR_URL=<the conductor's keystore.connection_url> \
+//! MIGRATION_NOTARY_LAIR_PASSPHRASE=<its passphrase> \
 //! LIVE_CLOSED_AGENT_B64=<uhCAk... of the closed agent> \
 //! cargo test --test live_roundtrip -- --ignored --nocapture
 //! ```

@@ -730,17 +730,23 @@ fn install_error_outcome(e: anyhow::Error) -> OpenOutcome {
 /// itself names which step it came from.
 fn join_error_outcome(e: JoinError, open_cfg: &OpenConfig, role_name: &str) -> OpenOutcome {
     match e {
-        JoinError::Permanent(e) => OpenOutcome::HardStop(format!(
-            "the target release's joining service at {} will not provision the carried key, and \
-             retrying cannot change that: {e:#}. The code and message above are that service's \
-             own, and they name the step that failed. A refused JOIN is usually \
-             MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID ('{}') naming a network it has not \
-             registered (publish-joining-modifiers.sh), the carried key not being on that \
-             network's allow list, or its roles map carrying no '{role_name}'. A refused \
-             RECONNECT is usually the carried key being revoked, this node signing with the \
-             wrong key, or that service having no reconnect route.",
-            open_cfg.joining_url, open_cfg.joining_service_happ_id,
-        )),
+        JoinError::Permanent(e) => {
+            let base = open_cfg.joining_url.trim_end_matches('/');
+            let happ_id = &open_cfg.joining_service_happ_id;
+            OpenOutcome::HardStop(format!(
+                "the target release's joining service at {base} will not provision the carried \
+                 key, and retrying cannot change that: {e:#}. The code and message above are \
+                 that service's own, and they name the step that failed. A refused JOIN is \
+                 usually MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID ('{happ_id}') naming something \
+                 other than that service's own static happ id, the only name it resolves on its \
+                 own. An unauthenticated 'GET {base}/info' settles that and the next cause: \
+                 'happ.id' is the id this one must equal, and 'roles' is what it will provision, \
+                 so no '{role_name}' there is that service not yet serving this release's \
+                 modifiers. The remaining cause is the carried key not being on its allow list. \
+                 A refused RECONNECT is usually the carried key being revoked, this node signing \
+                 with the wrong key, or that service having no reconnect route."
+            ))
+        }
         JoinError::Transient(e) => {
             OpenOutcome::Transient(e.context("fresh membrane proof from target joining service"))
         }
@@ -966,6 +972,32 @@ mod tests {
                 && why.contains("alliance")
                 && why.contains("joining.example"),
             "the hard stop names the config to check: {why}"
+        );
+        assert!(
+            why.contains("static happ id") && why.contains("GET https://joining.example/v1/info"),
+            "the hard stop renders the URL the id is readable from, not a path to guess at: \
+             {why}"
+        );
+        assert!(
+            !why.contains("publish-joining-modifiers"),
+            "registering a network is refused for the id the release deploys under, so the \
+             hard stop must never send an operator there: {why}"
+        );
+
+        let trailing_slash = OpenConfig {
+            joining_url: "https://joining.example/v1/".into(),
+            ..open_cfg()
+        };
+        let OpenOutcome::HardStop(why) = join_error_outcome(
+            JoinError::Permanent(anyhow::anyhow!("POST /join returned 400 Bad Request")),
+            &trailing_slash,
+            "alliance",
+        ) else {
+            panic!("a permanent joining refusal must hard-stop the open service");
+        };
+        assert!(
+            why.contains("GET https://joining.example/v1/info") && !why.contains("//info"),
+            "a configured trailing slash must not render a doubled path: {why}"
         );
 
         let missing_role = JoinError::Permanent(anyhow::anyhow!(
