@@ -146,27 +146,26 @@ pub trait Conductor: Send + Sync {
     /// and the close-side half of `Verify`.
     async fn get_ledger(&self) -> Result<Ledger>;
 
-    /// `transactor::drop_off_fees` — clear any owed fees BEFORE preparing the
-    /// summary, which pins the chain top.
+    /// `transactor::drop_off_fees`: clear any owed fees.
     async fn drop_off_fees(&self) -> Result<String>;
 
-    /// `transactor::prepare_closing_summary` — the payload notaries check, plus
+    /// `transactor::prepare_closing_summary`: the payload notaries check, plus
     /// the GD's closing pair (N, M). Takes the successor `target` the close
     /// binds to; the extern pre-checks it against this DNA's `upgrade_targets`.
     async fn prepare_closing_summary(&self, target: DnaHash) -> Result<PrepareCloseResponse>;
 
-    /// `transactor::request_close_check` — one `call_remote` to a notary's
+    /// `transactor::request_close_check`: one `call_remote` to a notary's
     /// `notary_check_closing_summary`, response verbatim.
     async fn request_close_check(&self, req: CloseCheckRequest) -> Result<CloseCheckResponse>;
 
-    /// `transactor::close_agent_chain` — commit the `ClosingStateSummary` and
+    /// `transactor::close_agent_chain`: commit the `ClosingStateSummary` and
     /// `close_chain` in one call. Returns the summary action hash.
     async fn close_agent_chain(
         &self,
         payload: SummaryStatePayload,
     ) -> Result<holo_hash::ActionHash>;
 
-    /// `transactor::get_migration_close_state` — the agent's own committed close
+    /// `transactor::get_migration_close_state`: the agent's own committed close
     /// `{ payload, close_action }`. Errors if the chain has not closed.
     async fn get_migration_close_state(&self) -> Result<CommittedClose>;
 
@@ -227,10 +226,16 @@ pub struct HamConductor {
 /// the conductor coordinates plus the signer [`Config`] resolved at startup. One
 /// home, so the close / status / verify path and the tests that assert which
 /// signer is configured are looking at the same thing.
+///
+/// The request timeout covers the check's own, since a `request_close_check`
+/// is one zome call on this connection.
 pub fn ham_config(cfg: &Config) -> ham::HamConfig {
+    let request_timeout_secs = cfg
+        .request_timeout_secs
+        .max(cfg.policy.request_timeout.as_secs());
     cfg.signing.apply(
         ham::HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-            .with_request_timeout_secs(cfg.request_timeout_secs),
+            .with_request_timeout_secs(request_timeout_secs),
     )
 }
 
@@ -494,7 +499,17 @@ mod tests {
             "every ham connection this service makes must sign through lair"
         );
         assert_eq!(ham_cfg.admin_port, 8800);
-        assert_eq!(ham_cfg.request_timeout_secs, 60);
+    }
+
+    #[test]
+    fn a_check_is_never_cut_short_by_the_connection_timeout() {
+        let signing = signing::resolve(Some(LAIR_URL.into()), Some("pass".into()), None).unwrap();
+        let mut cfg = config_with(signing);
+        cfg.request_timeout_secs = 60;
+        cfg.policy.request_timeout = Duration::from_secs(120);
+        assert_eq!(ham_config(&cfg).request_timeout_secs, 120);
+        cfg.request_timeout_secs = 300;
+        assert_eq!(ham_config(&cfg).request_timeout_secs, 300);
     }
 
     #[test]

@@ -1,7 +1,6 @@
-//! Chain/app state probing and the next-step mapping that makes both services
-//! idempotent and restart-safe. Every service re-probes on (re)start and
-//! resumes from the first incomplete step; this module is the pure decision
-//! layer, exhaustively unit-tested against the mock conductor.
+//! Chain and app state probing that keeps both services idempotent and
+//! restart-safe: every service re-probes on (re)start and resumes from the first
+//! incomplete step. Unit-tested against the mock conductor.
 
 use anyhow::Result;
 use rave_engine::types::entries::migration::v0_2::CommittedClose;
@@ -39,9 +38,8 @@ pub enum ProbeFailure {
     Transient(anyhow::Error),
 }
 
-/// Classify the close state of the old chain WITHOUT writing to it, from
-/// `get_migration_close_state`: a close ⇒ `Closed`; `MIG_NO_CLOSING_SUMMARY`
-/// ⇒ `Open`; `MIG_NO_CLOSE_CHAIN_ACTION` ⇒ a hard stop.
+/// Read the old chain's close state from `get_migration_close_state`, without
+/// writing to it.
 pub async fn probe_close_state(
     conductor: &dyn Conductor,
 ) -> std::result::Result<CloseState, ProbeFailure> {
@@ -70,16 +68,13 @@ pub async fn probe_close_state(
 /// The close-side answer to the `Status` report's "is the old chain closed?"
 /// question — a TRI-STATE, because a status report must not conflate "the
 /// conductor says the chain is still open" with "the conductor was unreachable".
-/// (The close *service* needs no such distinction: it treats any non-closed
-/// result as "open, re-probe", since prepare/collect/close are idempotent. Only
-/// the report needs to tell a definitive answer from a missing one.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosedStatus {
     /// A committed close was read back — the old chain is closed.
     Closed,
     /// The conductor was reached and definitively reports no committed close yet
     /// (a recognized "no closing state summary" / "no CloseChain" response,
-    /// i.e. a plain-open or partial-close chain).
+    /// i.e. an open chain, or one holding a summary with no close after it).
     NotClosed,
     /// The close state could not be determined — a transport failure, a timeout,
     /// or any unrecognized error. NOT a definitive "not closed"; the report must

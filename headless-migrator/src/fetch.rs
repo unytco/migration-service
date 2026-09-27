@@ -1,6 +1,6 @@
 //! The migration-package fetch against the router (`POST /v1/migrate`). The
-//! router returns the closing-summary package `{ payload, notary_signatures,
-//! close_action }` verbatim, or the shared error envelope. For a headless
+//! router returns the package `{ payload, notary_signatures, close_action }`,
+//! M notaries' signatures over one close, or the shared error envelope. For a headless
 //! restoring agent, a `no_close_found` AFTER a known close can only be
 //! propagation lag — so it (and the genuinely transient codes) maps to
 //! `KeepWaiting`, NEVER a hard stop and NEVER a fresh-agent fallback. A true

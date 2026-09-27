@@ -220,12 +220,12 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
         || r_lower.contains("carry-forward section")
         // An update to the opening summary is never allowed.
         || r_lower.contains("opening state summary update is not allowed")
-        // Single-landing reject (M13): the close's target_dna_hash != the DNA
+        // Single-landing reject: the close's target_dna_hash != the DNA
         // being opened. Lowercase `dna` — the verdict is "...names a different
         // target DNA" and the input is lowercased before matching.
         || r_lower.contains("names a different target dna")
         // The close's source_dna_hash has no entry in the target GD's
-        // opening_predecessors (M13).
+        // opening_predecessors.
         || r_lower.contains("is not an accepted predecessor")
 }
 
@@ -233,8 +233,8 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
 /// close validator — is a terminal target-binding fault: the configured `to_dna`
 /// is not in the source GD's `upgrade_targets`, so no amount of retrying fixes it
 /// (unlike propagation lag / a transient blip, which the close loop retries
-/// forever). Mirrors M13's two strings; lowercased internally so the caller may
-/// pass the raw rendered error.
+/// forever). Mirrors the two target strings; lowercased internally so the caller
+/// may pass the raw rendered error.
 pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     if let Some(code) = MigrationError::from_rendered(rendered) {
         return code == MigrationError::CloseTargetNotUpgradeTarget;
@@ -309,25 +309,11 @@ pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
     }
 }
 
-/// Whether a `get_migration_close_state` error string is a *recognized DNA
-/// close-state response* (the conductor was reached and the chain definitively
-/// has no committed close yet) rather than a transport / unexpected failure
-/// (which leaves the close state UNKNOWN). The close **service** treats every
-/// non-closed error as "open, re-probe" (safe — its actions are idempotent), but
-/// the **status report** must not present an unreachable conductor as a definitive
-/// `old_chain_closed = false`; this predicate is what lets it distinguish the two.
-/// Mirrors the same two alliance close-surface strings `classify_close_error`
-/// keys off: `"No closing state summary found"` (plain open) and
-/// `"no CloseChain action found on chain"` (a summary with no close).
+/// Whether a `get_migration_close_state` error is the DNA answering about the
+/// chain rather than a transport or unexpected failure, so the status report
+/// never shows an unreachable conductor as `old_chain_closed = false`.
 pub fn is_recognized_close_state_response(rendered: &str) -> bool {
-    if let Some(code) = MigrationError::from_rendered(rendered) {
-        return matches!(
-            code,
-            MigrationError::NoClosingSummary | MigrationError::NoCloseChainAction
-        );
-    }
-    rendered.contains("No closing state summary found")
-        || rendered.contains("no CloseChain action found")
+    classify_close_error(rendered) != CloseErrorClass::Unrecognized
 }
 
 /// Whether a router error `code` is a genuine hard stop for the migration —
@@ -370,7 +356,7 @@ pub fn router_code_is_retryable(code: &str) -> bool {
         // Notaries momentarily unreachable / unable to attest — re-fetch later.
         | "all_orgs_unhealthy"
         | "unable_to_verify"
-        // The router's own internal/transport error — our fault, retry.
+        // A daemon fault the router reports, or packages that disagree: retry.
         | "internal"
         // Auth / rate limiting — momentary; back off and retry.
         | "auth_failed"
@@ -541,7 +527,7 @@ mod tests {
 
     #[test]
     fn skip_open_rejects_are_hard_failures() {
-        // M13 single-landing + unlisted-source verdicts must hard-stop the open
+        // Single-landing and unlisted-source verdicts must hard-stop the open
         // service (the classifier lowercases its input before matching).
         assert_eq!(
             classify_migration_init_error("Opening state summary names a different target DNA"),

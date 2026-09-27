@@ -60,8 +60,11 @@ pub struct MockConductor {
     /// every pass, the shape a schema mismatch actually has.
     pub ledger: Mutex<Option<anyhow::Result<Ledger>>>,
     pub drop_fees: Mutex<Option<anyhow::Result<String>>>,
-    pub prepare: Mutex<Option<anyhow::Result<PrepareCloseResponse>>>,
+    pub prepare: Mutex<VecDeque<anyhow::Result<PrepareCloseResponse>>>,
     pub check_responses: Mutex<VecDeque<anyhow::Result<CloseCheckResponse>>>,
+    /// Every check request, and every payload `close_agent_chain` committed.
+    pub checks: Mutex<Vec<CloseCheckRequest>>,
+    pub closed_with: Mutex<Vec<SummaryStatePayload>>,
     pub close_result: Mutex<Option<anyhow::Result<ActionHash>>>,
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
@@ -129,22 +132,20 @@ impl Conductor for MockConductor {
         target: holo_hash::DnaHash,
     ) -> anyhow::Result<PrepareCloseResponse> {
         self.record(Call::PrepareClosingSummary { target });
-        self.prepare
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_else(|| Err(anyhow::anyhow!("mock: no prepare scripted")))
+        Self::pop(&self.prepare, "prepare_closing_summary")
     }
 
     async fn request_close_check(
         &self,
-        _req: CloseCheckRequest,
+        req: CloseCheckRequest,
     ) -> anyhow::Result<CloseCheckResponse> {
         self.record(Call::RequestCloseCheck);
+        self.checks.lock().unwrap().push(req);
         Self::pop(&self.check_responses, "request_close_check")
     }
 
-    async fn close_agent_chain(&self, _payload: SummaryStatePayload) -> anyhow::Result<ActionHash> {
+    async fn close_agent_chain(&self, payload: SummaryStatePayload) -> anyhow::Result<ActionHash> {
+        self.closed_with.lock().unwrap().push(payload);
         self.record(Call::CloseAgentChain);
         self.close_result
             .lock()

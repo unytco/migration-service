@@ -24,7 +24,7 @@ use crate::state_file::{Phase, State, Step};
 enum CloseOutcome {
     /// The chain is closed (now or already). Exit 0.
     Closed,
-    /// A hard stop — warrants on the agent. Exit nonzero; the operator must act.
+    /// A fault no retry fixes. Exit nonzero; the operator must act.
     HardStop(String),
     /// A transient failure; back off and re-probe.
     Transient(anyhow::Error),
@@ -37,11 +37,6 @@ pub async fn run(
     cfg: &Config,
     shutdown: &mut ham::ShutdownRx,
 ) -> Result<()> {
-    // A single `State` carried across every pass: progress fields (`agent`,
-    // `approvals_collected` / `approvals_threshold`) set during the check must
-    // survive transient passes and persist INTO the final closed state, so the
-    // report collector (`make migrate-status`) sees them after a successful
-    // close.
     // The close binds to a configured successor (single-landing). Resolve it up
     // front so a missing/garbled MIGRATION_AGENT_TO_DNA fails the close service
     // immediately (not mid-loop); open/verify/status, which don't set it, are
@@ -114,8 +109,8 @@ async fn attempt(
 
     match close_state {
         CloseState::Closed(committed) => {
-            // A chain found closed never ran the check: only the agent is
-            // recovered, and the approval counts stay unset.
+            // The close carries no approvals, so only the agent can be
+            // recovered from it.
             let agent_b64 =
                 AgentPubKeyB64::from(committed.payload.agent_pubkey.clone()).to_string();
             persist(cfg, state, |s| {
@@ -129,7 +124,6 @@ async fn attempt(
     }
 }
 
-/// The full close path: fee-drop if owed → prepare → M notaries approve → close.
 async fn prepare_check_close(
     conductor: &dyn Conductor,
     cfg: &Config,
@@ -201,7 +195,9 @@ async fn prepare_check_close(
         Err(e @ PolicyError::Exhausted { .. }) => {
             return CloseOutcome::Transient(anyhow::anyhow!("{e}"))
         }
-        Err(PolicyError::Fatal(why)) => return CloseOutcome::HardStop(why),
+        Err(PolicyError::Misconfigured(why) | PolicyError::Fatal(why)) => {
+            return CloseOutcome::HardStop(why)
+        }
     };
 
     persist(cfg, state, |s| {

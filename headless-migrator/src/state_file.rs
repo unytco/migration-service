@@ -27,7 +27,8 @@ pub enum Step {
     Probing,
     /// Old chain: clearing owed fees before preparing the summary.
     DroppingFees,
-    /// Old chain: asking M of the N notaries to check the close.
+    /// Old chain: preparing the summary and asking M of the N notaries to check
+    /// it.
     CollectingApprovals,
     /// Old chain: committing the close + close_chain.
     Closing,
@@ -121,7 +122,7 @@ pub struct State {
 pub struct VerifyReport {
     pub balance_match: bool,
     pub carry_forward_units_match: bool,
-    /// The B49 cross-check: the new chain's COMMITTED agreement state (read
+    /// The agreement cross-check: the new chain's COMMITTED agreement state (read
     /// via `get_opened_agreement_state`) matches the fetched close package's
     /// carry-forward section — count and per-agreement hashes. `serde(default)`
     /// keeps pre-existing persisted reports decoding (they never had the

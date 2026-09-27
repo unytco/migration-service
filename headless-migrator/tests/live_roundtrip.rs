@@ -2,7 +2,7 @@
 //! against locally running conductors (an old-DNA conductor with a stateful
 //! agent + notary cells, and a new-DNA conductor), plus a `wrangler dev` router.
 //! Proves the close → key-carry → open → verify arc end-to-end, and that a kill
-//! mid-flow resumes without re-collecting for a closed chain or double-opening.
+//! mid-flow resumes without re-checking a closed chain or double-opening.
 //!
 //! Ignored by default — these need live conductors + a router and so run only
 //! at release time (this milestone is build + local verification). They are
@@ -229,7 +229,7 @@ async fn live_open_is_idempotent_across_restart() -> Result<()> {
 }
 
 /// Restart drill: re-running the close service after a successful close is a
-/// no-op (never re-collects for a closed chain).
+/// no-op (never re-checks a closed chain).
 #[tokio::test]
 #[ignore = "needs the live fixture from the file header; run after a completed close"]
 async fn live_close_is_idempotent_across_restart() -> Result<()> {

@@ -10,8 +10,10 @@
 //!   `state_mismatch_retries` in a row.
 //! - A merely slow notary is **never** substituted: only a `TimedOut` outcome
 //!   (the caller applies the timeout) is.
-//! - Too few notaries left to reach M: the attempt fails. Nothing was
-//!   committed, so the caller probes and prepares afresh.
+//! - Too few notaries left to reach M: the attempt fails, and the caller
+//!   decides what that means.
+//! - A threshold of 0, or fewer distinct notaries than M: misconfigured, since
+//!   no attempt can succeed.
 //! - `Warranted` → hard stop for the whole migration.
 
 use std::collections::HashSet;
@@ -23,20 +25,19 @@ use holo_hash::AgentPubKey;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-/// Tunable knobs for the collection policy — every open question the spec left
-/// to the driver. Defaults are read from the environment so `automation/` can
-/// tune a window without a rebuild.
+/// Tunable knobs for the check policy, read from the environment so
+/// `automation/` can tune a window without a rebuild.
 #[derive(Debug, Clone)]
 pub struct PolicyOpts {
-    /// Per-request check timeout — "generous" so a slow-but-live notary is
-    /// not mistaken for a dead one. A request exceeding this counts as failed.
+    /// Per-request check timeout, generous so a slow but live notary is not
+    /// mistaken for a dead one. A request exceeding this counts as failed.
     pub request_timeout: Duration,
-    /// Consecutive `StateMismatch` responses from the SAME notary tolerated
-    /// (retried with backoff) before that notary is substituted.
+    /// Consecutive refusals (`StateMismatch` or `TargetNotApproved`) from the
+    /// SAME notary tolerated before it is substituted.
     pub state_mismatch_retries: u32,
-    /// Initial backoff before a same-notary `StateMismatch` retry.
+    /// Initial backoff before asking the same notary again.
     pub retry_initial: Duration,
-    /// Cap on the same-notary `StateMismatch` retry backoff.
+    /// Cap on that backoff.
     pub retry_max: Duration,
 }
 
@@ -44,7 +45,7 @@ impl Default for PolicyOpts {
     fn default() -> Self {
         Self {
             // Generous: gossip + recompute on a loaded notary can be slow, and
-            // wrongly timing out a live signer would churn substitutions.
+            // wrongly timing out a live notary would churn substitutions.
             request_timeout: Duration::from_secs(120),
             state_mismatch_retries: 5,
             retry_initial: Duration::from_secs(2),
@@ -55,27 +56,39 @@ impl Default for PolicyOpts {
 
 impl PolicyOpts {
     pub fn from_env() -> Result<Self> {
-        fn dur_secs(key: &str, default: u64) -> Result<Duration> {
-            let raw = std::env::var(key).ok().filter(|v| !v.is_empty());
-            match raw {
-                Some(v) => Ok(Duration::from_secs(
-                    v.parse().map_err(|e| anyhow::anyhow!("{key}: {e}"))?,
-                )),
-                None => Ok(Duration::from_secs(default)),
-            }
-        }
-        let d = PolicyOpts::default();
-        Ok(Self {
-            request_timeout: dur_secs("MIGRATION_AGENT_SIGN_TIMEOUT_SECS", 120)?,
-            state_mismatch_retries: std::env::var("MIGRATION_AGENT_STATE_MISMATCH_RETRIES")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|v| v.parse())
+        Self::from_lookup(crate::config::var)
+    }
+
+    /// Read the knobs through `lookup`, so the names and defaults are testable
+    /// without touching the process environment.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let parse = |key: &str, default: u64| -> Result<u64> {
+            lookup(key)
+                .map(|v| v.parse().map_err(|e| anyhow::anyhow!("{key}: {e}")))
                 .transpose()
-                .map_err(|e| anyhow::anyhow!("MIGRATION_AGENT_STATE_MISMATCH_RETRIES: {e}"))?
-                .unwrap_or(d.state_mismatch_retries),
-            retry_initial: dur_secs("MIGRATION_AGENT_SIGN_RETRY_INITIAL_SECS", 2)?,
-            retry_max: dur_secs("MIGRATION_AGENT_SIGN_RETRY_MAX_SECS", 30)?,
+                .map(|v| v.unwrap_or(default))
+        };
+        let d = PolicyOpts::default();
+        // The names the release tooling renders, so they keep SIGN.
+        Ok(Self {
+            request_timeout: Duration::from_secs(parse(
+                "MIGRATION_AGENT_SIGN_TIMEOUT_SECS",
+                d.request_timeout.as_secs(),
+            )?),
+            state_mismatch_retries: parse(
+                "MIGRATION_AGENT_STATE_MISMATCH_RETRIES",
+                d.state_mismatch_retries.into(),
+            )?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("MIGRATION_AGENT_STATE_MISMATCH_RETRIES: {e}"))?,
+            retry_initial: Duration::from_secs(parse(
+                "MIGRATION_AGENT_SIGN_RETRY_INITIAL_SECS",
+                d.retry_initial.as_secs(),
+            )?),
+            retry_max: Duration::from_secs(parse(
+                "MIGRATION_AGENT_SIGN_RETRY_MAX_SECS",
+                d.retry_max.as_secs(),
+            )?),
         })
     }
 }
@@ -86,28 +99,23 @@ impl PolicyOpts {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckOutcome {
     Approved,
-    /// Ask the same notary again.
     StateMismatch,
-    /// Ask the same notary again.
     TargetNotApproved,
-    /// Substitute.
     UnableToVerify,
-    /// Substitute.
     NotAClosingNotary,
-    /// Substitute.
     TimedOut,
-    /// Substitute.
     Errored,
 }
 
-/// Why a collection attempt did not reach M signatures.
+/// Why the check did not reach M approvals.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyError {
-    /// The agent carries warrants — a hard stop for the whole migration.
+    /// The agent carries warrants: a hard stop for the whole migration.
     Warranted,
-    /// The N-list was exhausted (or could never reach M) before M notaries
-    /// approved. Nothing was committed; the agent re-runs later.
+    /// Every notary was asked before M approved.
     Exhausted { collected: usize, threshold: u32 },
+    /// No attempt can reach M: a threshold of 0, or fewer distinct notaries.
+    Misconfigured(String),
     /// The injected checker returned a hard error the policy can't classify.
     Fatal(String),
 }
@@ -115,7 +123,7 @@ pub enum PolicyError {
 impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PolicyError::Warranted => write!(f, "agent carries warrants — migration hard-stopped"),
+            PolicyError::Warranted => write!(f, "agent carries warrants: migration hard-stopped"),
             PolicyError::Exhausted {
                 collected,
                 threshold,
@@ -123,6 +131,7 @@ impl std::fmt::Display for PolicyError {
                 f,
                 "notary list exhausted with {collected}/{threshold} approvals"
             ),
+            PolicyError::Misconfigured(why) => write!(f, "{why}"),
             PolicyError::Fatal(e) => write!(f, "fatal error collecting approvals: {e}"),
         }
     }
@@ -141,17 +150,15 @@ pub trait Checker {
     ) -> impl Future<Output = std::result::Result<CheckOutcome, PolicyError>> + Send;
 }
 
-/// A pause primitive the policy uses for same-notary `StateMismatch` backoff —
-/// real code sleeps; tests pass a no-op so the state machine runs instantly.
+/// A pause primitive the policy uses for the same-notary backoff: real code
+/// sleeps, tests pass a no-op so the state machine runs instantly.
 pub trait Sleeper {
     fn sleep(&self, dur: Duration) -> impl Future<Output = ()> + Send;
 }
 
-/// Exponential backoff for same-notary retries — delegated to
-/// `ham::compute_delay_ms` (the dep's pub-exported, jittered backoff) so all
-/// slots that hit `StateMismatch` at the same gossip moment do NOT retry in
-/// lockstep: its ~10% wall-clock jitter de-synchronizes them. A hand-rolled
-/// copy would drop that jitter, so reuse the one source of truth.
+/// Exponential backoff for same-notary retries, from `ham::compute_delay_ms`,
+/// whose ~10% jitter keeps slots refused at the same gossip moment from
+/// retrying in lockstep.
 fn backoff(attempt: u32, opts: &PolicyOpts) -> Duration {
     let cfg = ham::BackoffConfig {
         initial_ms: opts.retry_initial.as_millis().min(u64::MAX as u128) as u64,
@@ -166,11 +173,6 @@ fn backoff(attempt: u32, opts: &PolicyOpts) -> Duration {
 
 /// Collect `threshold` (M) distinct approving notaries from `notaries` (N) per
 /// the policy. Pure over `checker` + `sleeper` + `rng`; no I/O of its own.
-///
-/// Selection: shuffle N once, draw the first M as the working set, keep the
-/// rest as the substitution reserve. On a substitutable failure, or a notary
-/// that exhausts its same-notary retries, draw the next reserve notary.
-/// Running out of reserves below M is `Exhausted`.
 pub async fn collect_approvals<C, P, R>(
     threshold: u32,
     notaries: &[AgentPubKey],
@@ -186,11 +188,13 @@ where
 {
     let m = threshold as usize;
     if m == 0 {
-        return Ok(vec![]);
+        return Err(PolicyError::Misconfigured(
+            "the network's definition sets closing_threshold 0, so it closes no chain".into(),
+        ));
     }
 
     // Distinct keys first: a GD list carrying a duplicate would put two working
-    // slots on one notary, and the close would never reach M.
+    // slots on one notary, and its one approval would count twice.
     let mut seen = HashSet::new();
     let distinct: Vec<AgentPubKey> = notaries
         .iter()
@@ -198,14 +202,15 @@ where
         .cloned()
         .collect();
     if distinct.len() < m {
-        return Err(PolicyError::Exhausted {
-            collected: 0,
-            threshold,
-        });
+        return Err(PolicyError::Misconfigured(format!(
+            "the network's definition lists {} distinct closing notaries, fewer than its \
+             closing_threshold {m}",
+            distinct.len()
+        )));
     }
 
-    // Random order over the distinct N; the working set is the first M, the rest
-    // are the substitution reserve — so substitution is also random.
+    // Random order over the distinct N: the working set is the first M, the rest
+    // the substitution reserve, so substitution is random too.
     let mut order: Vec<AgentPubKey> = distinct;
     order.shuffle(rng);
     let mut reserve = order.split_off(m); // `order` now holds exactly M.

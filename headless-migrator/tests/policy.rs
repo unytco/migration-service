@@ -5,7 +5,7 @@
 //! Covers: asks exactly M; substitutes on timeout / errored / UnableToVerify /
 //! NotAClosingNotary but NEVER a merely-slow notary; same-notary retry with
 //! backoff on StateMismatch and TargetNotApproved, then substitution; exhaustion
-//! fails; Warranted hard-stops.
+//! fails; an impossible threshold is misconfigured; Warranted hard-stops.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -115,33 +115,6 @@ async fn collects_exactly_m_and_no_more() {
 }
 
 #[tokio::test]
-async fn substitutes_on_timeout() {
-    // Two notaries time out once → they are substituted; we still reach M, and a
-    // timed-out notary is asked at most once (substituted, never retried). 6
-    // notaries / threshold 2 guarantees enough reserve for both substitutions
-    // regardless of the shuffle.
-    let ns = notaries(6);
-    let mut scripts = HashMap::new();
-    scripts.insert(ns[0].clone(), vec![CheckOutcome::TimedOut]);
-    scripts.insert(ns[1].clone(), vec![CheckOutcome::TimedOut]);
-    let checker = ScriptedChecker::new(scripts);
-    let approvals = collect_approvals(2, &ns, &opts(), &checker, &NoSleep, &mut rng())
-        .await
-        .expect("collection succeeds despite timeouts");
-    assert_eq!(approvals.len(), 2, "still collects M after substitution");
-    // A timed-out notary is asked at most once (substituted, not retried).
-    assert!(checker.calls_to(&ns[0]) <= 1);
-    assert!(checker.calls_to(&ns[1]) <= 1);
-    // No approval is from a notary that only timed out.
-    assert!(!approvals
-        .iter()
-        .any(|s| *s == ns[0] && checker.calls_to(&ns[0]) == 1));
-    assert!(!approvals
-        .iter()
-        .any(|s| *s == ns[1] && checker.calls_to(&ns[1]) == 1));
-}
-
-#[tokio::test]
 async fn never_substitutes_a_slow_but_approving_notary() {
     // A slow notary is modeled as one that simply approves: its slowness is
     // absorbed by the per-request timeout the CALLER applies. So every
@@ -238,13 +211,15 @@ async fn exhaustion_below_threshold_fails() {
 }
 
 #[tokio::test]
-async fn too_few_notaries_is_immediate_exhaustion() {
-    // N < M can never succeed → Exhausted without asking anyone.
+async fn too_few_notaries_is_misconfigured_without_asking_anyone() {
     let checker = ScriptedChecker::empty();
     let err = collect_approvals(3, &notaries(2), &opts(), &checker, &NoSleep, &mut rng())
         .await
         .expect_err("N < M cannot succeed");
-    assert!(matches!(err, PolicyError::Exhausted { .. }));
+    assert!(
+        matches!(&err, PolicyError::Misconfigured(why) if why.contains("2 distinct")),
+        "{err:?}"
+    );
     assert_eq!(checker.call_count(), 0, "no notary asked when N < M");
 }
 
@@ -263,29 +238,6 @@ async fn warranted_is_a_hard_stop() {
         .await
         .expect_err("warranted hard-stops");
     assert!(matches!(err, PolicyError::Warranted));
-}
-
-#[tokio::test]
-async fn unable_to_verify_substitutes() {
-    // UnableToVerify is transient → substitute (like a timeout). 6 notaries /
-    // threshold 2 guarantees enough reserve to absorb both failures regardless
-    // of the shuffle, so collection succeeds via substitution.
-    let ns = notaries(6);
-    let mut scripts = HashMap::new();
-    scripts.insert(ns[0].clone(), vec![CheckOutcome::UnableToVerify]);
-    scripts.insert(ns[1].clone(), vec![CheckOutcome::UnableToVerify]);
-    let checker = ScriptedChecker::new(scripts);
-    let approvals = collect_approvals(2, &ns, &opts(), &checker, &NoSleep, &mut rng())
-        .await
-        .expect("succeeds via substitution on UnableToVerify");
-    assert_eq!(approvals.len(), 2);
-    // No approval is from a notary that only returned UnableToVerify.
-    assert!(!approvals
-        .iter()
-        .any(|s| *s == ns[0] && checker.calls_to(&ns[0]) == 1));
-    assert!(!approvals
-        .iter()
-        .any(|s| *s == ns[1] && checker.calls_to(&ns[1]) == 1));
 }
 
 #[tokio::test]
@@ -319,11 +271,8 @@ async fn duplicate_notary_in_gd_list_still_collects_m_distinct() {
 }
 
 #[tokio::test]
-async fn distinct_count_below_threshold_is_immediate_exhaustion() {
-    // A list that is long only because of duplicates can't reach M: N =
-    // [a, a, a] with threshold 2 has just ONE distinct notary → Exhausted
-    // without churning (the dedup is what catches this; a raw-length check would
-    // have let it try and then fail late).
+async fn distinct_count_below_threshold_is_misconfigured() {
+    // Long only because of duplicates: one distinct notary cannot reach 2.
     let a = AgentPubKey::from_raw_36(vec![1; 36]);
     let checker = ScriptedChecker::empty();
     let err = collect_approvals(
@@ -336,17 +285,20 @@ async fn distinct_count_below_threshold_is_immediate_exhaustion() {
     )
     .await
     .expect_err("one distinct notary cannot reach threshold 2");
-    assert!(matches!(err, PolicyError::Exhausted { .. }));
+    assert!(matches!(err, PolicyError::Misconfigured(_)), "{err:?}");
 }
 
 #[tokio::test]
-async fn zero_threshold_collects_nothing() {
-    // A disabled direction (M == 0) collects no approvals and asks no one.
+async fn a_zero_threshold_is_misconfigured() {
+    // The network closes no chain: the close must not run unchecked.
     let checker = ScriptedChecker::empty();
-    let approvals = collect_approvals(0, &notaries(3), &opts(), &checker, &NoSleep, &mut rng())
+    let err = collect_approvals(0, &notaries(3), &opts(), &checker, &NoSleep, &mut rng())
         .await
-        .expect("zero threshold is trivially satisfied");
-    assert!(approvals.is_empty());
+        .expect_err("a zero threshold closes nothing");
+    assert!(
+        matches!(&err, PolicyError::Misconfigured(why) if why.contains("closing_threshold 0")),
+        "{err:?}"
+    );
     assert_eq!(checker.call_count(), 0);
 }
 
@@ -364,15 +316,64 @@ async fn target_not_approved_asks_the_same_notary_again() {
 }
 
 #[tokio::test]
-async fn not_a_closing_notary_is_substituted() {
-    let ns = notaries(4);
-    let mut scripts = HashMap::new();
-    scripts.insert(ns[0].clone(), vec![CheckOutcome::NotAClosingNotary; 8]);
-    let checker = ScriptedChecker::new(scripts);
-    let approvals = collect_approvals(3, &ns, &opts(), &checker, &NoSleep, &mut rng())
-        .await
-        .expect("a substitute approves");
-    assert_eq!(approvals.len(), 3);
-    assert!(checker.calls_to(&ns[0]) <= 1, "never asked again");
-    assert!(!approvals.contains(&ns[0]));
+async fn an_unavailable_notary_is_substituted_and_never_asked_again() {
+    // Four notaries fail their first ask, two approve: whatever the draw, both
+    // slots end on the two that approve, and no failing notary is asked twice.
+    for failure in [
+        CheckOutcome::TimedOut,
+        CheckOutcome::Errored,
+        CheckOutcome::UnableToVerify,
+        CheckOutcome::NotAClosingNotary,
+    ] {
+        let ns = notaries(6);
+        let mut scripts = HashMap::new();
+        for n in &ns[..4] {
+            scripts.insert(n.clone(), vec![failure.clone(); 4]);
+        }
+        let checker = ScriptedChecker::new(scripts);
+        let mut approvals = collect_approvals(2, &ns, &opts(), &checker, &NoSleep, &mut rng())
+            .await
+            .unwrap_or_else(|e| panic!("{failure:?}: {e}"));
+        approvals.sort();
+        let mut good = ns[4..].to_vec();
+        good.sort();
+        assert_eq!(approvals, good, "{failure:?}");
+        for n in &ns[..4] {
+            assert!(
+                checker.calls_to(n) <= 1,
+                "{failure:?}: a failing notary asked again"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_policy_reads_the_names_the_release_tooling_renders() {
+    let defaults = PolicyOpts::from_lookup(|_| None).unwrap();
+    assert_eq!(defaults.request_timeout, Duration::from_secs(120));
+    assert_eq!(defaults.state_mismatch_retries, 5);
+    assert_eq!(defaults.retry_initial, Duration::from_secs(2));
+    assert_eq!(defaults.retry_max, Duration::from_secs(30));
+
+    let env: HashMap<&str, &str> = HashMap::from([
+        ("MIGRATION_AGENT_SIGN_TIMEOUT_SECS", "90"),
+        ("MIGRATION_AGENT_STATE_MISMATCH_RETRIES", "7"),
+        ("MIGRATION_AGENT_SIGN_RETRY_INITIAL_SECS", "3"),
+        ("MIGRATION_AGENT_SIGN_RETRY_MAX_SECS", "40"),
+    ]);
+    let set = PolicyOpts::from_lookup(|k| env.get(k).map(|v| v.to_string())).unwrap();
+    assert_eq!(set.request_timeout, Duration::from_secs(90));
+    assert_eq!(set.state_mismatch_retries, 7);
+    assert_eq!(set.retry_initial, Duration::from_secs(3));
+    assert_eq!(set.retry_max, Duration::from_secs(40));
+
+    let err = PolicyOpts::from_lookup(|k| {
+        (k == "MIGRATION_AGENT_STATE_MISMATCH_RETRIES").then(|| "many".to_string())
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("MIGRATION_AGENT_STATE_MISMATCH_RETRIES"),
+        "{err}"
+    );
 }

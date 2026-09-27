@@ -4,7 +4,7 @@
 //! exit. The comparison is a pure function over its inputs so it is unit-tested
 //! without a conductor.
 //!
-//! ## The agreement-state cross-check (B49)
+//! ## The agreement-state cross-check
 //!
 //! The carry-forward section's integrity is enforced on-chain (the notary
 //! signatures cover the whole `SummaryStatePayload`, and the open validator
@@ -69,7 +69,7 @@ pub fn verify_against_ledger(closing_state: &SummaryState, ledger: &Ledger) -> V
     }
 }
 
-/// The B49 cross-check: the fetched package against the new chain's COMMITTED
+/// The agreement cross-check: the fetched package against the new chain's COMMITTED
 /// opened agreement state. Pure over its inputs. `opened == None` (chain
 /// reports not-migrated) is a mismatch by definition — a verify only runs
 /// against a chain the open service believes migrated.
