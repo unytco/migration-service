@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash, DnaHashB64};
 use holochain_types::prelude::CellId;
-use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
+use rave_engine::types::entries::migration::v0_2::MigrationInitRequest;
 
 use crate::conductor::{
     assert_happ_path, decode_membrane_proof, Conductor, HamConductor, InstallSpec,

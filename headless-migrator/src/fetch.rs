@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use holo_hash::DnaHashB64;
-use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
+use rave_engine::types::entries::migration::v0_2::MigrationInitRequest;
 
 /// The outcome of one package fetch.
 pub enum FetchOutcome {

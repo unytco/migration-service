@@ -282,32 +282,28 @@ fn is_global_definition_out_of_window_lower(r_lower: &str) -> bool {
     r_lower.contains("outside its validity window")
 }
 
-/// The non-closed close states the close-side probe must distinguish from a
-/// rendered `get_migration_close_state` error. A missing-`CloseChain` error
-/// means the summary IS committed but the chain isn't closed (partial);
-/// anything else (no summary at all, a transport error) is treated as a plain
-/// open chain that the next supervised pass re-probes.
+/// What a `get_migration_close_state` error says about the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseErrorClass {
-    /// Summary committed, `CloseChain` not yet observed — finish the close.
+    /// Summary committed, `CloseChain` not observed.
     PartialClose,
-    /// No summary (or a transport error) — (re)prepare from an open chain.
+    /// No summary: the chain is open.
     Open,
+    /// Not an answer about the chain, such as a transport error.
+    Unrecognized,
 }
 
-/// Classify a `get_migration_close_state` error string. The
-/// `"no CloseChain action found on chain"` contract is the alliance close
-/// surface's; an open chain says `"No closing state summary found"`.
+/// Classify a `get_migration_close_state` error string. The untagged fallbacks
+/// are the alliance close surface's `"No closing state summary found"` and
+/// `"no CloseChain action found on chain"`.
 pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
     match MigrationError::from_rendered(rendered) {
-        Some(MigrationError::NoCloseChainAction) => return CloseErrorClass::PartialClose,
-        Some(_) => return CloseErrorClass::Open,
-        None => {}
-    }
-    if rendered.contains("no CloseChain action found") {
-        CloseErrorClass::PartialClose
-    } else {
-        CloseErrorClass::Open
+        Some(MigrationError::NoCloseChainAction) => CloseErrorClass::PartialClose,
+        Some(MigrationError::NoClosingSummary) => CloseErrorClass::Open,
+        Some(_) => CloseErrorClass::Unrecognized,
+        None if rendered.contains("no CloseChain action found") => CloseErrorClass::PartialClose,
+        None if rendered.contains("No closing state summary found") => CloseErrorClass::Open,
+        None => CloseErrorClass::Unrecognized,
     }
 }
 
@@ -508,6 +504,14 @@ mod tests {
         assert_eq!(
             classify_close_error("[MIGERR:MIG_NO_CLOSING_SUMMARY] open chain"),
             CloseErrorClass::Open
+        );
+        assert_eq!(
+            classify_close_error("[MIGERR:MIG_STALE_CLOSE] not a close state"),
+            CloseErrorClass::Unrecognized
+        );
+        assert_eq!(
+            classify_close_error("Websocket error: Websocket closed: No connection"),
+            CloseErrorClass::Unrecognized
         );
         assert!(is_recognized_close_state_response(
             "[MIGERR:MIG_NO_CLOSING_SUMMARY] x"

@@ -11,7 +11,7 @@ mod support;
 use headless_migrator::conductor::{build_install_payload, InstallSpec};
 use holochain_types::app::RoleSettings;
 use holochain_types::prelude::{DnaModifiersOpt, SerializedBytes, YamlProperties};
-use rave_engine::types::entries::migration::v0_1::MigrationInitRequest;
+use rave_engine::types::entries::migration::v0_2::MigrationInitRequest;
 use rave_engine::types::CarryForwardUnits;
 
 use support::{agent, migration_init_request, summary_state, unit_map};

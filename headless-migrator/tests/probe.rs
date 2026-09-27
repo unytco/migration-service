@@ -5,8 +5,8 @@ mod support;
 
 use headless_migrator::conductor::AppPresence;
 use headless_migrator::probe::{
-    classify_close_error, probe_close_state, probe_closed_status, probe_open_state, CloseNext,
-    CloseState, ClosedStatus, OpenState,
+    probe_close_state, probe_closed_status, probe_open_state, CloseNext, CloseState, ClosedStatus,
+    OpenState, ProbeFailure,
 };
 use rave_engine::types::ledger::CarryForwardUnits;
 use support::*;
@@ -55,22 +55,41 @@ async fn probe_closed_chain_maps_to_already_closed() {
     assert_eq!(state.next(), CloseNext::AlreadyClosed);
 }
 
-#[test]
-fn classify_close_error_distinguishes_partial_from_open() {
-    assert_eq!(
-        classify_close_error("no CloseChain action found on chain"),
-        CloseState::PartialClose
-    );
-    assert_eq!(
-        classify_close_error("No closing state summary found"),
-        CloseState::Open
-    );
-    // A transport error is treated as an open chain (the next supervised pass
-    // re-probes; prepare/collect/close are idempotent).
-    assert_eq!(
-        classify_close_error("Websocket closed: ConnectionClosed"),
-        CloseState::Open
-    );
+#[tokio::test]
+async fn an_answer_that_names_no_close_state_is_transient() {
+    for rendered in [
+        "Websocket closed: ConnectionClosed",
+        "[MIGERR:MIG_STALE_CLOSE] not a close state",
+    ] {
+        let mock = MockConductor::default();
+        mock.close_state
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::anyhow!("{rendered}")));
+        assert!(
+            matches!(
+                probe_close_state(&mock).await,
+                Err(ProbeFailure::Transient(_))
+            ),
+            "{rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_undecodable_close_state_is_a_hard_stop() {
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!(
+            "get_migration_close_state zome call failed: Failed to deserialize response: \
+         missing field `close_action`"
+        )));
+    assert!(matches!(
+        probe_close_state(&mock).await,
+        Err(ProbeFailure::HardStop(why)) if why.contains("Rebuild the migrator")
+    ));
 }
 
 // ── Close-side status tri-state (fix 3a) ─────────────────────────────────

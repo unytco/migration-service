@@ -26,9 +26,9 @@ use holochain_types::prelude::{
     CellId, DnaModifiersOpt, InitProperties, MembraneProof, SerializedBytes, UnsafeBytes,
     YamlProperties,
 };
-use rave_engine::types::entries::migration::v0_1::{
-    CloseRequest, CommittedClose, MigrationInitRequest, NotarySignature, PrepareCloseResponse,
-    SignClosingResponse, SignRequest, SummaryStatePayload,
+use rave_engine::types::entries::migration::v0_2::{
+    CloseCheckRequest, CloseCheckResponse, CommittedClose, MigrationInitRequest,
+    PrepareCloseResponse, SummaryStatePayload,
 };
 use rave_engine::types::ledger::Ledger;
 
@@ -133,7 +133,7 @@ pub fn build_install_payload(spec: &InstallSpec) -> Result<InstallAppPayload> {
 /// `get_opened_agreement_state` extern returns it — re-exported from
 /// `rave_engine` under this module's path, so call sites read it as
 /// `conductor::OpenedAgreementState`.
-pub use rave_engine::types::entries::migration::v0_1::OpenedAgreementState;
+pub use rave_engine::types::entries::migration::v0_2::OpenedAgreementState;
 
 #[async_trait]
 pub trait Conductor: Send + Sync {
@@ -147,31 +147,27 @@ pub trait Conductor: Send + Sync {
     async fn get_ledger(&self) -> Result<Ledger>;
 
     /// `transactor::drop_off_fees` — clear any owed fees BEFORE preparing the
-    /// summary (post-signing chain activity voids the signatures).
+    /// summary, which pins the chain top.
     async fn drop_off_fees(&self) -> Result<String>;
 
-    /// `transactor::prepare_closing_summary` — the payload to collect signatures
-    /// over plus the GD's closing pair (N, M). Takes the successor `target` the
-    /// close binds to; the extern pre-checks it against this DNA's
-    /// `upgrade_targets`.
+    /// `transactor::prepare_closing_summary` — the payload notaries check, plus
+    /// the GD's closing pair (N, M). Takes the successor `target` the close
+    /// binds to; the extern pre-checks it against this DNA's `upgrade_targets`.
     async fn prepare_closing_summary(&self, target: DnaHash) -> Result<PrepareCloseResponse>;
 
-    /// `transactor::request_closing_signature` — one `call_remote` to a notary's
-    /// `notary_sign_closing_summary`, response verbatim.
-    async fn request_closing_signature(&self, req: SignRequest) -> Result<SignClosingResponse>;
+    /// `transactor::request_close_check` — one `call_remote` to a notary's
+    /// `notary_check_closing_summary`, response verbatim.
+    async fn request_close_check(&self, req: CloseCheckRequest) -> Result<CloseCheckResponse>;
 
     /// `transactor::close_agent_chain` — commit the `ClosingStateSummary` and
-    /// `close_chain`. Returns the summary action hash.
+    /// `close_chain` in one call. Returns the summary action hash.
     async fn close_agent_chain(
         &self,
         payload: SummaryStatePayload,
-        notary_signatures: Vec<NotarySignature>,
     ) -> Result<holo_hash::ActionHash>;
 
     /// `transactor::get_migration_close_state` — the agent's own committed close
-    /// `{ payload, notary_signatures, close_action }`. Errors if no close is
-    /// committed; used to tell open-chain from closed-chain in the probe and to
-    /// feed the open service + `Verify`.
+    /// `{ payload, close_action }`. Errors if the chain has not closed.
     async fn get_migration_close_state(&self) -> Result<CommittedClose>;
 
     // ── New-DNA (open-side) zome calls ───────────────────────────────────
@@ -328,29 +324,19 @@ impl Conductor for HamConductor {
             .context("prepare_closing_summary zome call failed")
     }
 
-    async fn request_closing_signature(&self, req: SignRequest) -> Result<SignClosingResponse> {
+    async fn request_close_check(&self, req: CloseCheckRequest) -> Result<CloseCheckResponse> {
         self.ham()?
-            .call_zome(
-                &self.role_name,
-                "transactor",
-                "request_closing_signature",
-                req,
-            )
+            .call_zome(&self.role_name, "transactor", "request_close_check", req)
             .await
-            .context("request_closing_signature zome call failed")
+            .context("request_close_check zome call failed")
     }
 
     async fn close_agent_chain(
         &self,
         payload: SummaryStatePayload,
-        notary_signatures: Vec<NotarySignature>,
     ) -> Result<holo_hash::ActionHash> {
-        let req = CloseRequest {
-            payload,
-            notary_signatures,
-        };
         self.ham()?
-            .call_zome(&self.role_name, "transactor", "close_agent_chain", req)
+            .call_zome(&self.role_name, "transactor", "close_agent_chain", payload)
             .await
             .context("close_agent_chain zome call failed")
     }

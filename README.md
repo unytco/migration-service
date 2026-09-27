@@ -1,6 +1,6 @@
 # migration-service
 
-Off-chain pipeline for unyt DNA migration. Lets an app fetch its committed closing summary over HTTP — instead of hand-driving zome calls against someone else's conductor — and open on the successor DNA with it.
+Off-chain pipeline for unyt DNA migration. Once an agent's chain has closed, it gathers M notaries' attestations of that close over HTTP, so the agent can open on the successor DNA with them without hand-driving zome calls against someone else's conductor.
 
 Two components:
 
@@ -8,11 +8,11 @@ Two components:
 
 - **`notary-daemon/`**: a Rust `axum` + [`ham`](https://github.com/unytco/ham) service, run beside a Holochain conductor whose cell is a closing notary on the old (from-DNA) network. Its `/v2/attest-close` calls the alliance `notary_attest_close` zome fn, which reads the agent's closed chain and signs the close, and serves the package carrying that one signature; the router combines M of them. Attesting commits nothing, and the daemon signs its own zome calls through the node's lair, so connecting commits nothing either. Exposed to the router via a Cloudflare Tunnel; healthy only when both the conductor and its app cell answer.
 
-- **`headless-migrator/`** — a Rust `clap` + [`ham`](https://github.com/unytco/ham) binary, the headless counterpart of the app's migration ceremony for the **stateful server agents** the fleet provisions (bridge orchestrator, hf-swapper). Two supervised systemd services: a **close service** on the old server (collect M-of-N notary signatures → close the chain) and an **open service** on the new server (wait out gossip for the package → fresh membrane proof for the carried key → install with the package as the alliance role's `init_properties` so the DNA's `init` opens the chain → verify), plus `status` and `verify` one-shots. Each is probe-first and idempotent and exits 0 only on success, so `Restart=on-failure` drives the loop. It operates on an already-carried agent key (the lair-version-aware key carry across droplets is `automation/`'s job).
+- **`headless-migrator/`**: a Rust `clap` + [`ham`](https://github.com/unytco/ham) binary, the headless counterpart of the app's migration ceremony for the **stateful server agents** the fleet provisions (bridge orchestrator, hf-swapper). Two supervised systemd services: a **close service** on the old server (M notaries check the payload → close the chain) and an **open service** on the new server (wait out gossip for the package → fresh membrane proof for the carried key → install with the package as the alliance role's `init_properties` so the DNA's `init` opens the chain → verify), plus `status` and `verify` one-shots. Each is probe-first and idempotent and exits 0 only on success, so `Restart=on-failure` drives the loop. It operates on an already-carried agent key (the lair-version-aware key carry across droplets is `automation/`'s job).
 
 The app (and the headless-migrator's open service) completes the flow by installing the new-DNA app with the package as the alliance role's `init_properties`, so the DNA's `init` opens the agent's own chain at genesis — no off-chain service can do that.
 
-Full design + protocol contracts are maintained in unyt's internal version-migration specs.
+The contract is [`documentation/specs/notary-attest-after-close.md`](documentation/specs/notary-attest-after-close.md).
 
 ## Layout
 

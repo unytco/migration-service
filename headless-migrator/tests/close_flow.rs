@@ -1,7 +1,7 @@
 //! Close-service flow against the mock conductor: fees-owed → `drop_off_fees`
 //! precedes `prepare_closing_summary`; close is a no-op on an already-closed
-//! chain; a warranted notary hard-stops; a happy path drives prepare → collect
-//! → close in order. Drives the real `close::run` loop with the injected mock
+//! chain; a warranted notary hard-stops; a happy path drives prepare → M notary
+//! checks → close in order. Drives the real `close::run` loop with the injected mock
 //! (no live conductor), so the ordering + idempotency contract is proven.
 
 mod support;
@@ -12,7 +12,7 @@ use headless_migrator::close;
 use headless_migrator::config::Config;
 use headless_migrator::policy::PolicyOpts;
 use headless_migrator::state_file::{Phase, State, Step};
-use rave_engine::types::entries::migration::v0_1::SignClosingResponse;
+use rave_engine::types::entries::migration::v0_2::CloseCheckResponse;
 use rave_engine::types::ledger::CarryForwardUnits;
 use rave_engine::types::units::UnitMap;
 use support::*;
@@ -75,12 +75,10 @@ async fn close_with_fees_owed(name: &str, fees_owed: UnitMap) -> Vec<Call> {
     *mock.drop_fees.lock().unwrap() = Some(Ok("Fees dropped off".into()));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
-    mock.sign_responses
+    mock.check_responses
         .lock()
         .unwrap()
-        .push_back(Ok(SignClosingResponse::Signed {
-            signature: hdi::prelude::Signature([2u8; 64]),
-        }));
+        .push_back(Ok(CloseCheckResponse::Approved));
 
     let mut sd = never_shutdown();
     close::run(&mock, &cfg(&tmp), &mut sd)
@@ -186,11 +184,9 @@ async fn bad_to_dna_hard_stops_instead_of_looping() {
 #[tokio::test]
 async fn already_closed_restart_retains_agent_attribution() {
     // Restart onto an already-closed chain: `attempt` returns Closed straight
-    // from the probe (no prepare/collect), but the persisted record must still
-    // carry the agent + the collected-signature count, recovered from the
-    // committed close the probe read — so the report shows attribution after a
-    // restart, not the all-None gap. The committed-close fixture carries one
-    // notary signature for agent seed 3.
+    // from the probe (no prepare/check), but the persisted record must still
+    // carry the agent, recovered from the committed close the probe read. The
+    // close carries no approvals, so their counts stay unset.
     let tmp = tmp_state("closed-restart-attribution");
     let mock = MockConductor::default();
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
@@ -225,11 +221,8 @@ async fn already_closed_restart_retains_agent_attribution() {
         Some(expected_agent.as_str()),
         "the agent is recovered from the committed close on the restart path"
     );
-    assert_eq!(
-        state.signatures_collected,
-        Some(1),
-        "the collected-signature count is recovered from the committed close"
-    );
+    assert_eq!(state.approvals_collected, None);
+    assert_eq!(state.approvals_threshold, None);
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -252,13 +245,11 @@ async fn fees_owed_drops_before_prepare() {
     // Prepare: one notary, threshold 1.
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
-    // The single notary signs.
-    mock.sign_responses
+    // The single notary approves.
+    mock.check_responses
         .lock()
         .unwrap()
-        .push_back(Ok(SignClosingResponse::Signed {
-            signature: hdi::prelude::Signature([2u8; 64]),
-        }));
+        .push_back(Ok(CloseCheckResponse::Approved));
 
     let mut sd = never_shutdown();
     close::run(&mock, &cfg(&tmp), &mut sd)
@@ -283,7 +274,7 @@ async fn fees_owed_drops_before_prepare() {
     );
     assert!(
         calls.contains(&Call::CloseAgentChain),
-        "the chain is closed after collection"
+        "the chain is closed after the check"
     );
     let _ = std::fs::remove_file(&tmp);
 }
@@ -411,13 +402,13 @@ async fn undecodable_close_state_hard_stops_instead_of_looping() {
 }
 
 #[tokio::test]
-async fn undecodable_signature_response_hard_stops_without_blaming_the_notaries() {
-    // Reachable when `PrepareCloseResponse` decodes and `SignClosingResponse`
+async fn undecodable_check_response_hard_stops_without_blaming_the_notaries() {
+    // Reachable when `PrepareCloseResponse` decodes and `CloseCheckResponse`
     // does not, e.g. upgraded notaries answering with a variant this binary does
     // not know. Collapsed into a per-notary error it substitutes across the whole
     // list and reports an exhausted N-list, sending the operator to check notary
     // health for a fault in the binary they are running.
-    let tmp = tmp_state("undecodable-signature");
+    let tmp = tmp_state("undecodable-check");
     let mock = MockConductor::default();
     mock.close_state
         .lock()
@@ -437,11 +428,11 @@ async fn undecodable_signature_response_hard_stops_without_blaming_the_notaries(
     )));
     // One per notary, so a regression that substitutes fails on the assertion.
     for _ in 0..2 {
-        mock.sign_responses
+        mock.check_responses
             .lock()
             .unwrap()
             .push_back(Err(anyhow::anyhow!(
-                "request_closing_signature zome call failed: Failed to deserialize \
+                "request_close_check zome call failed: Failed to deserialize \
                  response: unknown variant `Deferred`"
             )));
     }
@@ -462,7 +453,7 @@ async fn undecodable_signature_response_hard_stops_without_blaming_the_notaries(
     assert_eq!(
         mock.calls()
             .iter()
-            .filter(|c| **c == Call::RequestClosingSignature)
+            .filter(|c| **c == Call::RequestCloseCheck)
             .count(),
         1,
         "no substitution: {:?}",
@@ -490,12 +481,10 @@ async fn an_undecodable_write_response_still_retries() {
     )));
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
-    mock.sign_responses
+    mock.check_responses
         .lock()
         .unwrap()
-        .push_back(Ok(SignClosingResponse::Signed {
-            signature: hdi::prelude::Signature([2u8; 64]),
-        }));
+        .push_back(Ok(CloseCheckResponse::Approved));
     *mock.close_result.lock().unwrap() = Some(Err(anyhow::anyhow!(
         "close_agent_chain zome call failed: Failed to deserialize response: \
          invalid length 32, expected 39"
@@ -534,15 +523,13 @@ async fn no_fee_drop_when_none_owed() {
 }
 
 #[tokio::test]
-async fn closed_state_retains_agent_and_signature_progress() {
+async fn closed_state_retains_agent_and_approval_progress() {
     // After a successful close the persisted state must still carry the agent
-    // and the signatures_collected/threshold set during collection — the report
-    // collector (`make migrate-status`) reads these. A per-call `State::new`
-    // would re-stamp them to None on the final write; the carried `State` keeps
-    // them.
+    // and the approvals_collected/threshold set during the check: the report
+    // collector (`make migrate-status`) reads these.
     let tmp = tmp_state("closed-retains-progress");
     let mock = MockConductor::default();
-    // Open chain → prepare with threshold 2 over two notaries, both sign.
+    // Open chain → prepare with threshold 2 over two notaries, both approve.
     mock.close_state
         .lock()
         .unwrap()
@@ -560,12 +547,10 @@ async fn closed_state_retains_agent_and_signature_progress() {
         2,
     )));
     for _ in 0..2 {
-        mock.sign_responses
+        mock.check_responses
             .lock()
             .unwrap()
-            .push_back(Ok(SignClosingResponse::Signed {
-                signature: hdi::prelude::Signature([2u8; 64]),
-            }));
+            .push_back(Ok(CloseCheckResponse::Approved));
     }
 
     let mut sd = never_shutdown();
@@ -586,12 +571,12 @@ async fn closed_state_retains_agent_and_signature_progress() {
         "the agent persists into the final closed state"
     );
     assert_eq!(
-        state.signatures_threshold,
+        state.approvals_threshold,
         Some(2),
         "the threshold persists into the final closed state"
     );
     assert_eq!(
-        state.signatures_collected,
+        state.approvals_collected,
         Some(2),
         "the collected count persists into the final closed state"
     );
@@ -605,16 +590,16 @@ async fn shutdown_before_close_exits_nonzero_and_preserves_prior_report() {
     // `Restart=on-failure` resumes the loop rather than treating the interrupted
     // run as done. The shutdown is pre-fired, so the loop bails on its very first
     // top-of-loop check before any probe — and must NOT clobber the richer report
-    // a prior pass wrote (agent + signature attribution), since a fresh process
+    // a prior pass wrote (agent + approval attribution), since a fresh process
     // starts from an all-`None` in-memory `State`.
     let tmp = tmp_state("shutdown-before-close");
     let mock = MockConductor::default();
 
     // A prior pass left a report with attribution on disk (mid-collection).
-    let mut prior = State::new(Phase::Close, Step::CollectingSignatures, "collecting");
+    let mut prior = State::new(Phase::Close, Step::CollectingApprovals, "collecting");
     prior.agent = Some("uhCAk-prior-agent".into());
-    prior.signatures_collected = Some(2);
-    prior.signatures_threshold = Some(3);
+    prior.approvals_collected = Some(2);
+    prior.approvals_threshold = Some(3);
     prior.write(&tmp).unwrap();
 
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -638,11 +623,11 @@ async fn shutdown_before_close_exits_nonzero_and_preserves_prior_report() {
     let state = State::read(&tmp).unwrap();
     assert_eq!(
         state.step,
-        Step::CollectingSignatures,
+        Step::CollectingApprovals,
         "prior step preserved"
     );
     assert_eq!(state.agent.as_deref(), Some("uhCAk-prior-agent"));
-    assert_eq!(state.signatures_collected, Some(2));
+    assert_eq!(state.approvals_collected, Some(2));
     assert_ne!(state.step, Step::Failed);
     assert!(!state.old_chain_closed);
     let _ = std::fs::remove_file(&tmp);
@@ -664,10 +649,10 @@ async fn warranted_notary_hard_stops_the_close() {
     let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
     *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, vec![agent(70)], 1)));
     // The notary returns Warranted → the whole migration hard-stops.
-    mock.sign_responses
+    mock.check_responses
         .lock()
         .unwrap()
-        .push_back(Ok(SignClosingResponse::Warranted(vec![])));
+        .push_back(Ok(CloseCheckResponse::Warranted(vec![])));
 
     let mut sd = never_shutdown();
     let result = close::run(&mock, &cfg(&tmp), &mut sd).await;
@@ -679,4 +664,166 @@ async fn warranted_notary_hard_stops_the_close() {
     let state = State::read(&tmp).unwrap();
     assert_eq!(state.step, Step::Failed);
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// An open chain owing nothing, prepared over `notaries` with threshold `m`,
+/// whose notaries answer the check with `checks` in order.
+fn open_chain(
+    notaries: Vec<holo_hash::AgentPubKey>,
+    m: u32,
+    checks: Vec<CloseCheckResponse>,
+) -> MockConductor {
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!(
+            "[MIGERR:MIG_NO_CLOSING_SUMMARY] No closing state summary found"
+        )));
+    *mock.ledger.lock().unwrap() = Some(Ok(ledger(
+        unit_map(0, 10),
+        CarryForwardUnits::new(),
+        UnitMap::new(),
+    )));
+    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+    *mock.prepare.lock().unwrap() = Some(Ok(prepare_response(3, closing, notaries, m)));
+    for check in checks {
+        mock.check_responses.lock().unwrap().push_back(Ok(check));
+    }
+    mock
+}
+
+async fn run_close(name: &str, mock: &MockConductor) -> (Result<(), String>, Vec<Call>) {
+    let tmp = tmp_state(name);
+    let mut sd = never_shutdown();
+    let result = close::run(mock, &cfg(&tmp), &mut sd)
+        .await
+        .map_err(|e| format!("{e:#}"));
+    let _ = std::fs::remove_file(&tmp);
+    (result, mock.calls())
+}
+
+#[tokio::test]
+async fn m_notaries_approve_before_the_close() {
+    let mock = open_chain(
+        vec![agent(70), agent(71), agent(72)],
+        2,
+        vec![CloseCheckResponse::Approved, CloseCheckResponse::Approved],
+    );
+    let (result, calls) = run_close("m-approve-then-close", &mock).await;
+    result.expect("the chain closes");
+    let checks: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == Call::RequestCloseCheck)
+        .map(|(i, _)| i)
+        .collect();
+    let close = calls
+        .iter()
+        .position(|c| *c == Call::CloseAgentChain)
+        .unwrap();
+    assert_eq!(checks.len(), 2, "exactly M notaries asked: {calls:?}");
+    assert!(
+        checks.iter().all(|i| *i < close),
+        "checks precede the close: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusing_notary_is_asked_again_then_counts() {
+    for refusal in [
+        CloseCheckResponse::StateMismatch,
+        CloseCheckResponse::TargetNotApproved,
+    ] {
+        let mock = open_chain(
+            vec![agent(70)],
+            1,
+            vec![refusal.clone(), CloseCheckResponse::Approved],
+        );
+        let (result, calls) = run_close("refusal-then-approve", &mock).await;
+        result.unwrap_or_else(|e| panic!("{refusal:?}: {e}"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| **c == Call::RequestCloseCheck)
+                .count(),
+            2,
+            "{refusal:?}: the same notary is asked again: {calls:?}"
+        );
+        assert!(calls.contains(&Call::CloseAgentChain));
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_notary_is_substituted() {
+    for failure in [
+        CloseCheckResponse::UnableToVerify,
+        CloseCheckResponse::NotAClosingNotary,
+    ] {
+        let mock = open_chain(
+            vec![agent(70), agent(71)],
+            1,
+            vec![failure.clone(), CloseCheckResponse::Approved],
+        );
+        let (result, calls) = run_close("unavailable-substituted", &mock).await;
+        result.unwrap_or_else(|e| panic!("{failure:?}: {e}"));
+        assert!(
+            calls.contains(&Call::CloseAgentChain),
+            "{failure:?}: {calls:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn too_few_approvals_backs_off_without_closing() {
+    let mock = open_chain(
+        vec![agent(70), agent(71)],
+        2,
+        vec![
+            CloseCheckResponse::UnableToVerify,
+            CloseCheckResponse::Approved,
+        ],
+    );
+    let (result, calls) = run_close("too-few-approvals", &mock).await;
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
+        "too few approvals is not a hard stop: {err}"
+    );
+    assert!(!calls.contains(&Call::CloseAgentChain), "{calls:?}");
+}
+
+#[tokio::test]
+async fn an_unrecognized_probe_answer_backs_off_without_preparing() {
+    let mock = MockConductor::default();
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!(
+            "get_migration_close_state zome call failed: Failed to call zome: \
+             Websocket error: Websocket closed: No connection"
+        )));
+    let (result, calls) = run_close("unrecognized-probe", &mock).await;
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
+        "{err}"
+    );
+    assert_eq!(
+        calls,
+        vec![Call::GetMigrationCloseState],
+        "nothing past the probe"
+    );
+}
+
+#[tokio::test]
+async fn a_close_to_an_unapproved_target_hard_stops() {
+    let mock = open_chain(vec![agent(70)], 1, vec![CloseCheckResponse::Approved]);
+    *mock.close_result.lock().unwrap() = Some(Err(anyhow::anyhow!(
+        "close_agent_chain zome call failed: [MIGERR:MIG_CLOSE_TARGET_NOT_UPGRADE_TARGET] \
+         Close target is not in this DNA's upgrade_targets"
+    )));
+    let (result, _) = run_close("close-target-hard-stop", &mock).await;
+    let err = result.unwrap_err();
+    assert!(err.contains("hard-stopped"), "{err}");
 }

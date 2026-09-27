@@ -13,9 +13,11 @@
 //!
 //! Stand up, via the unyt repo's sweettest / `make launch-tauri` tooling:
 //!   * an OLD-DNA conductor hosting the `alliance` app for a stateful agent,
-//!     with notary cells on the old DNA (so close-time signing works);
+//!     with closing-notary cells on the old DNA (they check the close before it
+//!     commits and attest it after);
 //!   * a `wrangler dev` router whose registry maps the old DNA → new DNA and
-//!     lists the local notary daemon(s) (see `migration-service/migration-router`);
+//!     lists the local notary daemons with the old DNA's `closing_threshold`
+//!     (see `migration-service/migration-router`);
 //!   * a NEW-DNA conductor (admin reachable) with the carried key imported into
 //!     its lair (the shell's `migrate-carry-key.sh` step) + `lair-sign` on PATH;
 //!   * the target release's joining service reachable for a fresh membrane proof.
@@ -153,9 +155,7 @@ fn load_live_env() -> Result<LiveEnv> {
 }
 
 /// The full arc: close on the old conductor → (key already carried) → open on
-/// the new conductor → verify. The fresh-chain rule makes ordering self-proving:
-/// any pre-`migration_init` zome call leaves a non-fresh chain the open
-/// validator rejects.
+/// the new conductor → verify.
 #[tokio::test]
 #[ignore = "needs live old+new conductors + a wrangler-dev router; see the file header"]
 async fn live_close_carry_open_verify() -> Result<()> {
@@ -170,7 +170,7 @@ async fn live_close_carry_open_verify() -> Result<()> {
         .await
         .context("close service")?;
 
-    // ── Open (new conductor) — install for the carried key + migration_init ──
+    // ── Open (new conductor): install for the carried key with the package ──
     open::run(
         &env.new_cfg,
         &env.open_cfg,

@@ -4,7 +4,7 @@
 //! layer, exhaustively unit-tested against the mock conductor.
 
 use anyhow::Result;
-use rave_engine::types::entries::migration::v0_1::CommittedClose;
+use rave_engine::types::entries::migration::v0_2::CommittedClose;
 
 use crate::conductor::{AppPresence, Conductor};
 use crate::dna_errors::CloseErrorClass;
@@ -64,39 +64,35 @@ impl CloseState {
     }
 }
 
-/// Classify the close state of the old chain WITHOUT writing to it.
-///
-/// `get_migration_close_state` distinguishes the three cases by its result:
-/// `Ok` ⇒ fully closed; an error whose chain mentions a *missing CloseChain*
-/// ⇒ partial close (summary present, chain still open); any other "no closing
-/// state summary" error ⇒ a plain open chain. The two error strings are part
-/// of the alliance `close.rs` contract (`"No closing state summary found"` and
-/// `"no CloseChain action found on chain"`); [`classify_close_error`] isolates
-/// that match so it is a single, testable place to update if the DNA reworks
-/// its messages.
-///
-/// `Err` is reserved for a response that did not DECODE: the close state is then
-/// unknowable to this binary, so it is raised for the caller to hard-stop on
-/// rather than folded into `Open` and driven at.
-pub async fn probe_close_state(conductor: &dyn Conductor) -> Result<CloseState> {
-    match conductor.get_migration_close_state().await {
-        Ok(close) => Ok(CloseState::Closed(Box::new(close))),
-        Err(e) if crate::dna_errors::is_response_decode_failure(&format!("{e:#}")) => Err(e),
-        Err(e) => Ok(classify_close_error(&format!("{e:#}"))),
-    }
+/// Why the probe could not name a close state.
+#[derive(Debug)]
+pub enum ProbeFailure {
+    /// Stop: a response this binary cannot decode.
+    HardStop(String),
+    /// Back off and probe again: anything the DNA did not answer with a state.
+    Transient(anyhow::Error),
 }
 
-/// Map a `get_migration_close_state` error string onto the non-closed close
-/// states. The substring contract itself lives in [`crate::dna_errors`] (one
-/// home for every fragile DNA error-string match); this only lifts its
-/// [`CloseErrorClass`] into the probe's [`CloseState`]. A transport failure
-/// classifies as `Open` and simply re-probes on the next supervised pass, which
-/// is safe: prepare/collect/close are each idempotent or abort atomically on a
-/// stale/duplicate attempt.
-pub fn classify_close_error(rendered: &str) -> CloseState {
-    match crate::dna_errors::classify_close_error(rendered) {
-        CloseErrorClass::PartialClose => CloseState::PartialClose,
-        CloseErrorClass::Open => CloseState::Open,
+/// Classify the close state of the old chain WITHOUT writing to it, from
+/// `get_migration_close_state`: a close ⇒ `Closed`; `MIG_NO_CLOSING_SUMMARY`
+/// ⇒ `Open`; `MIG_NO_CLOSE_CHAIN_ACTION` ⇒ `PartialClose`.
+pub async fn probe_close_state(
+    conductor: &dyn Conductor,
+) -> std::result::Result<CloseState, ProbeFailure> {
+    let e = match conductor.get_migration_close_state().await {
+        Ok(close) => return Ok(CloseState::Closed(Box::new(close))),
+        Err(e) => e,
+    };
+    let rendered = format!("{e:#}");
+    if crate::dna_errors::is_response_decode_failure(&rendered) {
+        return Err(ProbeFailure::HardStop(
+            crate::dna_errors::schema_mismatch_message("probing close state", &rendered),
+        ));
+    }
+    match crate::dna_errors::classify_close_error(&rendered) {
+        CloseErrorClass::Open => Ok(CloseState::Open),
+        CloseErrorClass::PartialClose => Ok(CloseState::PartialClose),
+        CloseErrorClass::Unrecognized => Err(ProbeFailure::Transient(e)),
     }
 }
 

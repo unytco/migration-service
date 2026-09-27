@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use holo_hash::DnaHashB64;
-use rave_engine::types::entries::migration::v0_1::{SummaryState, SummaryStatePayload};
+use rave_engine::types::entries::migration::v0_2::{SummaryState, SummaryStatePayload};
 use rave_engine::types::ledger::Ledger;
 
 use crate::conductor::{Conductor, HamConductor, OpenedAgreementState};
