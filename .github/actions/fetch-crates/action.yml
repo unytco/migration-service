@@ -1,8 +1,8 @@
 name: Fetch crates
 description: >
   cargo fetch for one crate, reading the private unytco/unyt-app repository that
-  rave_engine is pinned to. The token reaches this step alone, so no build script
-  runs while it is in the environment.
+  rave_engine is pinned to. The token is in this step's environment alone, so no
+  build script finds it there.
 inputs:
   working-directory:
     description: The crate to fetch for.

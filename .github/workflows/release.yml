@@ -102,6 +102,8 @@ jobs:
             exit 1
           fi
 
+      # Unlike CI's, this cache is saved under the tag, and only a run of the same
+      # tag can restore it, so the private unyt-app history it holds stays here.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ matrix.crate }}
