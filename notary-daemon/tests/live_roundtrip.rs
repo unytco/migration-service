@@ -4,8 +4,10 @@
 //! bypass: the served package must decode with the same `rave_engine` types the
 //! app consumes, carrying this notary's one signature.
 //!
-//! Ignored by default. Stand the fixture up with the unyt repo's test tooling,
-//! then run from `notary-daemon/`:
+//! Ignored by default. Stand the fixture up with the unyt repo's sweettest
+//! tooling (its migration scenario builds closing notaries and closes an agent),
+//! exposing that notary conductor's admin and app interfaces, then run from
+//! `notary-daemon/`:
 //!
 //! ```bash
 //! MIGRATION_NOTARY_BEARER_TOKEN=test-token \

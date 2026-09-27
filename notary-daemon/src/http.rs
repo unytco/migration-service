@@ -22,18 +22,15 @@ use crate::conductor::Conductor;
 pub const API_VERSIONS: &[&str] = &["v2"];
 pub const PROTOCOL_VERSIONS: &[&str] = &["v0_2"];
 
-/// Machine-readable error codes — the daemon half of the cross-service contract.
-/// These MUST stay in sync with the router's `ErrorCode` union in
-/// `migration-router/src/errors.ts`, which switches on these exact strings. Defined once
-/// here rather than as scattered literals so a code can't silently drift.
+/// The router reads these through `DAEMON_CODES` in
+/// `migration-router/src/notary.ts` and treats any code missing there as
+/// `internal`, so a code added here goes there too.
 mod codes {
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const WARRANTED: &str = "warranted";
     pub const NO_CLOSE_FOUND: &str = "no_close_found";
     pub const UNABLE_TO_VERIFY: &str = "unable_to_verify";
     pub const INTERNAL: &str = "internal";
-    // B5/B6: client-side input errors get a distinct 4xx code so the router
-    // hard-stops instead of retrying the same malformed request across notaries.
     pub const BAD_REQUEST: &str = "bad_request";
 }
 
@@ -71,10 +68,9 @@ fn error_with_details(
         .into_response()
 }
 
-/// Healthy means BOTH the conductor answers and the app cell answers — a
-/// conductor can be reachable while its cell is wedged, and the router must
-/// not route fetches at either state. The two failures carry distinct
-/// messages so ops can tell them apart from the probe alone.
+/// Healthy means BOTH the conductor and the app cell answer: a conductor can be
+/// reachable while its cell is wedged. The two failures carry distinct messages
+/// so ops can tell them apart.
 async fn healthz(State(state): State<AppState>) -> Response {
     if let Err(e) = state.conductor.ping().await {
         return error(
@@ -122,6 +118,7 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
 /// exactly its own signature. The router combines M of them.
 async fn attest_close(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     if !check_bearer(&headers, &state.bearer_token) {
+        tracing::warn!("attest-close refused: missing or invalid bearer token");
         return error(
             StatusCode::UNAUTHORIZED,
             codes::AUTH_FAILED,
@@ -150,6 +147,7 @@ async fn attest_close(State(state): State<AppState>, headers: HeaderMap, body: S
         }
     };
 
+    let agent = parsed.agent_pubkey;
     match state.conductor.notary_attest_close(agent_pubkey).await {
         Ok(AttestCloseResponse::Attested {
             payload,
@@ -181,7 +179,7 @@ async fn attest_close(State(state): State<AppState>, headers: HeaderMap, body: S
             "this notary cannot see the agent's closed chain yet",
         ),
         Ok(AttestCloseResponse::NotAClosingNotary) => {
-            tracing::error!("this node is not a closing notary on its DNA");
+            tracing::error!(%agent, "this node is not a closing notary on its DNA");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 codes::INTERNAL,
@@ -189,7 +187,7 @@ async fn attest_close(State(state): State<AppState>, headers: HeaderMap, body: S
             )
         }
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "notary_attest_close failed");
+            tracing::error!(%agent, error = %format!("{e:#}"), "notary_attest_close failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 codes::INTERNAL,

@@ -41,31 +41,29 @@ struct MockConductor {
 }
 
 impl MockConductor {
-    fn with(resp: anyhow::Result<AttestCloseResponse>) -> Arc<Self> {
+    fn new(
+        ping_ok: bool,
+        whoami_ok: bool,
+        response: Option<anyhow::Result<AttestCloseResponse>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            ping_ok: true,
-            whoami_ok: true,
-            response: Mutex::new(Some(resp)),
+            ping_ok,
+            whoami_ok,
+            response: Mutex::new(response),
             asked_about: Mutex::new(vec![]),
         })
+    }
+
+    fn with(resp: anyhow::Result<AttestCloseResponse>) -> Arc<Self> {
+        Self::new(true, true, Some(resp))
     }
 
     fn down() -> Arc<Self> {
-        Arc::new(Self {
-            ping_ok: false,
-            whoami_ok: false,
-            response: Mutex::new(None),
-            asked_about: Mutex::new(vec![]),
-        })
+        Self::new(false, false, None)
     }
 
     fn cell_wedged() -> Arc<Self> {
-        Arc::new(Self {
-            ping_ok: true,
-            whoami_ok: false,
-            response: Mutex::new(None),
-            asked_about: Mutex::new(vec![]),
-        })
+        Self::new(true, false, None)
     }
 }
 
