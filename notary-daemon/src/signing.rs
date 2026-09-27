@@ -1,6 +1,6 @@
 //! The lair credentials and the opt-in this daemon reads from its environment.
 //!
-//! The daemon only reads (`read_predecessor_close`, `whoami`), but connecting is
+//! The daemon writes nothing (`notary_attest_close`, `whoami`), but connecting is
 //! not free: through lair a zome call is signed with the cell's own agent key
 //! and nothing is written, while without it `ham` authorizes a throwaway signing
 //! key by committing a capability grant to the notary's chain on EVERY connect,
