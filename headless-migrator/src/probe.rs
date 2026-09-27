@@ -9,26 +9,15 @@ use rave_engine::types::entries::migration::v0_2::CommittedClose;
 use crate::conductor::{AppPresence, Conductor};
 use crate::dna_errors::CloseErrorClass;
 
-/// The close-side state of the old chain, as the close service must resume from
-/// it. Derived from `get_migration_close_state` (which returns the committed
-/// package only when BOTH the `ClosingStateSummary` and the `CloseChain` action
-/// are present — see the alliance `close.rs`), so its three outcomes map
-/// one-to-one onto the resume decision.
+/// The close-side state of the old chain, from `get_migration_close_state`.
 ///
-/// `PartialEq` is by variant only (`CommittedClose` is `PartialEq`-free in
-/// `rave_engine`, and the close payload content is not what callers branch on —
-/// only which state the chain is in).
+/// `PartialEq` is by variant only: `CommittedClose` is `PartialEq`-free in
+/// `rave_engine`, and callers branch on the state, not the payload.
 #[derive(Debug, Clone)]
 pub enum CloseState {
-    /// No `ClosingStateSummary` committed — a normal open chain. Resume by
-    /// preparing + collecting M-of-N + closing.
+    /// No `ClosingStateSummary`: prepare, check, close.
     Open,
-    /// `ClosingStateSummary` committed but `close_chain` not yet issued (a crash
-    /// between the two). Resume by issuing `close_chain` ONLY — never re-prepare
-    /// or re-collect over a committed summary.
-    PartialClose,
-    /// Fully closed: summary + `CloseChain` present. The committed package is
-    /// readable. Nothing to do (the close is a no-op on a closed chain).
+    /// Summary + `CloseChain`: nothing to do.
     Closed(Box<CommittedClose>),
 }
 
@@ -36,38 +25,15 @@ impl PartialEq for CloseState {
     fn eq(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (CloseState::Open, CloseState::Open)
-                | (CloseState::PartialClose, CloseState::PartialClose)
-                | (CloseState::Closed(_), CloseState::Closed(_))
+            (CloseState::Open, CloseState::Open) | (CloseState::Closed(_), CloseState::Closed(_))
         )
-    }
-}
-
-/// The next action the close service should take, from a [`CloseState`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum CloseNext {
-    /// Prepare the summary, collect M-of-N, then close.
-    PrepareCollectClose,
-    /// Finish the interrupted close: `close_chain` only.
-    FinishCloseOnly,
-    /// Already closed — exit 0.
-    AlreadyClosed,
-}
-
-impl CloseState {
-    pub fn next(&self) -> CloseNext {
-        match self {
-            CloseState::Open => CloseNext::PrepareCollectClose,
-            CloseState::PartialClose => CloseNext::FinishCloseOnly,
-            CloseState::Closed(_) => CloseNext::AlreadyClosed,
-        }
     }
 }
 
 /// Why the probe could not name a close state.
 #[derive(Debug)]
 pub enum ProbeFailure {
-    /// Stop: a response this binary cannot decode.
+    /// Stop: a response this binary cannot decode, or a summary with no close.
     HardStop(String),
     /// Back off and probe again: anything the DNA did not answer with a state.
     Transient(anyhow::Error),
@@ -75,7 +41,7 @@ pub enum ProbeFailure {
 
 /// Classify the close state of the old chain WITHOUT writing to it, from
 /// `get_migration_close_state`: a close ⇒ `Closed`; `MIG_NO_CLOSING_SUMMARY`
-/// ⇒ `Open`; `MIG_NO_CLOSE_CHAIN_ACTION` ⇒ `PartialClose`.
+/// ⇒ `Open`; `MIG_NO_CLOSE_CHAIN_ACTION` ⇒ a hard stop.
 pub async fn probe_close_state(
     conductor: &dyn Conductor,
 ) -> std::result::Result<CloseState, ProbeFailure> {
@@ -91,7 +57,12 @@ pub async fn probe_close_state(
     }
     match crate::dna_errors::classify_close_error(&rendered) {
         CloseErrorClass::Open => Ok(CloseState::Open),
-        CloseErrorClass::PartialClose => Ok(CloseState::PartialClose),
+        CloseErrorClass::SummaryWithoutClose => Err(ProbeFailure::HardStop(
+            "the chain holds a closing summary with no close after it. Closing again would \
+             commit a second summary, and notaries never attest a chain holding two, so it \
+             needs an operator"
+                .into(),
+        )),
         CloseErrorClass::Unrecognized => Err(ProbeFailure::Transient(e)),
     }
 }

@@ -4,23 +4,6 @@
 //! Transient failures back off and re-probe (no overall deadline — systemd
 //! `Restart=on-failure` owns process death; this loop owns in-process
 //! progress).
-//!
-//! ## Partial-close note (a DNA-surface limitation, recorded as a decision)
-//!
-//! The spec asks a partial close (a `ClosingStateSummary` committed but
-//! `close_chain` not yet issued) to be finished by `close_chain` ONLY, without
-//! re-collecting. The alliance transactor exposes **no bare `close_chain` /
-//! finish extern** — `close_agent_chain` is the only close path and it always
-//! commits a fresh summary before `close_chain`. So the only safe finish with
-//! today's externs is to re-run the full prepare → collect → close over the
-//! *current* chain top: the orphaned first summary is harmless (the author-time
-//! validator only checks the final summary that directly precedes the
-//! `CloseChain`), and because the workload is quiesced before close the chain
-//! top does not move between prepare and close, so the staleness pin holds.
-//! The probe still distinguishes the partial-close state for the status report;
-//! the *action* is identical. (Honoring "close_chain only" verbatim would need
-//! a new DNA extern — out of scope for this milestone; flagged for the DNA
-//! owner.)
 
 use std::time::Duration;
 
@@ -33,7 +16,7 @@ use rave_engine::types::entries::migration::v0_2::{
 use crate::conductor::Conductor;
 use crate::config::Config;
 use crate::policy::{self, CheckOutcome, Checker, PolicyError, Sleeper};
-use crate::probe::{probe_close_state, CloseNext, CloseState, ProbeFailure};
+use crate::probe::{probe_close_state, CloseState, ProbeFailure};
 use crate::state_file::{Phase, State, Step};
 
 /// Outcome of one close attempt, before the supervised loop decides to exit or
@@ -129,32 +112,20 @@ async fn attempt(
         }
     };
 
-    if let CloseState::PartialClose = close_state {
-        tracing::warn!(
-            "partial close detected (summary committed, chain open) — finishing via \
-             prepare→collect→close over the current chain top (no bare close_chain extern exists)"
-        );
-    }
-
-    // A chain found already closed never ran the check, so only the agent is
-    // recovered, from the committed payload. Its close carries no approvals, so
-    // the approval counts stay unset.
-    if let CloseState::Closed(committed) = &close_state {
-        let agent_b64 = AgentPubKeyB64::from(committed.payload.agent_pubkey.clone()).to_string();
-        persist(cfg, state, |s| {
-            if s.agent.is_none() {
-                s.agent = Some(agent_b64);
-            }
-        });
-    }
-
-    match close_state.next() {
-        CloseNext::AlreadyClosed => CloseOutcome::Closed,
-        // Both an open chain and a partial close route through the same path —
-        // see the module-level partial-close note for why.
-        CloseNext::FinishCloseOnly | CloseNext::PrepareCollectClose => {
-            prepare_check_close(conductor, cfg, target, state).await
+    match close_state {
+        CloseState::Closed(committed) => {
+            // A chain found closed never ran the check: only the agent is
+            // recovered, and the approval counts stay unset.
+            let agent_b64 =
+                AgentPubKeyB64::from(committed.payload.agent_pubkey.clone()).to_string();
+            persist(cfg, state, |s| {
+                if s.agent.is_none() {
+                    s.agent = Some(agent_b64);
+                }
+            });
+            CloseOutcome::Closed
         }
+        CloseState::Open => prepare_check_close(conductor, cfg, target, state).await,
     }
 }
 

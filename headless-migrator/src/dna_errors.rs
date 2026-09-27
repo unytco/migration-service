@@ -286,7 +286,7 @@ fn is_global_definition_out_of_window_lower(r_lower: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseErrorClass {
     /// Summary committed, `CloseChain` not observed.
-    PartialClose,
+    SummaryWithoutClose,
     /// No summary: the chain is open.
     Open,
     /// Not an answer about the chain, such as a transport error.
@@ -298,10 +298,12 @@ pub enum CloseErrorClass {
 /// `"no CloseChain action found on chain"`.
 pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
     match MigrationError::from_rendered(rendered) {
-        Some(MigrationError::NoCloseChainAction) => CloseErrorClass::PartialClose,
+        Some(MigrationError::NoCloseChainAction) => CloseErrorClass::SummaryWithoutClose,
         Some(MigrationError::NoClosingSummary) => CloseErrorClass::Open,
         Some(_) => CloseErrorClass::Unrecognized,
-        None if rendered.contains("no CloseChain action found") => CloseErrorClass::PartialClose,
+        None if rendered.contains("no CloseChain action found") => {
+            CloseErrorClass::SummaryWithoutClose
+        }
         None if rendered.contains("No closing state summary found") => CloseErrorClass::Open,
         None => CloseErrorClass::Unrecognized,
     }
@@ -316,7 +318,7 @@ pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
 /// `old_chain_closed = false`; this predicate is what lets it distinguish the two.
 /// Mirrors the same two alliance close-surface strings `classify_close_error`
 /// keys off: `"No closing state summary found"` (plain open) and
-/// `"no CloseChain action found on chain"` (partial close).
+/// `"no CloseChain action found on chain"` (a summary with no close).
 pub fn is_recognized_close_state_response(rendered: &str) -> bool {
     if let Some(code) = MigrationError::from_rendered(rendered) {
         return matches!(
@@ -498,8 +500,8 @@ mod tests {
             "[MIGERR:MIG_STALE_CLOSE] the chain moved"
         ));
         assert_eq!(
-            classify_close_error("[MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] partial close"),
-            CloseErrorClass::PartialClose
+            classify_close_error("[MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] summary, no close"),
+            CloseErrorClass::SummaryWithoutClose
         );
         assert_eq!(
             classify_close_error("[MIGERR:MIG_NO_CLOSING_SUMMARY] open chain"),

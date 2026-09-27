@@ -827,3 +827,31 @@ async fn a_close_to_an_unapproved_target_hard_stops() {
     let err = result.unwrap_err();
     assert!(err.contains("hard-stopped"), "{err}");
 }
+
+#[tokio::test]
+async fn a_summary_with_no_close_hard_stops_without_closing_again() {
+    let tmp = tmp_state("summary-without-close");
+    let mock = MockConductor::default();
+    for _ in 0..2 {
+        mock.close_state
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::anyhow!(
+                "get_migration_close_state zome call failed: \
+             [MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] no CloseChain action found on chain"
+            )));
+    }
+    let mut sd = never_shutdown();
+    let err = close::run(&mock, &cfg(&tmp), &mut sd)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("hard-stopped"), "{err}");
+    assert_eq!(
+        mock.calls(),
+        vec![Call::GetMigrationCloseState],
+        "nothing is prepared, checked or closed"
+    );
+    assert_eq!(State::read(&tmp).unwrap().step, Step::Failed);
+    let _ = std::fs::remove_file(&tmp);
+}
