@@ -189,8 +189,8 @@ function parseError(status: number, text: string): DaemonAnswer {
       message: `notary daemon answered an unknown code ${String(code)}`,
     };
   }
-  // No error envelope: the answer came from in front of the daemon, the tunnel
-  // or Cloudflare Access, not from the daemon itself.
+  // No error envelope: usually the tunnel or Cloudflare Access in front of the
+  // daemon answered, not the daemon.
   const reason = `HTTP ${status} without an error body`;
   if (status === 401 || status === 403) {
     return { kind: "error", code: "auth_failed", message: reason };

@@ -1,6 +1,6 @@
 //! Close-service flow against the mock conductor: fees-owed → `drop_off_fees`
 //! precedes `prepare_closing_summary`; close is a no-op on an already-closed
-//! chain; a warranted notary hard-stops; a happy path drives prepare → M notary
+//! chain; a warranted agent hard-stops; a happy path drives prepare → M notary
 //! checks → close in order. Drives the real `close::run` loop with the injected
 //! mock (no live conductor), so the ordering + idempotency contract is proven.
 
@@ -230,9 +230,6 @@ async fn fees_owed_drops_before_prepare() {
 
 #[tokio::test]
 async fn fees_owed_on_a_non_base_unit_also_drops_before_prepare() {
-    // Under a single `ZFuel` a service-unit debt was unrepresentable, so a chain
-    // owing only those would have prepared its summary with the fees still
-    // outstanding.
     let calls = close_with_fees_owed("fees-non-base-unit", unit_map(3, 5)).await;
     let drop_idx = position(&calls, |c| *c == Call::DropOffFees);
     let prep_idx = position(&calls, is_prepare);
@@ -266,12 +263,6 @@ async fn no_fee_drop_when_none_owed() {
 #[tokio::test]
 async fn undecodable_ledger_hard_stops_instead_of_looping() {
     let mock = open_chain(vec![agent(70)], 1, vec![]);
-    // A second probe, so a regression that loops fails on the assertion below
-    // rather than on the mock running out of script.
-    mock.close_state
-        .lock()
-        .unwrap()
-        .push_back(Err(anyhow::anyhow!(OPEN)));
     *mock.ledger.lock().unwrap() = Some(Err(anyhow::anyhow!(
         "get_ledger zome call failed: Failed to deserialize response: \
          invalid type: string \"5\", expected a map"
@@ -318,15 +309,13 @@ async fn undecodable_close_state_hard_stops_instead_of_looping() {
     // A probe response that will not decode leaves the chain's real state
     // unknowable, so it must not be driven at.
     let mock = MockConductor::default();
-    for _ in 0..2 {
-        mock.close_state
-            .lock()
-            .unwrap()
-            .push_back(Err(anyhow::anyhow!(
-                "get_migration_close_state zome call failed: Failed to deserialize \
-                 response: missing field `agreement_carry_forward`"
-            )));
-    }
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!(
+            "get_migration_close_state zome call failed: Failed to deserialize \
+             response: missing field `agreement_carry_forward`"
+        )));
     let run = run_close("undecodable-close-state", &mock).await;
     let err = run.result.unwrap_err();
     assert!(
@@ -446,7 +435,7 @@ async fn shutdown_before_close_exits_nonzero_and_preserves_prior_report() {
 }
 
 #[tokio::test]
-async fn warranted_notary_hard_stops_the_close() {
+async fn a_warranted_agent_hard_stops_the_close() {
     let mock = open_chain(
         vec![agent(70)],
         1,
@@ -667,15 +656,13 @@ async fn a_close_to_an_unapproved_target_hard_stops() {
 #[tokio::test]
 async fn a_summary_with_no_close_hard_stops_without_closing_again() {
     let mock = MockConductor::default();
-    for _ in 0..2 {
-        mock.close_state
-            .lock()
-            .unwrap()
-            .push_back(Err(anyhow::anyhow!(
-                "get_migration_close_state zome call failed: \
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::anyhow!(
+            "get_migration_close_state zome call failed: \
              [MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] no CloseChain action found on chain"
-            )));
-    }
+        )));
     let run = run_close("summary-without-close", &mock).await;
     let err = run.result.unwrap_err();
     assert!(err.contains("hard-stopped"), "{err}");
