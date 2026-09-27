@@ -98,7 +98,12 @@ The request is `{ to_dna_hash, agent_pubkey, from_dna_hash? }` and a success bod
 
 1. M is the source's `closing_threshold`, and its daemons are ordered at random for this request.
 2. The first M daemons are asked at once. Every answer that does not count starts the next daemon in the order, until none are left.
-3. An answer is well formed when it is a 200 whose body has a `payload`, exactly one signature and a `close_action`, and whose `payload.source_dna_hash` is this source. It is bound to the target its `payload.target_dna_hash` names.
+3. An answer is well formed when it is a 200 whose body has:
+   - a `payload` whose `source_dna_hash` is this source and whose `agent_pubkey` is `agent_pubkey`;
+   - exactly one signature, whose `notary` is an agent key and whose `signature` is 64 bytes;
+   - a `close_action` that is an action hash.
+
+   It is bound to the target its `payload.target_dna_hash` names. A daemon that serves another agent's close fails here, so a client never installs a package it cannot open.
 4. The first well-formed answer bound to `to_dna_hash` fixes the package's `payload` and `close_action`. A well-formed answer, that first one included, counts when its `payload` and `close_action` are byte-identical to the fixed ones, and its signer has not counted already and is not `agent_pubkey`.
 5. The moment M answers count, the response is the fixed `payload` and `close_action` with those M signatures. Answers still in flight are ignored.
 6. Three answers end the request or the source early:
@@ -106,6 +111,17 @@ The request is `{ to_dna_hash, agent_pubkey, from_dna_hash? }` and a success bod
    - `bad_request` from any daemon: `400 bad_request` at once.
    - a well-formed answer bound to another target, before the package is fixed: the agent's close on this source binds elsewhere, so the next source is tried.
 7. Anything else does not count: `no_close_found`, `unable_to_verify`, `internal`, `auth_failed`, `rate_limited`, a timeout, a transport failure, a 200 that is not well formed, a package that differs from the fixed one, a repeated signer, the agent's own signature.
+
+An error answer is read by its `{ "error": { "code" } }` envelope. A code outside the daemon's table is `internal`. An answer with no envelope usually comes from in front of the daemon, the tunnel or Cloudflare Access, and is read by its status:
+
+| Status | Read as |
+| --- | --- |
+| 401, 403 | `auth_failed` |
+| 429 | `rate_limited` |
+| 5xx | a daemon that could not be reached |
+| any other | `internal` |
+
+The router logs every answer that does not count, with its daemon and the reason.
 
 When no source reaches M, the response is the first row that applies:
 
@@ -133,6 +149,7 @@ No code reaches a client that it does not already know.
 | daemon to conductor | `HAM_REQUEST_TIMEOUT_SECS`, 30 s by default |
 | one source, worst case | with N daemons, one slot makes at most `N - M + 1` calls in a row, so `(N - M + 1) × 10 s` |
 | headless migrator to router | 30 s. A client timeout is transient and the migrator asks again. |
+| headless migrator's close check | `MIGRATION_AGENT_SIGN_TIMEOUT_SECS`, 120 s by default. The migrator's conductor connection times a request out at the larger of that and `HAM_REQUEST_TIMEOUT_SECS`, so it never cuts a check short. |
 
 ### `GET /healthz`
 
@@ -160,6 +177,8 @@ Reports `protocol_versions: ["v0_2"]`.
    | `Warranted`, or a response that does not decode | hard stop |
 
    When too few notaries remain to reach M, back off and probe again. Nothing was committed, so the next pass prepares afresh.
+
+   When M is 0, or N holds fewer distinct notaries than M, no check can pass: hard stop, before any notary is asked, naming which.
 5. **Close:** `close_agent_chain(payload)`. `MIG_CLOSE_TARGET_NOT_UPGRADE_TARGET` is a hard stop. Any other error backs off and probes again.
 
 - Approvals gate the close and are not carried in it.
@@ -180,15 +199,5 @@ Reports `protocol_versions: ["v0_2"]`.
 
 - The router's public API is `v1`.
 - The router speaks `v2` to daemons.
-- Both Rust crates exact-pin a published `rave_engine` that carries `migration::v0_2`.
-
-## Open decision: the `rave_engine` pin before the release
-
-No published `rave_engine` carries `migration::v0_2` yet; `0.11.0` carries `v0_1` only. Once decided, the developer edits the `rave_engine` line in `notary-daemon/Cargo.toml` and `headless-migrator/Cargo.toml`, and their lockfiles.
-
-| Option | What it costs |
-| --- | --- |
-| **Wait for the release** (recommended) | The daemon and migrator changes land after the release. Nothing needs them sooner: a network running this DNA cannot open a `v0_1` close, so the first migration that uses them leaves such a network. |
-| Publish a pre-release now | A crates.io publish of a version that stays there, making unreleased DNA changes public before the fleet runs them. The `v0_2` wire is frozen upstream, so the final release changes one line per crate. |
-| Git pin to the unreleased branch | That repository is private and this one is public: CI and the release workflow fail without a new secret, and nobody else can build this repository. |
-| Local copies of the types | A carried copy of upstream code. It escapes the upstream freeze that guards the bytes notaries sign. |
+- Both Rust crates pin `rave_engine` to one revision of `unytco/unyt-app` that carries `migration::v0_2`. That repository is private, so CI and the release workflow fetch it with the `UNYT_APP_READ_TOKEN` secret, a token that can read it.
+- The release that publishes `rave_engine` with `migration::v0_2` replaces the pin in both crates with an exact pin on that published version.
