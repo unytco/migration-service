@@ -33,7 +33,7 @@ describe("worker.fetch — GET /healthz", () => {
     const b = await body(resp);
     expect(b.status).toBe("ok");
     expect(b.api_versions).toEqual(["v1"]);
-    expect(b.protocol_versions).toEqual(["v0_1"]);
+    expect(b.protocol_versions).toEqual(["v0_2"]);
   });
 
   it("carries the CORS allow-origin header on a successful response", async () => {

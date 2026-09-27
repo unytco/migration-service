@@ -1,8 +1,8 @@
-// Client for calling a notary daemon's /{api}/fetch-close over its Cloudflare
-// Tunnel: the daemon serves the agent's committed closing summary from its own
-// conductor, and the router hands it back to the app verbatim.
+// Client for one notary daemon's /{api}/attest-close over its Cloudflare Tunnel:
+// the daemon reads the agent's closed chain on its own conductor and answers
+// with its own signature over the close.
 
-import type { ErrorCode } from "./errors";
+import { rawElements, rawMembers } from "./raw-json";
 
 export interface Env {
   /** Bearer token shared with every notary daemon. */
@@ -21,69 +21,49 @@ export interface Env {
 /** Injectable fetch so tests can mock daemon responses. */
 export type FetchLike = typeof fetch;
 
-export interface PackageResult {
-  kind: "package"; // opaque closing-summary package — forwarded verbatim
-  payload: unknown;
-  notary_signatures: unknown;
-  close_action: unknown;
-  /** The successor this close is bound to, read from `payload.target_dna_hash`, so
-   * the handler can target-filter a discovered close (skipping a stale one bound
-   * to a different version). */
-  target_dna_hash: unknown;
+/** One daemon's attestation, each JSON field as the exact text it served. */
+export interface Attestation {
+  payload: string;
+  closeAction: string;
+  signature: string;
+  /** The signing notary, base64. */
+  signer: string;
+  /** `payload.source_dna_hash` and `payload.target_dna_hash`, base64. */
+  source: string;
+  target: string;
 }
 
-export interface HardStop {
-  kind: "hard_stop";
-  status: number;
-  code: ErrorCode; // warranted | no_close_found | bad_request | internal (dna_hash mismatch)
-  message: string;
-  details?: unknown;
-}
-
-/** Transient: this notary failed, but another may succeed. `code` carries the daemon's
- * cause (or `all_orgs_unhealthy` when unreachable) so the router can aggregate and
- * surface the most informative final error. */
-export interface Transient {
-  kind: "transient";
-  code: string;
-}
-
-export type FetchCloseOutcome = PackageResult | HardStop | Transient;
-
-// Codes the router must not retry across notaries: a content verdict every notary
-// returns identically (`warranted` / `no_close_found`), or a client input error
-// (`bad_request`) the next notary would reject the same way.
-const HARD_STOP_CODES: ReadonlySet<string> = new Set([
+/** The daemon codes the router acts on. Anything else a daemon answers is a
+ * daemon fault, so no code the client does not know reaches it. */
+const DAEMON_CODES = [
   "warranted",
-  "no_close_found",
   "bad_request",
-]);
+  "no_close_found",
+  "unable_to_verify",
+  "auth_failed",
+  "rate_limited",
+  "internal",
+] as const;
+export type DaemonCode = (typeof DAEMON_CODES)[number];
 
-/** Per-call budget: a daemon that accepts the socket but never responds maps to
- * `transient` after this, so the candidate loop advances instead of stalling /v1/migrate. */
-const FETCH_CLOSE_TIMEOUT_MS = 10_000;
+export type DaemonAnswer =
+  | { kind: "attestation"; attestation: Attestation }
+  /** A 200 that is not one well-formed attestation. */
+  | { kind: "malformed" }
+  | { kind: "error"; code: DaemonCode; message: string; details?: unknown }
+  /** No answer within the budget, or no connection. */
+  | { kind: "unreachable" };
 
-/** Call one daemon's /{api}/fetch-close. Never throws — transport failures, timeouts,
- * and malformed success bodies all map to `transient`. A success payload whose
- * `source_dna_hash` differs from `expectedDnaHash` is a misconfigured notary →
- * `internal` hard stop (B2). The package's `target_dna_hash` is surfaced for the
- * handler's target-filter. */
+/** An answer later than this does not count. */
+const ATTEST_TIMEOUT_MS = 10_000;
+
 /**
- * Normalize a DNA hash the daemon may serialize EITHER as its canonical b64
- * string ("uhC0k…") OR as a raw HoloHash byte array — the notary relays the
- * zome's close payload verbatim, and holo_hash serializes to bytes there. The
- * router compares these against the registry's b64 DNA hashes, so it must accept
- * both. Returns the b64 form, or `undefined` for anything that is not a b64
- * string or a well-formed HoloHash byte array.
- *
- * A HoloHash is EXACTLY 39 unsigned bytes (3-byte prefix + 32-byte hash + 4-byte
- * location), so only a 39-element array of integers in 0..=255 is accepted. A
- * wrong-length or out-of-range array is malformed and yields `undefined` rather
- * than a bogus b64 (`String.fromCharCode` would silently wrap/truncate a bad
- * value). (A 39-byte HoloHash → `"u"` + unpadded base64url, matching
- * `encodeHashToBase64`.)
+ * The base64 form of a HoloHash the daemon may serialize EITHER as its b64
+ * string or as its raw byte array (holo_hash serializes to bytes in JSON).
+ * Only a 39-element array of integers in 0..=255 is a HoloHash (3-byte prefix,
+ * 32-byte hash, 4-byte location); anything else is `undefined`.
  */
-export function normalizeDnaHashB64(value: unknown): string | undefined {
+export function normalizeHashB64(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (
     Array.isArray(value) &&
@@ -98,14 +78,14 @@ export function normalizeDnaHashB64(value: unknown): string | undefined {
   return undefined;
 }
 
-export async function fetchClose(
+/** Ask one daemon to attest `agentPubkey`'s close. Never throws. */
+export async function attestClose(
   daemonUrl: string,
   api: string,
   agentPubkey: string,
-  expectedDnaHash: string,
   env: Env,
   fetchImpl: FetchLike,
-): Promise<FetchCloseOutcome> {
+): Promise<DaemonAnswer> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${env.MIGRATION_NOTARY_BEARER_TOKEN}`,
@@ -115,101 +95,71 @@ export async function fetchClose(
     headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
   }
 
-  let resp: Response;
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), ATTEST_TIMEOUT_MS);
+  let status: number;
+  let text: string;
   try {
-    resp = await fetchImpl(
-      `${daemonUrl.replace(/\/$/, "")}/${api}/fetch-close`,
+    const resp = await fetchImpl(
+      `${daemonUrl.replace(/\/$/, "")}/${api}/attest-close`,
       {
         method: "POST",
         headers,
         body: JSON.stringify({ agent_pubkey: agentPubkey }),
-        signal: AbortSignal.timeout(FETCH_CLOSE_TIMEOUT_MS),
+        signal: timeout.signal,
       },
     );
+    status = resp.status;
+    text = await resp.text();
   } catch {
-    return { kind: "transient", code: "all_orgs_unhealthy" };
+    return { kind: "unreachable" };
+  } finally {
+    clearTimeout(timer);
   }
 
-  if (resp.status === 200) {
-    // B3: a 200 can still carry a truncated/non-JSON body — guard the parse (the
-    // "Never throws" contract) and fail over rather than escape the candidate loop.
-    let body: {
-      payload?: unknown;
-      notary_signatures?: unknown;
-      close_action?: unknown;
-    };
-    try {
-      body = (await resp.json()) as typeof body;
-    } catch {
-      return { kind: "transient", code: "unable_to_verify" };
-    }
-    // A 200 missing any package field (or null) is as malformed as a non-JSON body — fail over.
-    if (
-      body.payload == null ||
-      body.notary_signatures == null ||
-      body.close_action == null
-    ) {
-      return { kind: "transient", code: "unable_to_verify" };
-    }
-    // B2 / fail-closed: the daemon serves exactly one DNA, and a well-formed close
-    // ALWAYS binds a `source_dna_hash` (a required field of rave_engine's
-    // SummaryStatePayload). So anything other than the source we queried — a
-    // mismatch, a missing field, or a malformed hash that normalizes to `undefined`
-    // — can't be proven to belong here; reject as `internal` rather than forward an
-    // unbound package. Normalize first: the hash may be a b64 string or a byte array.
-    const payloadSourceDna = normalizeDnaHashB64(
-      (body.payload as { source_dna_hash?: unknown } | undefined)?.source_dna_hash,
-    );
-    if (payloadSourceDna !== expectedDnaHash) {
-      return {
-        kind: "hard_stop",
-        status: 500,
-        code: "internal",
-        message: "notary returned a payload for a different or missing source DNA",
-        details: {
-          expected_dna_hash: expectedDnaHash,
-          got_dna_hash: payloadSourceDna ?? null,
-        },
-      };
-    }
-    return {
-      kind: "package",
-      // The payload is passed to the app verbatim — its hashes stay in the
-      // on-chain (byte) form the successor DNA's `init` expects; only the router's
-      // OWN routing field is normalized to b64 for comparison against the registry.
-      payload: body.payload,
-      notary_signatures: body.notary_signatures,
-      close_action: body.close_action,
-      target_dna_hash: normalizeDnaHashB64(
-        (body.payload as { target_dna_hash?: unknown } | undefined)?.target_dna_hash,
-      ),
-    };
+  if (status === 200) {
+    const attestation = parseAttestation(text);
+    return attestation ? { kind: "attestation", attestation } : { kind: "malformed" };
   }
+  return parseError(text);
+}
 
-  let code = "internal";
-  let message = `notary returned ${resp.status}`;
-  let details: unknown;
+function parseAttestation(text: string): Attestation | undefined {
+  const body = rawMembers(text);
+  const payload = body?.get("payload");
+  const closeAction = body?.get("close_action");
+  const signatures = rawElements(body?.get("notary_signatures") ?? "");
+  if (!payload || !closeAction || signatures?.length !== 1) return undefined;
+  const hashes = JSON.parse(payload) as {
+    source_dna_hash?: unknown;
+    target_dna_hash?: unknown;
+  } | null;
+  const signed = JSON.parse(signatures[0]) as { notary?: unknown } | null;
+  const source = normalizeHashB64(hashes?.source_dna_hash);
+  const target = normalizeHashB64(hashes?.target_dna_hash);
+  const signer = normalizeHashB64(signed?.notary);
+  if (!source || !target || !signer || JSON.parse(closeAction) === null) {
+    return undefined;
+  }
+  return { payload, closeAction, signature: signatures[0], signer, source, target };
+}
+
+function parseError(text: string): DaemonAnswer {
+  let body: { error?: { code?: unknown; message?: unknown; details?: unknown } };
   try {
-    const body = (await resp.json()) as {
-      error?: { code?: string; message?: string; details?: unknown };
-    };
-    if (body.error?.code) code = body.error.code;
-    if (body.error?.message) message = body.error.message;
-    details = body.error?.details;
+    body = JSON.parse(text);
   } catch {
-    /* non-JSON error body — keep defaults */
+    body = {};
   }
-
-  if (HARD_STOP_CODES.has(code)) {
-    return {
-      kind: "hard_stop",
-      status: resp.status,
-      code: code as ErrorCode,
-      message,
-      details,
-    };
+  const code = body?.error?.code;
+  if (!DAEMON_CODES.includes(code as DaemonCode)) {
+    return { kind: "error", code: "internal", message: "notary daemon fault" };
   }
-  // Not a hard stop: preserve the daemon's code so the router can surface the real
-  // cause if every candidate fails the same way.
-  return { kind: "transient", code };
+  const message = body.error?.message;
+  return {
+    kind: "error",
+    code: code as DaemonCode,
+    message: typeof message === "string" ? message : String(code),
+    details: body.error?.details,
+  };
 }

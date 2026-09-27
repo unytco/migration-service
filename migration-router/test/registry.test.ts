@@ -294,17 +294,17 @@ describe("Registry.load", () => {
     expect(r.source("unknown", v03)).toBeUndefined();
   });
 
-  it("reaches reflects the upgrade_targets list", () => {
+  it("source reflects the upgrade_targets list", () => {
     const r = Registry.load(skipChain());
-    expect(r.reaches(v01, v03)).toBe(true);
-    expect(r.reaches(v02, v03)).toBe(true);
-    expect(r.reaches(v02, v01)).toBe(false);
-    expect(r.reaches("unknown", v03)).toBe(false);
+    expect(r.source(v01, v03)).toBeDefined();
+    expect(r.source(v02, v03)).toBeDefined();
+    expect(r.source(v02, v01)).toBeUndefined();
+    expect(r.source("unknown", v03)).toBeUndefined();
   });
 });
 
 // The customers-last visibility gate: `published` is HONORED by furthestTargetOf (the
-// /v1/update-check banner) but IGNORED by reaches / sourcesReaching (the /v1/migrate close-package
+// /v1/update-check banner) but IGNORED by source / sourcesReaching (the /v1/migrate close-package
 // fetch), so a successor can be served to the headless server open BEFORE it is surfaced to
 // customers. Absent `published` = unpublished (the safe default).
 describe("Registry — published (customer-visibility) gate", () => {
@@ -385,9 +385,9 @@ describe("Registry — published (customer-visibility) gate", () => {
     expect(r.furthestTargetOf(v02)).toBeUndefined();
   });
 
-  it("reaches IGNORES published — an unpublished target is still reachable (migrate serves it)", () => {
+  it("source IGNORES published — an unpublished target is still reachable (migrate serves it)", () => {
     const r = Registry.load(gated(false));
-    expect(r.reaches(v01, v02)).toBe(true);
+    expect(r.source(v01, v02)).toBeDefined();
   });
 
   it("sourcesReaching IGNORES published — an unpublished target still lists its sources", () => {

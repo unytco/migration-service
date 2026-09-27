@@ -34,7 +34,7 @@ export interface DnaEntry {
   /** Customer-visibility gate for this DNA as a migration TARGET (customers-last, Stage 7.1).
    * HONORED by /v1/update-check (`furthestTargetOf`): an unpublished successor is invisible, so
    * the app shows no upgrade banner. IGNORED by /v1/migrate + /v1/migration-options
-   * (`reaches` / `sourcesReaching`): the close-package is served regardless, so the headless
+   * (`source` / `sourcesReaching`): the close-package is served regardless, so the headless
    * server open can fetch the successor BEFORE it is surfaced to customers. Absent = unpublished
    * (the safe default): the routing phase registers a target `false`, the publish phase flips it
    * `true` once the whole fleet has migrated. */
@@ -252,8 +252,4 @@ export class Registry {
     return entry && reachesTarget(entry, toDnaHash) ? entry : undefined;
   }
 
-  /** Is `toDnaHash` a proven upgrade target of `fromDnaHash`? */
-  reaches(fromDnaHash: string, toDnaHash: string): boolean {
-    return this.source(fromDnaHash, toDnaHash) !== undefined;
-  }
 }
