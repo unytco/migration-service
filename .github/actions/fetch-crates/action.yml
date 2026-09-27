@@ -23,7 +23,7 @@ runs:
         GIT_CONFIG_VALUE_0: https://github.com/unytco/unyt-app
         # unyt-app names its submodules by SSH URL, and the runner has no SSH key.
         GIT_CONFIG_KEY_1: url.https://github.com/.insteadOf
-        GIT_CONFIG_VALUE_1: git@github.com:
+        GIT_CONFIG_VALUE_1: "git@github.com:"
       run: |
         if [[ -z "$UNYT_APP_TOKEN" ]]; then
           echo "::error::The UNYT_APP_READ_TOKEN secret is not set, and rave_engine comes from the private unytco/unyt-app."
