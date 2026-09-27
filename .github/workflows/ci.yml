@@ -18,8 +18,6 @@ jobs:
   daemon:
     name: notary-daemon (Rust)
     runs-on: ubuntu-latest
-    # `ham` (git dep) and `rave_engine` (crates.io) are both public — cargo fetches
-    # them anonymously, no token or git-auth config needed.
     defaults:
       run:
         working-directory: notary-daemon
@@ -30,9 +28,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No rust-cache: a pull request, a fork's included, can restore this branch's
+      # cache, and the cargo git database holds the private unyt-app history.
+      - uses: ./.github/actions/fetch-crates
         with:
-          workspaces: notary-daemon
+          working-directory: notary-daemon
+          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
       - name: fmt
         run: cargo fmt --check
       - name: clippy
@@ -43,8 +44,6 @@ jobs:
   agent:
     name: headless-migrator (Rust)
     runs-on: ubuntu-latest
-    # Same public deps as the daemon (`ham` git + `rave_engine` crates.io) —
-    # fetched anonymously, no token needed.
     defaults:
       run:
         working-directory: headless-migrator
@@ -55,9 +54,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No rust-cache: a pull request, a fork's included, can restore this branch's
+      # cache, and the cargo git database holds the private unyt-app history.
+      - uses: ./.github/actions/fetch-crates
         with:
-          workspaces: headless-migrator
+          working-directory: headless-migrator
+          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
       - name: fmt
         run: cargo fmt --check
       - name: clippy
