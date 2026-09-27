@@ -11,11 +11,7 @@
           "api": "v2"
         }
       ],
-      "published": false,
-      "upgrade_targets": [
-        "uhC0k_UgRlkczfH7eqwctk2XytOnxTKAEQBDXUJ7pSvyGYqS41TMe"
-      ],
-      "closing_threshold": 1
+      "published": false
     },
     {
       "dna_hash": "uhC0k_UgRlkczfH7eqwctk2XytOnxTKAEQBDXUJ7pSvyGYqS41TMe",

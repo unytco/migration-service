@@ -29,7 +29,8 @@ export interface DnaEntry {
   closing_threshold?: number;
   /** Where to download the build for this DNA (e.g. a GitHub release page). Surfaced by /v1/update-check. */
   release_url?: string;
-  /** 1..N notary daemons serving this DNA (redundancy / failover). */
+  /** The notary daemons serving this DNA. On a source, `closing_threshold` of
+   * them must each attest a close. */
   notaries: NotaryEntry[];
   /** Customer-visibility gate for this DNA as a migration TARGET (customers-last, Stage 7.1).
    * HONORED by /v1/update-check (`furthestTargetOf`): an unpublished successor is invisible, so

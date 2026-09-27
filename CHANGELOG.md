@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - router: the registry loads only `v2` notary daemons, and every entry with `upgrade_targets` names its `closing_threshold`.
 - router: `/v1/migrate` asks M notaries to attest the closed chain and returns their M signatures, and `/healthz` reports protocol `v0_2`.
+- router: a notary behind a failing tunnel or Access reads as unreachable or refused, not as a faulty daemon, and each answer that does not count is logged with its daemon.
 - notary-daemon: `POST /v2/attest-close` returns this notary's attestation of a closed chain, replacing `/v1/fetch-close`, and `/healthz` reports `v2` and `v0_2`.
 - headless-migrator: the close service has M notaries check the close before it closes the chain, and opens from the attestations the router gathers after.
 - **Breaking.** headless-migrator: during the check the state file reports step `collecting_approvals` with `approvals_collected` and `approvals_threshold`, replacing the `signatures_*` fields.

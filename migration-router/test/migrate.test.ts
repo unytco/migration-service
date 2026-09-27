@@ -3,10 +3,27 @@ import { Registry, type RawRegistry } from "../src/registry";
 import { migrate, type MigrateBody } from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
 
-const v01 = "uhC0k_v01";
-const v02 = "uhC0k_v02";
-const v03 = "uhC0k_v03";
-const AGENT = "uhCAk_agent";
+// Hashes in the daemons' wire form: serde_json writes a HoloHash as its 39
+// bytes (3-byte prefix, 32-byte core, 4-byte location).
+const hash = (prefix: number[], seed: number) => [
+  ...prefix,
+  ...Array(32).fill(seed),
+  0,
+  0,
+  0,
+  0,
+];
+const b64 = (bytes: number[]) => "u" + Buffer.from(bytes).toString("base64url");
+const dna = (seed: number) => hash([0x84, 0x2d, 0x24], seed);
+const key = (seed: number) => hash([0x84, 0x20, 0x24], seed);
+const action = (seed: number) => hash([0x84, 0x29, 0x24], seed);
+
+const v01 = b64(dna(1));
+const v02 = b64(dna(2));
+const v03 = b64(dna(3));
+const AGENT_SEED = 100;
+const AGENT = b64(key(AGENT_SEED));
+const DNA_BYTES: Record<string, number[]> = { [v01]: dna(1), [v02]: dna(2), [v03]: dna(3) };
 const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
 const KEEP_ORDER = () => 0.99;
 
@@ -46,19 +63,25 @@ function registry(m = 2): Registry {
 }
 
 /** The carryover's integer-like keys are in the order the notaries signed. */
-const payloadText = (source = v01, target = v02) =>
-  `{"agent_pubkey":"${AGENT}","source_dna_hash":"${source}","target_dna_hash":"${target}","closing_state":{"agreement_carry_forward":[{"carryover":{"10":1,"9":2}}]},"chain_top":[7]}`;
+const payloadText = (source = v01, target = v02, agent = AGENT_SEED) =>
+  `{"agent_pubkey":${JSON.stringify(key(agent))},"source_dna_hash":${JSON.stringify(DNA_BYTES[source])},"target_dna_hash":${JSON.stringify(DNA_BYTES[target])},"closing_state":{"agreement_carry_forward":[{"carryover":{"10":1,"9":2}}]},"chain_top":${JSON.stringify(action(7))}}`;
+
+/** One notary's signature as a daemon serves it, spacing included. */
+const sigText = (signer: number) =>
+  `{"notary":${JSON.stringify(key(signer))}, "signature":${JSON.stringify(Array(64).fill(signer))}}`;
 
 interface Attest {
-  signer: string;
+  signer: number;
   source?: string;
   target?: string;
+  agent?: number;
   payload?: string;
-  closeAction?: string;
+  closeAction?: number;
+  signature?: string;
 }
 
 const attestText = (a: Attest) =>
-  `{"payload":${a.payload ?? payloadText(a.source, a.target)},"notary_signatures":[{"notary":"${a.signer}", "signature":[1,2]}],"close_action":${a.closeAction ?? "[6,6]"}}`;
+  `{"payload":${a.payload ?? payloadText(a.source, a.target, a.agent)},"notary_signatures":[${a.signature ?? sigText(a.signer)}],"close_action":${JSON.stringify(action(a.closeAction ?? 6))}}`;
 
 const attest = (a: Attest) => () =>
   new Response(attestText(a), {
@@ -140,8 +163,8 @@ describe("migrate: pair validation", () => {
 describe("migrate: combining attestations", () => {
   it("asks /{api}/attest-close with the bearer token and the agent", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
-      "https://n2": attest({ signer: "uhCAk_n2" }),
+      "https://n1": attest({ signer: 1 }),
+      "https://n2": attest({ signer: 2 }),
     });
     await migrate(registry(), pair(), ENV, d.fetch, KEEP_ORDER);
     const req = d.requests.find((r) => r.url.startsWith("https://n1"))!;
@@ -167,51 +190,72 @@ describe("migrate: combining attestations", () => {
 
   it("returns M signatures over the daemons' own payload and close_action text", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
-      "https://n2": attest({ signer: "uhCAk_n2" }),
+      "https://n1": attest({ signer: 1 }),
+      "https://n2": attest({ signer: 2 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
     const text = await resp.text();
     expect(text).toBe(
-      `{"payload":${payloadText()},"notary_signatures":[{"notary":"uhCAk_n1", "signature":[1,2]},{"notary":"uhCAk_n2", "signature":[1,2]}],"close_action":[6,6]}`,
+      `{"payload":${payloadText()},"notary_signatures":[${sigText(1)},${sigText(2)}],"close_action":${JSON.stringify(action(6))}}`,
     );
     expect(text).toContain('{"10":1,"9":2}');
   });
 
-  it("forwards a payload whose hashes are raw 39-byte arrays", async () => {
-    const bytes = [0x84, 0x2d, 0x24, ...Array(32).fill(7), 0, 0, 0, 0];
-    const src = "u" + Buffer.from(bytes).toString("base64url");
-    const r = Registry.load({
-      version: 1,
-      dnas: [
-        {
-          dna_hash: src,
-          version: "src",
-          upgrade_targets: [v02],
-          closing_threshold: 1,
-          notaries: [{ url: "https://nb", api: "v2" }],
-        },
-        {
-          dna_hash: v02,
-          version: "to",
-          upgrades_from: src,
-          notaries: [{ url: "https://nt", api: "v2" }],
-        },
-      ],
-    });
-    const payload = `{"source_dna_hash":${JSON.stringify(bytes)},"target_dna_hash":"${v02}"}`;
-    const d = daemons({ "https://nb": attest({ signer: "uhCAk_nb", payload }) });
-    const resp = await migrate(r, pair(v02, src), ENV, d.fetch);
+  it("also reads hashes served as base64 strings", async () => {
+    const payload = `{"agent_pubkey":"${AGENT}","source_dna_hash":"${v01}","target_dna_hash":"${v02}"}`;
+    const signature = `{"notary":"${b64(key(1))}","signature":${JSON.stringify(Array(64).fill(1))}}`;
+    const d = daemons({ "https://n1": attest({ signer: 1, payload, signature }) });
+    const resp = await migrate(registry(1), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
-    expect((await json(resp)).payload.source_dna_hash).toEqual(bytes);
+    expect((await json(resp)).payload.source_dna_hash).toBe(v01);
   });
+
+  it("orders the daemons at random for each request", async () => {
+    const firstAsked = async (rand: () => number) => {
+      const d = daemons({
+        "https://n1": attest({ signer: 1 }),
+        "https://n2": attest({ signer: 2 }),
+        "https://n3": attest({ signer: 3 }),
+      });
+      await migrate(registry(2), pair(), ENV, d.fetch, rand);
+      return d.asked.map((u) => new URL(u).origin).sort();
+    };
+    expect(await firstAsked(KEEP_ORDER)).toEqual(["https://n1", "https://n2"]);
+    expect(await firstAsked(() => 0)).toEqual(["https://n2", "https://n3"]);
+  });
+
+  const notCounting: [string, Daemon][] = [
+    ["internal", daemonError(500, "internal")],
+    ["a malformed 200", () => new Response("not json{", { status: 200 })],
+    ["an answer for another source", attest({ signer: 1, source: v02 })],
+    ["an answer for another agent", attest({ signer: 1, agent: 101 })],
+    ["a malformed signature", attest({ signer: 1, signature: `{"notary":${JSON.stringify(key(1))},"signature":"x"}` })],
+    ["auth_failed", daemonError(401, "auth_failed")],
+    ["rate_limited", daemonError(429, "rate_limited")],
+    ["a tunnel error page", () => new Response("<html>1033</html>", { status: 530 })],
+  ];
+  for (const [name, daemon] of notCounting) {
+    it(`asks the next daemon after ${name}`, async () => {
+      const d = daemons({
+        "https://n1": daemon,
+        "https://n2": attest({ signer: 2 }),
+        "https://n3": attest({ signer: 3 }),
+      });
+      const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
+      expect(resp.status).toBe(200);
+      expect(d.asked).toHaveLength(3);
+      const text = await resp.text();
+      expect(text).toContain(sigText(2));
+      expect(text).toContain(sigText(3));
+    });
+  }
 
   it("substitutes the next daemon for one that is unable to verify", async () => {
     const d = daemons({
       "https://n1": daemonError(503, "unable_to_verify"),
-      "https://n2": attest({ signer: "uhCAk_n2" }),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n2": attest({ signer: 2 }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
@@ -221,8 +265,8 @@ describe("migrate: combining attestations", () => {
   it("does not abandon a source over one no_close_found", async () => {
     const d = daemons({
       "https://n1": daemonError(404, "no_close_found"),
-      "https://n2": attest({ signer: "uhCAk_n2" }),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n2": attest({ signer: 2 }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
@@ -230,9 +274,9 @@ describe("migrate: combining attestations", () => {
 
   it("counts one signature per notary, and never the agent's own", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
-      "https://n2": attest({ signer: "uhCAk_n1" }),
-      "https://n3": attest({ signer: AGENT }),
+      "https://n1": attest({ signer: 1 }),
+      "https://n2": attest({ signer: 1 }),
+      "https://n3": attest({ signer: AGENT_SEED }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(await code(resp)).toEqual({ status: 503, code: "unable_to_verify" });
@@ -240,9 +284,9 @@ describe("migrate: combining attestations", () => {
 
   it("asks the next daemon for a repeated signer", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
-      "https://n2": attest({ signer: "uhCAk_n1" }),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n1": attest({ signer: 1 }),
+      "https://n2": attest({ signer: 1 }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
@@ -251,13 +295,13 @@ describe("migrate: combining attestations", () => {
 
   it("does not count a package that differs from the one that fixed it", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
-      "https://n2": attest({ signer: "uhCAk_n2", closeAction: "[5,5]" }),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n1": attest({ signer: 1 }),
+      "https://n2": attest({ signer: 2, closeAction: 5 }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(200);
-    expect(await resp.text()).not.toContain("uhCAk_n2");
+    expect(await resp.text()).not.toContain(sigText(2));
   });
 });
 
@@ -266,7 +310,7 @@ describe("migrate: answers that end the request or the source", () => {
     const d = daemons({
       "https://n1": daemonError(422, "warranted", { warrants: ["w"] }),
       "https://n2": pending(),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(resp.status).toBe(422);
@@ -279,7 +323,7 @@ describe("migrate: answers that end the request or the source", () => {
     const d = daemons({
       "https://n1": daemonError(400, "bad_request"),
       "https://n2": pending(),
-      "https://n3": attest({ signer: "uhCAk_n3" }),
+      "https://n3": attest({ signer: 3 }),
     });
     const resp = await migrate(registry(2), pair(), ENV, d.fetch, KEEP_ORDER);
     expect(await code(resp)).toEqual({ status: 400, code: "bad_request" });
@@ -287,14 +331,14 @@ describe("migrate: answers that end the request or the source", () => {
 
   it("tries the next source when a close binds another target", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1", target: v02 }),
-      "https://n2": attest({ signer: "uhCAk_n2", target: v02 }),
-      "https://n3": attest({ signer: "uhCAk_n3", target: v02 }),
-      "https://m1": attest({ signer: "uhCAk_m1", source: v02, target: v03 }),
+      "https://n1": attest({ signer: 1, target: v02 }),
+      "https://n2": attest({ signer: 2, target: v02 }),
+      "https://n3": attest({ signer: 3, target: v02 }),
+      "https://m1": attest({ signer: 4, source: v02, target: v03 }),
     });
     const resp = await migrate(registry(2), pair(v03, null), ENV, d.fetch);
     expect(resp.status).toBe(200);
-    expect(await resp.text()).toContain("uhCAk_m1");
+    expect(await resp.text()).toContain(sigText(4));
   });
 
   it("finds the close on a later source when an earlier one falls short", async () => {
@@ -302,7 +346,7 @@ describe("migrate: answers that end the request or the source", () => {
       "https://n1": daemonError(503, "unable_to_verify"),
       "https://n2": daemonError(503, "unable_to_verify"),
       "https://n3": daemonError(503, "unable_to_verify"),
-      "https://m1": attest({ signer: "uhCAk_m1", source: v02, target: v03 }),
+      "https://m1": attest({ signer: 4, source: v02, target: v03 }),
     });
     const resp = await migrate(registry(2), pair(v03, null), ENV, d.fetch);
     expect(resp.status).toBe(200);
@@ -333,7 +377,7 @@ describe("migrate: the answer when no source reaches M", () => {
     [
       "an answer for another source is a fault",
       {
-        "https://n1": attest({ signer: "uhCAk_n1", source: v02 }),
+        "https://n1": attest({ signer: 1, source: v02 }),
         "https://n2": daemonError(404, "no_close_found"),
         "https://n3": daemonError(404, "no_close_found"),
       },
@@ -345,6 +389,26 @@ describe("migrate: the answer when no source reaches M", () => {
       {
         "https://n1": daemonError(418, "teapot"),
         "https://n2": daemonError(404, "no_close_found"),
+        "https://n3": daemonError(404, "no_close_found"),
+      },
+      500,
+      "internal",
+    ],
+    [
+      "a package that differs from the one that fixed it is a fault",
+      {
+        "https://n1": attest({ signer: 1 }),
+        "https://n2": attest({ signer: 2, closeAction: 5 }),
+        "https://n3": daemonError(404, "no_close_found"),
+      },
+      500,
+      "internal",
+    ],
+    [
+      "a payload that differs is a fault",
+      {
+        "https://n1": attest({ signer: 1 }),
+        "https://n2": attest({ signer: 2, payload: payloadText().replace('"10":1', '"10":2') }),
         "https://n3": daemonError(404, "no_close_found"),
       },
       500,
@@ -363,11 +427,41 @@ describe("migrate: the answer when no source reaches M", () => {
     [
       "some counted but fewer than M is unable_to_verify",
       {
-        "https://n1": attest({ signer: "uhCAk_n1" }),
+        "https://n1": attest({ signer: 1 }),
         "https://n2": daemonError(404, "no_close_found"),
       },
       503,
       "unable_to_verify",
+    ],
+    [
+      "an Access refusal without an error body is auth_failed",
+      {
+        "https://n1": () => new Response("<html>denied</html>", { status: 403 }),
+        "https://n2": daemonError(404, "no_close_found"),
+        "https://n3": daemonError(404, "no_close_found"),
+      },
+      502,
+      "auth_failed",
+    ],
+    [
+      "a gateway error page is an unreachable daemon",
+      {
+        "https://n1": () => new Response("<html>530</html>", { status: 530 }),
+        "https://n2": daemonError(404, "no_close_found"),
+        "https://n3": daemonError(404, "no_close_found"),
+      },
+      503,
+      "all_orgs_unhealthy",
+    ],
+    [
+      "only the agent's own signature leaves no_close_found",
+      {
+        "https://n1": attest({ signer: AGENT_SEED }),
+        "https://n2": daemonError(404, "no_close_found"),
+        "https://n3": daemonError(404, "no_close_found"),
+      },
+      404,
+      "no_close_found",
     ],
     [
       "auth_failed outranks rate limits",
@@ -410,10 +504,26 @@ describe("migrate: the answer when no source reaches M", () => {
     });
   }
 
+  it("ranks what every source's daemons said", async () => {
+    for (const [first, status, errorCode] of [
+      ["unable_to_verify", 503, "unable_to_verify"],
+      ["internal", 500, "internal"],
+    ] as const) {
+      const d = daemons({
+        "https://n1": daemonError(503, first),
+        "https://n2": daemonError(503, first),
+        "https://n3": daemonError(503, first),
+        "https://m1": daemonError(404, "no_close_found"),
+      });
+      const resp = await migrate(registry(2), pair(v03, null), ENV, d.fetch);
+      expect(await code(resp)).toEqual({ status, code: errorCode });
+    }
+  });
+
   it("every close binding elsewhere is 404", async () => {
     const d = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1", target: v02 }),
-      "https://n2": attest({ signer: "uhCAk_n2", target: v02 }),
+      "https://n1": attest({ signer: 1, target: v02 }),
+      "https://n2": attest({ signer: 2, target: v02 }),
       "https://m1": daemonError(404, "no_close_found"),
     });
     const resp = await migrate(registry(2), pair(v03, null), ENV, d.fetch, KEEP_ORDER);
@@ -423,7 +533,7 @@ describe("migrate: the answer when no source reaches M", () => {
   it("a daemon that has not answered in 10 s does not count", async () => {
     vi.useFakeTimers();
     const answering = daemons({
-      "https://n1": attest({ signer: "uhCAk_n1" }),
+      "https://n1": attest({ signer: 1 }),
       "https://n3": daemonError(404, "no_close_found"),
     });
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -471,7 +581,7 @@ describe("migrate: customers-last", () => {
         },
       ],
     });
-    const d = daemons({ "https://n1": attest({ signer: "uhCAk_n1" }) });
+    const d = daemons({ "https://n1": attest({ signer: 1 }) });
     expect((await migrate(r, pair(), ENV, d.fetch)).status).toBe(200);
   });
 });

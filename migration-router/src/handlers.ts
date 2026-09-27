@@ -264,6 +264,8 @@ interface Tally {
   unreachable: boolean;
 }
 
+/** First match wins: a daemon fault outranks every transient, so it never
+ * reads as an outage. */
 function shortResponse(tally: Tally): Response {
   if (tally.fault) {
     return errorJson(
@@ -329,15 +331,16 @@ function attestSource(
   const signatures = new Map<string, string>();
   let fixed: { payload: string; closeAction: string } | undefined;
 
-  /** An outcome that ends the source, or whether the answer counts. */
-  const judge = (answer: DaemonAnswer): SourceOutcome | boolean => {
+  /** An outcome that ends the source, `true` for an answer that counts, or why
+   * it does not. */
+  const judge = (answer: DaemonAnswer): SourceOutcome | true | string => {
     switch (answer.kind) {
       case "unreachable":
         tally.unreachable = true;
-        return false;
+        return answer.reason;
       case "malformed":
         tally.fault = true;
-        return false;
+        return answer.reason;
       case "error":
         switch (answer.code) {
           case "warranted":
@@ -365,20 +368,24 @@ function attestSource(
           case "no_close_found":
             break;
         }
-        return false;
+        return `${answer.code}: ${answer.message}`;
       case "attestation": {
         const a = answer.attestation;
-        if (a.source !== source.dna_hash) {
+        if (a.source !== source.dna_hash || a.agent !== agent) {
           tally.fault = true;
-          return false;
+          return "an attestation of another source or agent";
         }
-        if (!fixed && a.target !== to) return { kind: "next" };
+        if (!fixed && a.target !== to) {
+          console.warn(`migrate: ${source.dna_hash}'s close for ${agent} binds ${a.target}`);
+          return { kind: "next" };
+        }
         fixed ??= { payload: a.payload, closeAction: a.closeAction };
         if (a.payload !== fixed.payload || a.closeAction !== fixed.closeAction) {
           tally.fault = true;
-          return false;
+          return "a package that differs from the one that fixed it";
         }
-        if (a.signer === agent || signatures.has(a.signer)) return false;
+        if (a.signer === agent) return "the agent's own signature";
+        if (signatures.has(a.signer)) return `a repeated signer ${a.signer}`;
         signatures.set(a.signer, a.signature);
         if (signatures.size < m) return true;
         return { kind: "package", body: packageBody(fixed, [...signatures.values()]) };
@@ -396,7 +403,7 @@ function attestSource(
     };
     const settleIfIdle = () => {
       if (inFlight > 0 || next < order.length) return;
-      if (fixed) tally.unableToVerify = true;
+      if (signatures.size > 0) tally.unableToVerify = true;
       settle({ kind: "next" });
     };
     const ask = () => {
@@ -408,8 +415,11 @@ function attestSource(
           inFlight--;
           if (settled) return;
           const verdict = judge(answer);
-          if (verdict === false) return ask();
           if (verdict === true) return settleIfIdle();
+          if (typeof verdict === "string") {
+            console.warn(`migrate: ${daemon.url} did not count: ${verdict}`);
+            return ask();
+          }
           settle(verdict);
         },
       );

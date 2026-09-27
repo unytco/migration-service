@@ -385,7 +385,7 @@ describe("Registry — published (customer-visibility) gate", () => {
     expect(r.furthestTargetOf(v02)).toBeUndefined();
   });
 
-  it("source IGNORES published — an unpublished target is still reachable (migrate serves it)", () => {
+  it("source IGNORES published: an unpublished target is still reachable (migrate serves it)", () => {
     const r = Registry.load(gated(false));
     expect(r.source(v01, v02)).toBeDefined();
   });

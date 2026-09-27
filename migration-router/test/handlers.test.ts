@@ -252,7 +252,7 @@ describe("updateCheck — migration axis (no app_version → unchanged, no GitHu
 
 // The customers-last gate on /v1/update-check. /v1/migrate serves the same unpublished entry
 // (test/migrate.test.ts), so the headless server open works before customers see the banner.
-describe("updateCheck — the published (customers-last) gate", () => {
+describe("updateCheck: the published (customers-last) gate", () => {
   const noGh = mockFetch({}); // update-check's no-version path must reach no network
 
   /** A single-step chain v01 → v02, with v02's customer-visibility parameterised. */

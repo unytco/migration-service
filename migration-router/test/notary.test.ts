@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { attestClose, normalizeHashB64, type FetchLike } from "../src/notary";
 
-// A HoloHash is exactly 39 bytes; the router accepts a DNA hash either as its b64
-// string form or as that raw byte array (the notary relays the zome payload verbatim).
+// A HoloHash is exactly 39 bytes; the router accepts one either as its b64 string
+// or as that raw byte array, which is how serde_json encodes holo_hash.
 describe("normalizeHashB64", () => {
   it("passes a b64 string through unchanged", () => {
     expect(normalizeHashB64("uhC0k_whatever")).toBe("uhC0k_whatever");
@@ -44,18 +44,20 @@ describe("attestClose", () => {
     (async () => new Response(body, { status })) as FetchLike;
   const ask = (fetch: FetchLike) =>
     attestClose("https://n1/", "v2", "uhCAk_agent", { MIGRATION_NOTARY_BEARER_TOKEN: "t" }, fetch);
-  const sig = `{"notary":"uhCAk_n1","signature":[1]}`;
-  const pay = `{"source_dna_hash":"uhC0k_a","target_dna_hash":"uhC0k_b"}`;
+  const sig = `{"notary":"uhCAk_n1","signature":${JSON.stringify(Array(64).fill(1))}}`;
+  const pay = `{"agent_pubkey":"uhCAk_agent","source_dna_hash":"uhC0k_a","target_dna_hash":"uhC0k_b"}`;
+  const body = (payload: string, signatures: string, closeAction: string) =>
+    `{"payload":${payload},"notary_signatures":[${signatures}],"close_action":${closeAction}}`;
 
   it("reads one attestation, keeping the served text", async () => {
-    const body = `{"payload":${pay},"notary_signatures":[${sig}],"close_action":[6]}`;
-    expect(await ask(answer(200, body))).toEqual({
+    expect(await ask(answer(200, body(pay, sig, `"uhCkk_c"`)))).toEqual({
       kind: "attestation",
       attestation: {
         payload: pay,
-        closeAction: "[6]",
+        closeAction: `"uhCkk_c"`,
         signature: sig,
         signer: "uhCAk_n1",
+        agent: "uhCAk_agent",
         source: "uhC0k_a",
         target: "uhC0k_b",
       },
@@ -63,25 +65,27 @@ describe("attestClose", () => {
   });
 
   it("calls a 200 that is not exactly one attestation malformed", async () => {
-    for (const body of [
-      `{"payload":${pay},"notary_signatures":[${sig},${sig}],"close_action":[6]}`,
-      `{"payload":${pay},"notary_signatures":[],"close_action":[6]}`,
+    for (const text of [
+      body(pay, `${sig},${sig}`, `"uhCkk_c"`),
+      body(pay, "", `"uhCkk_c"`),
       `{"payload":${pay},"notary_signatures":[${sig}]}`,
-      `{"payload":${pay},"notary_signatures":[${sig}],"close_action":null}`,
-      `{"payload":null,"notary_signatures":[${sig}],"close_action":[6]}`,
-      `{"payload":{"source_dna_hash":"uhC0k_a"},"notary_signatures":[${sig}],"close_action":[6]}`,
-      `{"payload":${pay},"notary_signatures":[{"notary":[1],"signature":[1]}],"close_action":[6]}`,
+      body(pay, sig, "null"),
+      body(pay, sig, "[6]"),
+      body("null", sig, `"uhCkk_c"`),
+      body(`{"source_dna_hash":"uhC0k_a","target_dna_hash":"uhC0k_b"}`, sig, `"uhCkk_c"`),
+      body(pay, `{"notary":[1],"signature":${JSON.stringify(Array(64).fill(1))}}`, `"uhCkk_c"`),
+      body(pay, `{"notary":"uhCAk_n1","signature":[1]}`, `"uhCkk_c"`),
       "not json{",
     ]) {
-      expect(await ask(answer(200, body)), body).toEqual({ kind: "malformed" });
+      expect((await ask(answer(200, text))).kind, text).toBe("malformed");
     }
   });
 
   it("passes a known daemon code on, with its message and details", async () => {
-    const body = JSON.stringify({
+    const text = JSON.stringify({
       error: { code: "warranted", message: "w", details: { warrants: [1] } },
     });
-    expect(await ask(answer(422, body))).toEqual({
+    expect(await ask(answer(422, text))).toEqual({
       kind: "error",
       code: "warranted",
       message: "w",
@@ -89,11 +93,27 @@ describe("attestClose", () => {
     });
   });
 
-  it("turns an unknown code or an unreadable error into internal", async () => {
-    for (const body of [JSON.stringify({ error: { code: "teapot" } }), "<html>", ""]) {
-      const got = await ask(answer(502, body));
-      expect(got.kind === "error" && got.code, body).toBe("internal");
+  it("turns an unknown code, or an answer without an error body, into internal", async () => {
+    for (const [status, text] of [
+      [502, JSON.stringify({ error: { code: "teapot" } })],
+      [404, ""],
+      [418, "<html>"],
+    ] as const) {
+      const got = await ask(answer(status, text));
+      expect(got.kind === "error" && got.code, text).toBe("internal");
     }
+  });
+
+  it("reads an answer from in front of the daemon by its status", async () => {
+    const kindOf = async (status: number) => {
+      const got = await ask(answer(status, "<html>edge</html>"));
+      return got.kind === "error" ? got.code : got.kind;
+    };
+    expect(await kindOf(401)).toBe("auth_failed");
+    expect(await kindOf(403)).toBe("auth_failed");
+    expect(await kindOf(429)).toBe("rate_limited");
+    expect(await kindOf(502)).toBe("unreachable");
+    expect(await kindOf(530)).toBe("unreachable");
   });
 
   it("sends the Cloudflare Access credentials when both are set", async () => {
@@ -117,6 +137,6 @@ describe("attestClose", () => {
     const fetch = (async () => {
       throw new TypeError("connection refused");
     }) as FetchLike;
-    expect(await ask(fetch)).toEqual({ kind: "unreachable" });
+    expect((await ask(fetch)).kind).toBe("unreachable");
   });
 });

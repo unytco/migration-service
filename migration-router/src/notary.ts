@@ -21,14 +21,14 @@ export interface Env {
 /** Injectable fetch so tests can mock daemon responses. */
 export type FetchLike = typeof fetch;
 
-/** One daemon's attestation, each JSON field as the exact text it served. */
+/** One daemon's attestation: `payload`, `closeAction` and `signature` as the
+ * exact text it served, the hashes read out of them as base64. */
 export interface Attestation {
   payload: string;
   closeAction: string;
   signature: string;
-  /** The signing notary, base64. */
   signer: string;
-  /** `payload.source_dna_hash` and `payload.target_dna_hash`, base64. */
+  agent: string;
   source: string;
   target: string;
 }
@@ -49,10 +49,11 @@ export type DaemonCode = (typeof DAEMON_CODES)[number];
 export type DaemonAnswer =
   | { kind: "attestation"; attestation: Attestation }
   /** A 200 that is not one well-formed attestation. */
-  | { kind: "malformed" }
+  | { kind: "malformed"; reason: string }
   | { kind: "error"; code: DaemonCode; message: string; details?: unknown }
-  /** No answer within the budget, or no connection. */
-  | { kind: "unreachable" };
+  /** No answer within the budget, no connection, or a gateway error in front
+   * of the daemon. */
+  | { kind: "unreachable"; reason: string };
 
 /** An answer later than this does not count. */
 const ATTEST_TIMEOUT_MS = 10_000;
@@ -65,14 +66,8 @@ const ATTEST_TIMEOUT_MS = 10_000;
  */
 export function normalizeHashB64(value: unknown): string | undefined {
   if (typeof value === "string") return value;
-  if (
-    Array.isArray(value) &&
-    value.length === 39 &&
-    value.every(
-      (b) => typeof b === "number" && Number.isInteger(b) && b >= 0 && b <= 255,
-    )
-  ) {
-    const bin = String.fromCharCode(...(value as number[]));
+  if (isBytes(value, 39)) {
+    const bin = String.fromCharCode(...value);
     return "u" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
   return undefined;
@@ -111,40 +106,66 @@ export async function attestClose(
     );
     status = resp.status;
     text = await resp.text();
-  } catch {
-    return { kind: "unreachable" };
+  } catch (e) {
+    return { kind: "unreachable", reason: String(e) };
   } finally {
     clearTimeout(timer);
   }
 
   if (status === 200) {
     const attestation = parseAttestation(text);
-    return attestation ? { kind: "attestation", attestation } : { kind: "malformed" };
+    return typeof attestation === "string"
+      ? { kind: "malformed", reason: attestation }
+      : { kind: "attestation", attestation };
   }
-  return parseError(text);
+  return parseError(status, text);
 }
 
-function parseAttestation(text: string): Attestation | undefined {
+/** The attestation, or why the 200 is not one. */
+function parseAttestation(text: string): Attestation | string {
   const body = rawMembers(text);
-  const payload = body?.get("payload");
-  const closeAction = body?.get("close_action");
-  const signatures = rawElements(body?.get("notary_signatures") ?? "");
-  if (!payload || !closeAction || signatures?.length !== 1) return undefined;
+  if (!body) return "not a JSON object";
+  const payload = body.get("payload");
+  const closeAction = body.get("close_action");
+  const signatures = rawElements(body.get("notary_signatures") ?? "");
+  if (!payload || !closeAction) return "no payload or close_action";
+  if (signatures?.length !== 1) return "not exactly one signature";
   const hashes = JSON.parse(payload) as {
+    agent_pubkey?: unknown;
     source_dna_hash?: unknown;
     target_dna_hash?: unknown;
   } | null;
-  const signed = JSON.parse(signatures[0]) as { notary?: unknown } | null;
+  const signed = JSON.parse(signatures[0]) as {
+    notary?: unknown;
+    signature?: unknown;
+  } | null;
+  const agent = normalizeHashB64(hashes?.agent_pubkey);
   const source = normalizeHashB64(hashes?.source_dna_hash);
   const target = normalizeHashB64(hashes?.target_dna_hash);
   const signer = normalizeHashB64(signed?.notary);
-  if (!source || !target || !signer || JSON.parse(closeAction) === null) {
-    return undefined;
-  }
-  return { payload, closeAction, signature: signatures[0], signer, source, target };
+  if (!agent || !source || !target) return "a payload hash is missing or malformed";
+  if (!signer || !isBytes(signed?.signature, 64)) return "a malformed signature";
+  if (!normalizeHashB64(JSON.parse(closeAction))) return "a malformed close_action";
+  return {
+    payload,
+    closeAction,
+    signature: signatures[0],
+    signer,
+    agent,
+    source,
+    target,
+  };
 }
 
-function parseError(text: string): DaemonAnswer {
+function isBytes(value: unknown, length: number): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.length === length &&
+    value.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)
+  );
+}
+
+function parseError(status: number, text: string): DaemonAnswer {
   let body: { error?: { code?: unknown; message?: unknown; details?: unknown } };
   try {
     body = JSON.parse(text);
@@ -152,14 +173,29 @@ function parseError(text: string): DaemonAnswer {
     body = {};
   }
   const code = body?.error?.code;
-  if (!DAEMON_CODES.includes(code as DaemonCode)) {
-    return { kind: "error", code: "internal", message: "notary daemon fault" };
+  if (DAEMON_CODES.includes(code as DaemonCode)) {
+    const message = body.error?.message;
+    return {
+      kind: "error",
+      code: code as DaemonCode,
+      message: typeof message === "string" ? message : String(code),
+      details: body.error?.details,
+    };
   }
-  const message = body.error?.message;
-  return {
-    kind: "error",
-    code: code as DaemonCode,
-    message: typeof message === "string" ? message : String(code),
-    details: body.error?.details,
-  };
+  if (code !== undefined) {
+    return {
+      kind: "error",
+      code: "internal",
+      message: `notary daemon answered an unknown code ${String(code)}`,
+    };
+  }
+  // No error envelope: the answer came from in front of the daemon, the tunnel
+  // or Cloudflare Access, not from the daemon itself.
+  const reason = `HTTP ${status} without an error body`;
+  if (status === 401 || status === 403) {
+    return { kind: "error", code: "auth_failed", message: reason };
+  }
+  if (status === 429) return { kind: "error", code: "rate_limited", message: reason };
+  if (status >= 500) return { kind: "unreachable", reason };
+  return { kind: "error", code: "internal", message: reason };
 }
