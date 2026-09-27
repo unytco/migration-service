@@ -8,13 +8,14 @@
       "notaries": [
         {
           "url": "https://notary-1-v0-94-0.unyt.dev",
-          "api": "v1"
+          "api": "v2"
         }
       ],
       "published": false,
       "upgrade_targets": [
         "uhC0k_UgRlkczfH7eqwctk2XytOnxTKAEQBDXUJ7pSvyGYqS41TMe"
-      ]
+      ],
+      "closing_threshold": 1
     },
     {
       "dna_hash": "uhC0k_UgRlkczfH7eqwctk2XytOnxTKAEQBDXUJ7pSvyGYqS41TMe",
@@ -24,7 +25,7 @@
       "notaries": [
         {
           "url": "https://notary-1-v0-95-0.unyt.dev",
-          "api": "v1"
+          "api": "v2"
         }
       ],
       "published": true

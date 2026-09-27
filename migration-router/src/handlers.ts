@@ -236,12 +236,7 @@ export async function migrate(
   const transientCodes: string[] = [];
   let internalFault: HardStop | undefined;
   let sawMalformedPackage = false;
-  let sawZeroNotary = false;
   for (const source of sources) {
-    if (source.notaries.length === 0) {
-      sawZeroNotary = true;
-      continue;
-    }
     for (const notaryEntry of shuffled(source.notaries, rand)) {
       const outcome = await fetchClose(
         notaryEntry.url,
@@ -309,15 +304,6 @@ export async function migrate(
       500,
       "internal",
       "a notary daemon returned an internal error for a candidate source",
-    );
-  }
-  // Zero registered notaries is a registry fault on our side — 5xx so it's fixed, and so a
-  // close that may live on that source is never reported "absent".
-  if (sawZeroNotary) {
-    return errorJson(
-      500,
-      "internal",
-      "a candidate source has no registered notaries — registry misconfiguration",
     );
   }
   // Then the retryable transients — the close may be on a momentarily-unreachable source.
