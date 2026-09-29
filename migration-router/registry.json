@@ -1,30 +1,4 @@
 {
   "version": 1,
-  "dnas": [
-    {
-      "dna_hash": "uhC0kfrM4G8ydH9fxGhGnKiXooE9zkdhwT6QN0ijW6i6HtXZmspQ-",
-      "version": "alliance-v0.94.0",
-      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.94.0",
-      "notaries": [
-        {
-          "url": "https://notary-1-v0-94-0.unyt.dev",
-          "api": "v2"
-        }
-      ],
-      "published": false
-    },
-    {
-      "dna_hash": "uhC0k_UgRlkczfH7eqwctk2XytOnxTKAEQBDXUJ7pSvyGYqS41TMe",
-      "version": "alliance-v0.95.0",
-      "upgrades_from": "uhC0kfrM4G8ydH9fxGhGnKiXooE9zkdhwT6QN0ijW6i6HtXZmspQ-",
-      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.95.0",
-      "notaries": [
-        {
-          "url": "https://notary-1-v0-95-0.unyt.dev",
-          "api": "v2"
-        }
-      ],
-      "published": true
-    }
-  ]
+  "dnas": []
 }
