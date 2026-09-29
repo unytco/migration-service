@@ -102,16 +102,9 @@ jobs:
             exit 1
           fi
 
-      # This cache is saved under the tag, and only a run of the same tag restores
-      # it, so the private unyt-app history it holds reaches no other run.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ matrix.crate }}
-
-      - uses: ./.github/actions/fetch-crates
-        with:
-          working-directory: ${{ matrix.crate }}
-          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
 
       - name: Build
         run: cargo build --release --locked

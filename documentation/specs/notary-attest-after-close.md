@@ -199,5 +199,4 @@ Reports `protocol_versions: ["v0_2"]`.
 
 - The router's public API is `v1`.
 - The router speaks `v2` to daemons.
-- Both Rust crates pin `rave_engine` to one revision of `unytco/unyt-app` that carries `migration::v0_2`. That repository is private, so CI and the release workflow fetch it with the `UNYT_APP_READ_TOKEN` secret, a token that can read it.
-- The release that publishes `rave_engine` with `migration::v0_2` replaces the pin in both crates with an exact pin on that published version.
+- Both Rust crates pin `rave_engine` to exactly `0.12.0`, the published release that carries `migration::v0_2`.

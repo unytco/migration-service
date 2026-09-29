@@ -27,7 +27,7 @@ headless-migrator/ Rust crate — clap + ham (headless server-agent close/open s
 ## Build / test
 
 - **migration-router/**: `npm ci && npm run typecheck && npm test`. Self-contained, no private deps.
-- **notary-daemon/**: `cd notary-daemon && cargo test`. The migration wire types come from `rave_engine`, pinned to a revision of the private `unytco/unyt-app`, so fetching needs read access to that repository: CI reads it with the `UNYT_APP_READ_TOKEN` secret. `ham` is a public git dep ([`unytco/ham`](https://github.com/unytco/ham)). The HTTP↔zome mapping tests mock the conductor, so they need no Holochain conductor.
+- **notary-daemon/**: `cd notary-daemon && cargo test`. The migration wire types come from the published `rave_engine` release on crates.io, and `ham` is a public git dep ([`unytco/ham`](https://github.com/unytco/ham)), so fetching needs no credentials. The HTTP↔zome mapping tests mock the conductor, so they need no Holochain conductor.
 - **headless-migrator/**: `cd headless-migrator && cargo test`. Same deps as the daemon. The M-of-N policy, the close-state probe (incl. a summary with no close), close/open idempotency, and the verify comparison are all tested against a scripted mock conductor, so they need no Holochain conductor.
 - **Real-conductor round-trips (gated):** `cd notary-daemon && cargo test --test live_roundtrip -- --ignored` (a live notary conductor and an agent whose chain has closed: locks the package ⇄ `MigrationInitRequest` serde round-trip) and `cd headless-migrator && cargo test --test live_roundtrip -- --ignored` (live old+new conductors + a `wrangler dev` router: the full close → carry → open → verify arc + restart drills). Env vars + fixture notes in each test's file header.
 
