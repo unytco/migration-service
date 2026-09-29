@@ -162,7 +162,7 @@ Reports `protocol_versions: ["v0_2"]`.
 1. **Probe** with `get_migration_close_state`:
    - it returns a close: the chain is closed. Exit 0, writing nothing.
    - `MIG_NO_CLOSING_SUMMARY`: the chain is open. Continue.
-   - `MIG_NO_CLOSE_CHAIN_ACTION`, a summary with no close: hard stop. Closing again would commit a second summary, and notaries never attest a chain holding two. The shipped DNA commits the summary and the close in one call, so a chain reaches this state only by other means.
+   - `MIG_NO_CLOSE_CHAIN_ACTION`, a summary with no close: hard stop. The DNA refuses a second closing summary with `MIG_SECOND_CLOSING_SUMMARY`, so closing again can never succeed. The shipped DNA commits the summary and the close in one call, so a chain reaches this state only by other means.
    - a response that does not decode: hard stop.
    - anything else: back off and probe again.
 2. **Fees owed** are dropped with `drop_off_fees` before anything is prepared.

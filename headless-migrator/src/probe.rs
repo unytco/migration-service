@@ -56,9 +56,9 @@ pub async fn probe_close_state(
     match crate::dna_errors::classify_close_error(&rendered) {
         CloseErrorClass::Open => Ok(CloseState::Open),
         CloseErrorClass::SummaryWithoutClose => Err(ProbeFailure::HardStop(
-            "the chain holds a closing summary with no close after it. Closing again would \
-             commit a second summary, and notaries never attest a chain holding two, so it \
-             needs an operator"
+            "the chain holds a closing summary with no close after it. The DNA refuses a \
+             second closing summary, so closing again can never succeed, and it needs an \
+             operator"
                 .into(),
         )),
         CloseErrorClass::Unrecognized => Err(ProbeFailure::Transient(e)),

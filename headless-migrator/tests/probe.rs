@@ -38,7 +38,7 @@ async fn a_summary_with_no_close_is_a_hard_stop() {
         assert!(
             matches!(
                 probe_close_state(&mock).await,
-                Err(ProbeFailure::HardStop(why)) if why.contains("second summary")
+                Err(ProbeFailure::HardStop(why)) if why.contains("refuses a second closing summary")
             ),
             "{rendered}"
         );
