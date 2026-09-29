@@ -59,7 +59,8 @@ fn init_class_of(code: MigrationError) -> InitErrorClass {
         | CloseTargetNotUpgradeTarget
         | CloseSummaryMismatch
         | NoClosingSummary
-        | NoCloseChainAction => InitErrorClass::HardFailure,
+        | NoCloseChainAction
+        | SecondClosingSummary => InitErrorClass::HardFailure,
     }
 }
 
@@ -473,6 +474,10 @@ mod tests {
         assert_eq!(
             classify_migration_init_error("[MIGERR:MIG_ALREADY_MIGRATED] whatever"),
             InitErrorClass::AlreadyMigrated
+        );
+        assert_eq!(
+            classify_migration_init_error("[MIGERR:MIG_SECOND_CLOSING_SUMMARY] whatever"),
+            InitErrorClass::HardFailure
         );
     }
 
