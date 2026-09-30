@@ -2,8 +2,8 @@
 // an injected registry + fetch.
 
 import { errorJson, ok } from "./errors";
-import { Registry, type DnaEntry } from "./registry";
-import { fetchClose, type Env, type FetchLike, type HardStop } from "./notary";
+import { Registry, type DnaEntry, type SourceEntry } from "./registry";
+import { attestClose, type DaemonAnswer, type Env, type FetchLike } from "./notary";
 import {
   publishedBuilds,
   lineageOf,
@@ -13,7 +13,7 @@ import {
 } from "./builds";
 
 export const API_VERSIONS = ["v1"] as const;
-export const PROTOCOL_VERSIONS = ["v0_1"] as const;
+export const PROTOCOL_VERSIONS = ["v0_2"] as const;
 
 export function healthz(): Response {
   return ok({
@@ -177,7 +177,6 @@ export async function migrate(
   // `to` + `agent` are required; `from` is OPTIONAL — a freshly-installed app may no
   // longer know its predecessor, so the router discovers the source.
   if (!to_dna_hash || !agent_pubkey) {
-    // Client error: 4xx `bad_request`, not the 5xx `internal` the envelope reserves for our faults.
     return errorJson(
       400,
       "bad_request",
@@ -199,25 +198,23 @@ export async function migrate(
     );
   }
 
-  // Resolve candidate sources: a supplied `from` is validated and used directly;
-  // otherwise discover every source listing `to` among its upgrade_targets.
-  let sources: DnaEntry[];
+  let sources: SourceEntry[];
   if (from_dna_hash) {
-    const fromEntry = registry.get(from_dna_hash);
-    if (!fromEntry)
+    if (!registry.get(from_dna_hash))
       return errorJson(
         400,
         "unknown_from_dna",
         `unknown from_dna_hash ${from_dna_hash}`,
       );
-    if (!registry.reaches(from_dna_hash, to_dna_hash)) {
+    const source = registry.source(from_dna_hash, to_dna_hash);
+    if (!source) {
       return errorJson(
         400,
         "unreachable_target",
         `${to_dna_hash} is not a proven upgrade target of ${from_dna_hash}`,
       );
     }
-    sources = [fromEntry];
+    sources = [source];
   } else {
     sources = registry.sourcesReaching(to_dna_hash);
     if (sources.length === 0) {
@@ -229,131 +226,212 @@ export async function migrate(
     }
   }
 
-  // Try each source's daemons in per-request random order (stateless load-spreading),
-  // accepting the first package bound to `to`. Only an agent-level/malformed fault
-  // (`warranted`, `bad_request`) is terminal across all sources; a source-specific fault
-  // skips to the next source and is surfaced only if none succeeds.
-  const transientCodes: string[] = [];
-  let internalFault: HardStop | undefined;
-  let sawMalformedPackage = false;
-  let sawZeroNotary = false;
+  const tally: Tally = {
+    fault: false,
+    unableToVerify: false,
+    authFailed: false,
+    rateLimited: false,
+    unreachable: false,
+  };
   for (const source of sources) {
-    if (source.notaries.length === 0) {
-      sawZeroNotary = true;
-      continue;
+    const outcome = await attestSource(
+      source,
+      to_dna_hash,
+      agent_pubkey,
+      env,
+      fetchImpl,
+      rand,
+      tally,
+    );
+    if (outcome.kind === "package") {
+      return new Response(outcome.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
-    for (const notaryEntry of shuffled(source.notaries, rand)) {
-      const outcome = await fetchClose(
-        notaryEntry.url,
-        notaryEntry.api,
-        agent_pubkey,
-        source.dna_hash,
-        env,
-        fetchImpl,
-      );
-      if (outcome.kind === "package") {
-        if (outcome.target_dna_hash === to_dna_hash) {
-          return ok({
-            payload: outcome.payload,
-            notary_signatures: outcome.notary_signatures,
-            close_action: outcome.close_action,
-          });
-        }
-        // A package with NO target_dna_hash is malformed (every daemon binds one) — a
-        // daemon fault, not a clean stale close. A sibling may serve a well-formed one.
-        if (
-          typeof outcome.target_dna_hash !== "string" ||
-          outcome.target_dna_hash.length === 0
-        ) {
-          sawMalformedPackage = true;
-          continue;
-        }
-        // A genuine stale close bound elsewhere — every daemon of this source serves the
-        // same chain, so only the next source can help.
-        break;
-      }
-      if (outcome.kind === "hard_stop") {
-        // Terminal regardless of source — no source fixes a warranted chain or bad request.
-        if (outcome.code === "warranted" || outcome.code === "bad_request") {
-          return errorJson(
-            outcome.status,
-            outcome.code,
-            outcome.message,
-            outcome.details,
-          );
-        }
-        // A content verdict every daemon of this source returns identically — next source.
-        if (outcome.code === "no_close_found") break;
-        // A source-specific `internal` (wrong-cell): a sibling may serve the right cell, so
-        // try the rest; capture the first (with details) for the final surface.
-        if (!internalFault) internalFault = outcome;
-        continue;
-      }
-      transientCodes.push(outcome.code);
-    }
+    if (outcome.kind === "stop") return outcome.response;
   }
+  return shortResponse(tally);
+}
 
-  // No source yielded a package bound to `to`. Config/daemon FAULTS (5xx) rank FIRST: they
-  // won't fix themselves by retrying, and a definite fault must never read as a momentary
-  // outage even when a transient sibling co-occurs and would otherwise mask it.
-  if (internalFault) {
-    return errorJson(
-      internalFault.status,
-      internalFault.code,
-      internalFault.message,
-      internalFault.details,
-    );
-  }
-  if (transientCodes.includes("internal") || sawMalformedPackage) {
-    return errorJson(
-      500,
-      "internal",
-      "a notary daemon returned an internal error for a candidate source",
-    );
-  }
-  // Zero registered notaries is a registry fault on our side — 5xx so it's fixed, and so a
-  // close that may live on that source is never reported "absent".
-  if (sawZeroNotary) {
+/** What the daemons said across every source, for the response when no
+ * source reaches M. */
+interface Tally {
+  fault: boolean;
+  unableToVerify: boolean;
+  authFailed: boolean;
+  rateLimited: boolean;
+  unreachable: boolean;
+}
+
+/** First match wins: a daemon fault outranks every transient, so it never
+ * reads as an outage. */
+function shortResponse(tally: Tally): Response {
+  if (tally.fault) {
     return errorJson(
       500,
       "internal",
-      "a candidate source has no registered notaries — registry misconfiguration",
+      "a notary daemon answered with a fault or a package that disagrees",
     );
   }
-  // Then the retryable transients — the close may be on a momentarily-unreachable source.
-  // unable_to_verify (likely exists but not verifiable yet) wins the group.
-  if (transientCodes.includes("unable_to_verify")) {
+  if (tally.unableToVerify) {
     return errorJson(
       503,
       "unable_to_verify",
-      "all notaries were unable to verify the close state",
+      "too few notaries could attest the close yet",
     );
   }
-  if (transientCodes.includes("auth_failed")) {
+  if (tally.authFailed) {
     return errorJson(
       502,
       "auth_failed",
-      "notaries rejected the router's credentials — service misconfiguration",
+      "notaries rejected the router's credentials: service misconfiguration",
     );
   }
-  if (transientCodes.includes("rate_limited")) {
+  if (tally.rateLimited) {
     return errorJson(
       503,
       "rate_limited",
       "notaries are rate limiting requests; retry shortly",
     );
   }
-  if (transientCodes.length > 0) {
+  if (tally.unreachable) {
     return errorJson(
       503,
       "all_orgs_unhealthy",
-      "all candidate notaries are unavailable",
+      "too few notaries answered in time",
     );
   }
-  // Every candidate was reachable and definitively had no close bound to `to`.
   return errorJson(
     404,
     "no_close_found",
     "no committed close bound to the requested target was found",
   );
+}
+
+type SourceOutcome =
+  | { kind: "package"; body: string }
+  | { kind: "stop"; response: Response }
+  /** The source did not reach M, or its close binds another target. */
+  | { kind: "next" };
+
+/** Ask `source`'s daemons, M at once in a random order, each answer that does
+ * not count starting the next, until M attestations of one close count. */
+function attestSource(
+  source: SourceEntry,
+  to: string,
+  agent: string,
+  env: Env,
+  fetchImpl: FetchLike,
+  rand: () => number,
+  tally: Tally,
+): Promise<SourceOutcome> {
+  const order = shuffled(source.notaries, rand);
+  const m = source.closing_threshold;
+  const signatures = new Map<string, string>();
+  let fixed: { payload: string; closeAction: string } | undefined;
+
+  /** An outcome that ends the source, `true` for an answer that counts, or why
+   * it does not. */
+  const judge = (answer: DaemonAnswer): SourceOutcome | true | string => {
+    switch (answer.kind) {
+      case "unreachable":
+        tally.unreachable = true;
+        return answer.reason;
+      case "malformed":
+        tally.fault = true;
+        return answer.reason;
+      case "error":
+        switch (answer.code) {
+          case "warranted":
+            return {
+              kind: "stop",
+              response: errorJson(422, "warranted", answer.message, answer.details),
+            };
+          case "bad_request":
+            return {
+              kind: "stop",
+              response: errorJson(400, "bad_request", answer.message),
+            };
+          case "internal":
+            tally.fault = true;
+            break;
+          case "unable_to_verify":
+            tally.unableToVerify = true;
+            break;
+          case "auth_failed":
+            tally.authFailed = true;
+            break;
+          case "rate_limited":
+            tally.rateLimited = true;
+            break;
+          case "no_close_found":
+            break;
+        }
+        return `${answer.code}: ${answer.message}`;
+      case "attestation": {
+        const a = answer.attestation;
+        if (a.source !== source.dna_hash || a.agent !== agent) {
+          tally.fault = true;
+          return "an attestation of another source or agent";
+        }
+        if (!fixed && a.target !== to) {
+          console.warn(`migrate: ${source.dna_hash}'s close for ${agent} binds ${a.target}`);
+          return { kind: "next" };
+        }
+        fixed ??= { payload: a.payload, closeAction: a.closeAction };
+        if (a.payload !== fixed.payload || a.closeAction !== fixed.closeAction) {
+          tally.fault = true;
+          return "a package that differs from the one that fixed it";
+        }
+        if (a.signer === agent) return "the agent's own signature";
+        if (signatures.has(a.signer)) return `a repeated signer ${a.signer}`;
+        signatures.set(a.signer, a.signature);
+        if (signatures.size < m) return true;
+        return { kind: "package", body: packageBody(fixed, [...signatures.values()]) };
+      }
+    }
+  };
+
+  return new Promise((resolve) => {
+    let next = 0;
+    let inFlight = 0;
+    let settled = false;
+    const settle = (outcome: SourceOutcome) => {
+      settled = true;
+      resolve(outcome);
+    };
+    const settleIfIdle = () => {
+      if (inFlight > 0 || next < order.length) return;
+      if (signatures.size > 0) tally.unableToVerify = true;
+      settle({ kind: "next" });
+    };
+    const ask = () => {
+      if (next === order.length) return settleIfIdle();
+      const daemon = order[next++];
+      inFlight++;
+      void attestClose(daemon.url, daemon.api, agent, env, fetchImpl).then(
+        (answer) => {
+          inFlight--;
+          if (settled) return;
+          const verdict = judge(answer);
+          if (verdict === true) return settleIfIdle();
+          if (typeof verdict === "string") {
+            console.warn(`migrate: ${daemon.url} did not count: ${verdict}`);
+            return ask();
+          }
+          settle(verdict);
+        },
+      );
+    };
+    for (let i = 0; i < m; i++) ask();
+  });
+}
+
+/** The package as JSON text, built from the daemons' own text. */
+function packageBody(
+  fixed: { payload: string; closeAction: string },
+  signatures: string[],
+): string {
+  return `{"payload":${fixed.payload},"notary_signatures":[${signatures.join(",")}],"close_action":${fixed.closeAction}}`;
 }

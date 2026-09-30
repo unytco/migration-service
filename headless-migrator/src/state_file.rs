@@ -27,8 +27,9 @@ pub enum Step {
     Probing,
     /// Old chain: clearing owed fees before preparing the summary.
     DroppingFees,
-    /// Old chain: collecting M-of-N notary signatures.
-    CollectingSignatures,
+    /// Old chain: preparing the summary and asking M of the N notaries to check
+    /// it.
+    CollectingApprovals,
     /// Old chain: committing the close + close_chain.
     Closing,
     /// New server: waiting for the migration package to gossip / be fetchable.
@@ -88,11 +89,11 @@ pub struct State {
     pub old_chain_closed_unknown: bool,
     pub package_fetchable: bool,
     pub new_chain_opened: bool,
-    /// Signatures collected so far / needed (close phase).
+    /// Notary approvals collected so far / needed (close phase).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub signatures_collected: Option<u32>,
+    pub approvals_collected: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub signatures_threshold: Option<u32>,
+    pub approvals_threshold: Option<u32>,
     /// Verify per-field outcome, when a verify has run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyReport>,
@@ -121,7 +122,7 @@ pub struct State {
 pub struct VerifyReport {
     pub balance_match: bool,
     pub carry_forward_units_match: bool,
-    /// The B49 cross-check: the new chain's COMMITTED agreement state (read
+    /// The agreement cross-check: the new chain's COMMITTED agreement state (read
     /// via `get_opened_agreement_state`) matches the fetched close package's
     /// carry-forward section — count and per-agreement hashes. `serde(default)`
     /// keeps pre-existing persisted reports decoding (they never had the
@@ -149,8 +150,8 @@ impl State {
             old_chain_closed_unknown: false,
             package_fetchable: false,
             new_chain_opened: false,
-            signatures_collected: None,
-            signatures_threshold: None,
+            approvals_collected: None,
+            approvals_threshold: None,
             verify: None,
             safe_to_teardown: false,
             message: message.into(),

@@ -53,8 +53,8 @@ enum Command {
         agent_key: Option<String>,
     },
 
-    /// Supervised loop: probe → (drop fees if owed) → prepare → collect M-of-N
-    /// → close_agent_chain. Exits 0 only once the old chain is closed.
+    /// Supervised loop: probe → (drop fees if owed) → prepare → M notaries
+    /// check → close_agent_chain. Exits 0 only once the old chain is closed.
     CloseService,
 
     /// Supervised loop: wait/retry the package fetch → fresh membrane proof for

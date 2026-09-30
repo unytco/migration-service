@@ -59,7 +59,8 @@ fn init_class_of(code: MigrationError) -> InitErrorClass {
         | CloseTargetNotUpgradeTarget
         | CloseSummaryMismatch
         | NoClosingSummary
-        | NoCloseChainAction => InitErrorClass::HardFailure,
+        | NoCloseChainAction
+        | SecondClosingSummary => InitErrorClass::HardFailure,
     }
 }
 
@@ -220,12 +221,12 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
         || r_lower.contains("carry-forward section")
         // An update to the opening summary is never allowed.
         || r_lower.contains("opening state summary update is not allowed")
-        // Single-landing reject (M13): the close's target_dna_hash != the DNA
+        // Single-landing reject: the close's target_dna_hash != the DNA
         // being opened. Lowercase `dna` — the verdict is "...names a different
         // target DNA" and the input is lowercased before matching.
         || r_lower.contains("names a different target dna")
         // The close's source_dna_hash has no entry in the target GD's
-        // opening_predecessors (M13).
+        // opening_predecessors.
         || r_lower.contains("is not an accepted predecessor")
 }
 
@@ -233,8 +234,8 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
 /// close validator — is a terminal target-binding fault: the configured `to_dna`
 /// is not in the source GD's `upgrade_targets`, so no amount of retrying fixes it
 /// (unlike propagation lag / a transient blip, which the close loop retries
-/// forever). Mirrors M13's two strings; lowercased internally so the caller may
-/// pass the raw rendered error.
+/// forever). Mirrors the two target strings; lowercased internally so the caller
+/// may pass the raw rendered error.
 pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     if let Some(code) = MigrationError::from_rendered(rendered) {
         return code == MigrationError::CloseTargetNotUpgradeTarget;
@@ -282,54 +283,38 @@ fn is_global_definition_out_of_window_lower(r_lower: &str) -> bool {
     r_lower.contains("outside its validity window")
 }
 
-/// The non-closed close states the close-side probe must distinguish from a
-/// rendered `get_migration_close_state` error. A missing-`CloseChain` error
-/// means the summary IS committed but the chain isn't closed (partial);
-/// anything else (no summary at all, a transport error) is treated as a plain
-/// open chain that the next supervised pass re-probes.
+/// What a `get_migration_close_state` error says about the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseErrorClass {
-    /// Summary committed, `CloseChain` not yet observed — finish the close.
-    PartialClose,
-    /// No summary (or a transport error) — (re)prepare from an open chain.
+    /// Summary committed, `CloseChain` not observed.
+    SummaryWithoutClose,
+    /// No summary: the chain is open.
     Open,
+    /// Not an answer about the chain, such as a transport error.
+    Unrecognized,
 }
 
-/// Classify a `get_migration_close_state` error string. The
-/// `"no CloseChain action found on chain"` contract is the alliance close
-/// surface's; an open chain says `"No closing state summary found"`.
+/// Classify a `get_migration_close_state` error string. The untagged fallbacks
+/// are the alliance close surface's `"No closing state summary found"` and
+/// `"no CloseChain action found on chain"`.
 pub fn classify_close_error(rendered: &str) -> CloseErrorClass {
     match MigrationError::from_rendered(rendered) {
-        Some(MigrationError::NoCloseChainAction) => return CloseErrorClass::PartialClose,
-        Some(_) => return CloseErrorClass::Open,
-        None => {}
-    }
-    if rendered.contains("no CloseChain action found") {
-        CloseErrorClass::PartialClose
-    } else {
-        CloseErrorClass::Open
+        Some(MigrationError::NoCloseChainAction) => CloseErrorClass::SummaryWithoutClose,
+        Some(MigrationError::NoClosingSummary) => CloseErrorClass::Open,
+        Some(_) => CloseErrorClass::Unrecognized,
+        None if rendered.contains("no CloseChain action found") => {
+            CloseErrorClass::SummaryWithoutClose
+        }
+        None if rendered.contains("No closing state summary found") => CloseErrorClass::Open,
+        None => CloseErrorClass::Unrecognized,
     }
 }
 
-/// Whether a `get_migration_close_state` error string is a *recognized DNA
-/// close-state response* (the conductor was reached and the chain definitively
-/// has no committed close yet) rather than a transport / unexpected failure
-/// (which leaves the close state UNKNOWN). The close **service** treats every
-/// non-closed error as "open, re-probe" (safe — its actions are idempotent), but
-/// the **status report** must not present an unreachable conductor as a definitive
-/// `old_chain_closed = false`; this predicate is what lets it distinguish the two.
-/// Mirrors the same two alliance close-surface strings `classify_close_error`
-/// keys off: `"No closing state summary found"` (plain open) and
-/// `"no CloseChain action found on chain"` (partial close).
+/// Whether a `get_migration_close_state` error is the DNA answering about the
+/// chain rather than a transport or unexpected failure, so the status report
+/// never shows an unreachable conductor as `old_chain_closed = false`.
 pub fn is_recognized_close_state_response(rendered: &str) -> bool {
-    if let Some(code) = MigrationError::from_rendered(rendered) {
-        return matches!(
-            code,
-            MigrationError::NoClosingSummary | MigrationError::NoCloseChainAction
-        );
-    }
-    rendered.contains("No closing state summary found")
-        || rendered.contains("no CloseChain action found")
+    classify_close_error(rendered) != CloseErrorClass::Unrecognized
 }
 
 /// Whether a router error `code` is a genuine hard stop for the migration —
@@ -372,7 +357,7 @@ pub fn router_code_is_retryable(code: &str) -> bool {
         // Notaries momentarily unreachable / unable to attest — re-fetch later.
         | "all_orgs_unhealthy"
         | "unable_to_verify"
-        // The router's own internal/transport error — our fault, retry.
+        // A daemon fault the router reports, or packages that disagree: retry.
         | "internal"
         // Auth / rate limiting — momentary; back off and retry.
         | "auth_failed"
@@ -490,6 +475,10 @@ mod tests {
             classify_migration_init_error("[MIGERR:MIG_ALREADY_MIGRATED] whatever"),
             InitErrorClass::AlreadyMigrated
         );
+        assert_eq!(
+            classify_migration_init_error("[MIGERR:MIG_SECOND_CLOSING_SUMMARY] whatever"),
+            InitErrorClass::HardFailure
+        );
     }
 
     #[test]
@@ -502,12 +491,20 @@ mod tests {
             "[MIGERR:MIG_STALE_CLOSE] the chain moved"
         ));
         assert_eq!(
-            classify_close_error("[MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] partial close"),
-            CloseErrorClass::PartialClose
+            classify_close_error("[MIGERR:MIG_NO_CLOSE_CHAIN_ACTION] summary, no close"),
+            CloseErrorClass::SummaryWithoutClose
         );
         assert_eq!(
             classify_close_error("[MIGERR:MIG_NO_CLOSING_SUMMARY] open chain"),
             CloseErrorClass::Open
+        );
+        assert_eq!(
+            classify_close_error("[MIGERR:MIG_STALE_CLOSE] not a close state"),
+            CloseErrorClass::Unrecognized
+        );
+        assert_eq!(
+            classify_close_error("Websocket error: Websocket closed: No connection"),
+            CloseErrorClass::Unrecognized
         );
         assert!(is_recognized_close_state_response(
             "[MIGERR:MIG_NO_CLOSING_SUMMARY] x"
@@ -535,7 +532,7 @@ mod tests {
 
     #[test]
     fn skip_open_rejects_are_hard_failures() {
-        // M13 single-landing + unlisted-source verdicts must hard-stop the open
+        // Single-landing and unlisted-source verdicts must hard-stop the open
         // service (the classifier lowercases its input before matching).
         assert_eq!(
             classify_migration_init_error("Opening state summary names a different target DNA"),

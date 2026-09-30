@@ -18,8 +18,6 @@ jobs:
   daemon:
     name: notary-daemon (Rust)
     runs-on: ubuntu-latest
-    # `ham` (git dep) and `rave_engine` (crates.io) are both public — cargo fetches
-    # them anonymously, no token or git-auth config needed.
     defaults:
       run:
         working-directory: notary-daemon
@@ -43,8 +41,6 @@ jobs:
   agent:
     name: headless-migrator (Rust)
     runs-on: ubuntu-latest
-    # Same public deps as the daemon (`ham` git + `rave_engine` crates.io) —
-    # fetched anonymously, no token needed.
     defaults:
       run:
         working-directory: headless-migrator

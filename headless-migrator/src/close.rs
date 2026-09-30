@@ -4,36 +4,19 @@
 //! Transient failures back off and re-probe (no overall deadline — systemd
 //! `Restart=on-failure` owns process death; this loop owns in-process
 //! progress).
-//!
-//! ## Partial-close note (a DNA-surface limitation, recorded as a decision)
-//!
-//! The spec asks a partial close (a `ClosingStateSummary` committed but
-//! `close_chain` not yet issued) to be finished by `close_chain` ONLY, without
-//! re-collecting. The alliance transactor exposes **no bare `close_chain` /
-//! finish extern** — `close_agent_chain` is the only close path and it always
-//! commits a fresh summary before `close_chain`. So the only safe finish with
-//! today's externs is to re-run the full prepare → collect → close over the
-//! *current* chain top: the orphaned first summary is harmless (the author-time
-//! validator only checks the final summary that directly precedes the
-//! `CloseChain`), and because the workload is quiesced before close the chain
-//! top does not move between prepare and close, so the staleness pin holds.
-//! The probe still distinguishes the partial-close state for the status report;
-//! the *action* is identical. (Honoring "close_chain only" verbatim would need
-//! a new DNA extern — out of scope for this milestone; flagged for the DNA
-//! owner.)
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use holo_hash::{AgentPubKey, AgentPubKeyB64, DnaHash};
-use rave_engine::types::entries::migration::v0_1::{
-    NotarySignature, PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryStatePayload,
+use rave_engine::types::entries::migration::v0_2::{
+    CloseCheckRequest, CloseCheckResponse, PrepareCloseResponse, SummaryStatePayload,
 };
 
 use crate::conductor::Conductor;
 use crate::config::Config;
-use crate::policy::{self, PolicyError, SignOutcome, Signer, Sleeper};
-use crate::probe::{probe_close_state, CloseNext, CloseState};
+use crate::policy::{self, CheckOutcome, Checker, PolicyError, Sleeper};
+use crate::probe::{probe_close_state, CloseState, ProbeFailure};
 use crate::state_file::{Phase, State, Step};
 
 /// Outcome of one close attempt, before the supervised loop decides to exit or
@@ -41,7 +24,7 @@ use crate::state_file::{Phase, State, Step};
 enum CloseOutcome {
     /// The chain is closed (now or already). Exit 0.
     Closed,
-    /// A hard stop — warrants on the agent. Exit nonzero; the operator must act.
+    /// A fault no retry fixes. Exit nonzero; the operator must act.
     HardStop(String),
     /// A transient failure; back off and re-probe.
     Transient(anyhow::Error),
@@ -54,12 +37,6 @@ pub async fn run(
     cfg: &Config,
     shutdown: &mut ham::ShutdownRx,
 ) -> Result<()> {
-    // A single `State` carried across every pass: progress fields (`agent`,
-    // `signatures_collected` / `signatures_threshold`) set during collection
-    // must survive transient passes and persist INTO the final closed state, so
-    // the report collector (`make migrate-status`) sees the agent + signature
-    // progress even after a successful close — not the all-`None` a per-call
-    // `State::new(...)` would re-stamp.
     // The close binds to a configured successor (single-landing). Resolve it up
     // front so a missing/garbled MIGRATION_AGENT_TO_DNA fails the close service
     // immediately (not mid-loop); open/verify/status, which don't set it, are
@@ -124,61 +101,37 @@ async fn attempt(
     });
     let close_state = match probe_close_state(conductor).await {
         Ok(s) => s,
-        // The probe raises `Err` for one thing: a response that did not decode.
-        Err(e) => {
-            return CloseOutcome::HardStop(crate::dna_errors::schema_mismatch_message(
-                "probing close state",
-                &format!("{e:#}"),
-            ))
+        Err(ProbeFailure::HardStop(why)) => return CloseOutcome::HardStop(why),
+        Err(ProbeFailure::Transient(e)) => {
+            return CloseOutcome::Transient(e.context("probing close state"))
         }
     };
 
-    if let CloseState::PartialClose = close_state {
-        tracing::warn!(
-            "partial close detected (summary committed, chain open) — finishing via \
-             prepare→collect→close over the current chain top (no bare close_chain extern exists)"
-        );
-    }
-
-    // The already-closed restart path returns `Closed` straight from the probe,
-    // WITHOUT running `prepare_collect_close` — so the agent / signature fields it
-    // would otherwise set are still unpopulated. Recover them from the committed
-    // close the probe already read (its signed payload names the agent and
-    // carries the collected signatures), so the report (`make migrate-status`)
-    // still shows attribution after a restart onto an already-closed chain. The
-    // GD's M threshold is NOT carried in `CommittedClose`, so it stays unset.
-    if let CloseState::Closed(committed) = &close_state {
-        let agent_b64 = AgentPubKeyB64::from(committed.payload.agent_pubkey.clone()).to_string();
-        let collected = committed.notary_signatures.len() as u32;
-        persist(cfg, state, |s| {
-            if s.agent.is_none() {
-                s.agent = Some(agent_b64);
-            }
-            if s.signatures_collected.is_none() {
-                s.signatures_collected = Some(collected);
-            }
-        });
-    }
-
-    match close_state.next() {
-        CloseNext::AlreadyClosed => CloseOutcome::Closed,
-        // Both an open chain and a partial close route through the same path —
-        // see the module-level partial-close note for why.
-        CloseNext::FinishCloseOnly | CloseNext::PrepareCollectClose => {
-            prepare_collect_close(conductor, cfg, target, state).await
+    match close_state {
+        CloseState::Closed(committed) => {
+            // The close carries no approvals, so only the agent can be
+            // recovered from it.
+            let agent_b64 =
+                AgentPubKeyB64::from(committed.payload.agent_pubkey.clone()).to_string();
+            persist(cfg, state, |s| {
+                if s.agent.is_none() {
+                    s.agent = Some(agent_b64);
+                }
+            });
+            CloseOutcome::Closed
         }
+        CloseState::Open => prepare_check_close(conductor, cfg, target, state).await,
     }
 }
 
-/// The full close path: fee-drop if owed → prepare → collect M-of-N → close.
-async fn prepare_collect_close(
+async fn prepare_check_close(
     conductor: &dyn Conductor,
     cfg: &Config,
     target: &DnaHash,
     state: &mut State,
 ) -> CloseOutcome {
-    // Fees owed? Drop them FIRST — a fee drop after signing voids the
-    // signatures (the staleness pin), so it must precede prepare.
+    // Fees owed? Drop them FIRST: prepare pins the chain top, and a fee drop
+    // after it would void the prepared payload.
     match conductor.get_ledger().await {
         Ok(ledger) => {
             if !ledger.fees_owed.is_zero() {
@@ -195,7 +148,7 @@ async fn prepare_collect_close(
     }
 
     persist(cfg, state, |s| {
-        s.step = Step::CollectingSignatures;
+        s.step = Step::CollectingApprovals;
         s.message = "preparing closing summary".into();
     });
     let prepared: PrepareCloseResponse =
@@ -206,34 +159,33 @@ async fn prepare_collect_close(
     let agent_b64 = AgentPubKeyB64::from(prepared.payload.agent_pubkey.clone()).to_string();
     persist(cfg, state, |s| {
         s.agent = Some(agent_b64.clone());
-        s.signatures_threshold = Some(prepared.closing_threshold);
-        s.signatures_collected = Some(0);
+        s.approvals_threshold = Some(prepared.closing_threshold);
+        s.approvals_collected = Some(0);
         s.message = format!(
-            "collecting {} of {} notary signatures",
+            "asking {} of {} notaries to check the close",
             prepared.closing_threshold,
             prepared.closing_notaries.len()
         );
     });
 
-    // Collect M-of-N via the parameterized policy.
-    let signer = ConductorSigner {
+    let checker = ConductorChecker {
         conductor,
         payload: prepared.payload.clone(),
         request_timeout: cfg.policy.request_timeout,
     };
     let sleeper = TokioSleeper;
     let mut rng = rand::thread_rng();
-    let signatures = match policy::collect_signatures(
+    let approvals = match policy::collect_approvals(
         prepared.closing_threshold,
         &prepared.closing_notaries,
         &cfg.policy,
-        &signer,
+        &checker,
         &sleeper,
         &mut rng,
     )
     .await
     {
-        Ok(sigs) => sigs,
+        Ok(approvals) => approvals,
         Err(PolicyError::Warranted) => {
             return CloseOutcome::HardStop("agent carries warrants".into())
         }
@@ -243,18 +195,17 @@ async fn prepare_collect_close(
         Err(e @ PolicyError::Exhausted { .. }) => {
             return CloseOutcome::Transient(anyhow::anyhow!("{e}"))
         }
-        Err(PolicyError::Fatal(why)) => return CloseOutcome::HardStop(why),
+        Err(PolicyError::Misconfigured(why) | PolicyError::Fatal(why)) => {
+            return CloseOutcome::HardStop(why)
+        }
     };
 
     persist(cfg, state, |s| {
         s.step = Step::Closing;
-        s.signatures_collected = Some(signatures.len() as u32);
+        s.approvals_collected = Some(approvals.len() as u32);
         s.message = "committing close + close_chain".into();
     });
-    match conductor
-        .close_agent_chain(prepared.payload, signatures)
-        .await
-    {
+    match conductor.close_agent_chain(prepared.payload).await {
         Ok(_) => CloseOutcome::Closed,
         Err(e) => classify_close_failure(e, "close_agent_chain"),
     }
@@ -285,25 +236,25 @@ fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutc
     }
 }
 
-/// Bridges the policy's [`Signer`] to a live `request_closing_signature` zome
-/// call, applying the per-request timeout and mapping the response. A
-/// `Warranted` verdict is raised through the `Err` channel so the policy
-/// hard-stops the whole migration rather than substituting.
-struct ConductorSigner<'a> {
+/// Bridges the policy's [`Checker`] to a live `request_close_check` zome call,
+/// applying the per-request timeout and mapping the response. `Warranted` is
+/// raised through the `Err` channel so the policy hard-stops the whole
+/// migration rather than substituting.
+struct ConductorChecker<'a> {
     conductor: &'a dyn Conductor,
     payload: SummaryStatePayload,
     request_timeout: Duration,
 }
 
-impl Signer for ConductorSigner<'_> {
-    async fn sign(&self, notary: AgentPubKey) -> std::result::Result<SignOutcome, PolicyError> {
-        let req = SignRequest {
+impl Checker for ConductorChecker<'_> {
+    async fn check(&self, notary: AgentPubKey) -> std::result::Result<CheckOutcome, PolicyError> {
+        let req = CloseCheckRequest {
             notary: notary.clone(),
             payload: self.payload.clone(),
         };
-        let call = self.conductor.request_closing_signature(req);
+        let call = self.conductor.request_close_check(req);
         match tokio::time::timeout(self.request_timeout, call).await {
-            Err(_elapsed) => Ok(SignOutcome::TimedOut),
+            Err(_elapsed) => Ok(CheckOutcome::TimedOut),
             Ok(Err(e)) => {
                 let rendered = format!("{e:#}");
                 // Not the notary's fault: substituting reports an exhausted
@@ -311,21 +262,21 @@ impl Signer for ConductorSigner<'_> {
                 if crate::dna_errors::is_response_decode_failure(&rendered) {
                     return Err(PolicyError::Fatal(
                         crate::dna_errors::schema_mismatch_message(
-                            "request_closing_signature",
+                            "request_close_check",
                             &rendered,
                         ),
                     ));
                 }
                 tracing::warn!(notary = %notary, error = %rendered,
-                    "request_closing_signature errored");
-                Ok(SignOutcome::Errored)
+                    "request_close_check errored");
+                Ok(CheckOutcome::Errored)
             }
-            Ok(Ok(SignClosingResponse::Signed { signature })) => {
-                Ok(SignOutcome::Signed(NotarySignature { notary, signature }))
-            }
-            Ok(Ok(SignClosingResponse::StateMismatch)) => Ok(SignOutcome::StateMismatch),
-            Ok(Ok(SignClosingResponse::UnableToVerify)) => Ok(SignOutcome::UnableToVerify),
-            Ok(Ok(SignClosingResponse::Warranted(_))) => Err(PolicyError::Warranted),
+            Ok(Ok(CloseCheckResponse::Approved)) => Ok(CheckOutcome::Approved),
+            Ok(Ok(CloseCheckResponse::StateMismatch)) => Ok(CheckOutcome::StateMismatch),
+            Ok(Ok(CloseCheckResponse::TargetNotApproved)) => Ok(CheckOutcome::TargetNotApproved),
+            Ok(Ok(CloseCheckResponse::UnableToVerify)) => Ok(CheckOutcome::UnableToVerify),
+            Ok(Ok(CloseCheckResponse::NotAClosingNotary)) => Ok(CheckOutcome::NotAClosingNotary),
+            Ok(Ok(CloseCheckResponse::Warranted(_))) => Err(PolicyError::Warranted),
         }
     }
 }
@@ -353,7 +304,7 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
 /// interrupted (e.g. reboot mid-close) run as done and never resume it. The
 /// in-progress step is the operator-must-intervene `Step::Failed`'s opposite —
 /// a restart re-probes and resumes — so we deliberately do NOT touch the state
-/// file here: leaving the last meaningful record (agent + signature attribution
+/// file here: leaving the last meaningful record (agent + approval attribution
 /// a prior pass wrote) intact rather than clobbering it with this pass's
 /// possibly-bare in-memory `State` (the top-of-loop bail can fire before any
 /// `attempt` has populated it). The next restart's first probe rewrites it.
@@ -364,7 +315,7 @@ fn shutdown_before_complete() -> Result<()> {
 /// Apply `f` to the carried `state` and persist it, swallowing (logging) a
 /// write error — a failed status write must never abort the migration itself.
 /// Mutating the carried `state` in place (rather than re-stamping a fresh
-/// `State::new`) is what makes `agent` / `signatures_*` progress persist across
+/// `State::new`) is what makes `agent` / `approvals_*` progress persist across
 /// passes and into the final closed record.
 fn persist(cfg: &Config, state: &mut State, f: impl FnOnce(&mut State)) {
     f(state);
