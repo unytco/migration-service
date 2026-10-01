@@ -23,8 +23,8 @@ fn round_trips_through_disk() {
     state.new_chain_opened = true;
     state.package_fetchable = true;
     state.safe_to_teardown = true;
-    state.signatures_collected = Some(3);
-    state.signatures_threshold = Some(3);
+    state.approvals_collected = Some(3);
+    state.approvals_threshold = Some(3);
     state.verify = Some(VerifyReport {
         balance_match: true,
         carry_forward_units_match: true,
@@ -40,9 +40,25 @@ fn round_trips_through_disk() {
     assert_eq!(read.agent.as_deref(), Some("uhCAkAGENT"));
     assert!(read.old_chain_closed && read.new_chain_opened && read.package_fetchable);
     assert!(read.safe_to_teardown);
-    assert_eq!(read.signatures_collected, Some(3));
+    assert_eq!(read.approvals_collected, Some(3));
     assert!(read.verify.as_ref().unwrap().passed());
     assert!(read.updated_at_us > 0, "the write stamps a timestamp");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The names the report collector reads during the pre-close check.
+#[test]
+fn the_check_writes_collecting_approvals_and_the_approval_counts() {
+    let path = tmp("approval-names");
+    let mut state = State::new(Phase::Close, Step::CollectingApprovals, "checking");
+    state.approvals_collected = Some(1);
+    state.approvals_threshold = Some(2);
+    state.write(&path).unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["step"], "collecting_approvals");
+    assert_eq!(raw["approvals_collected"], 1);
+    assert_eq!(raw["approvals_threshold"], 2);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -72,7 +88,7 @@ fn persisted_safe_to_teardown_reads_the_monotonic_signal() {
         "an absent state file ⇒ false (never verified)"
     );
 
-    let mut s = State::new(Phase::Open, Step::CollectingSignatures, "mid-flight");
+    let mut s = State::new(Phase::Open, Step::CollectingApprovals, "mid-flight");
     s.new_chain_opened = true;
     s.safe_to_teardown = false;
     s.write(&path).unwrap();

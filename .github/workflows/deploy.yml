@@ -15,8 +15,13 @@ jobs:
   deploy-router:
     name: wrangler deploy (router)
     runs-on: ubuntu-latest
-    # Only deploy when the CI run that triggered this actually passed.
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Only a passing CI run of a push to this repository deploys. The branch
+    # filter above matches a pull request's head branch too, a fork's `main`
+    # included, and that run's code must never reach wrangler with our secrets.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     defaults:
       run:
         working-directory: migration-router

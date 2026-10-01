@@ -3,16 +3,13 @@
 // handlers.test.ts; this exercises routing, CORS, and the bundled-registry wiring.
 //
 // index.ts loads the BUNDLED registry.json at module load (not injectable), so
-// these tests assert against whatever registry.json currently contains: a single
-// chain-root placeholder DNA.
+// these tests use a DNA no registry lists.
 
 import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/notary";
 
-// The single placeholder DNA hash currently shipped in registry.json. It is a
-// chain root (no upgrades_from), i.e. a chain tip with no successor.
-const PLACEHOLDER_DNA = "uhC0kREPLACE_WITH_v0_1_DNA_HASH";
+const UNREGISTERED_DNA = "uhC0kREPLACE_WITH_v0_1_DNA_HASH";
 
 const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "t" };
 
@@ -33,7 +30,7 @@ describe("worker.fetch — GET /healthz", () => {
     const b = await body(resp);
     expect(b.status).toBe("ok");
     expect(b.api_versions).toEqual(["v1"]);
-    expect(b.protocol_versions).toEqual(["v0_1"]);
+    expect(b.protocol_versions).toEqual(["v0_2"]);
   });
 
   it("carries the CORS allow-origin header on a successful response", async () => {
@@ -43,14 +40,14 @@ describe("worker.fetch — GET /healthz", () => {
 });
 
 describe("worker.fetch — GET /v1/update-check", () => {
-  it("placeholder (chain tip) has no upgrade", async () => {
+  it("an unregistered DNA has no upgrade", async () => {
     const resp = await get(
-      `/v1/update-check?current_dna_hash=${encodeURIComponent(PLACEHOLDER_DNA)}`,
+      `/v1/update-check?current_dna_hash=${encodeURIComponent(UNREGISTERED_DNA)}`,
     );
     expect(resp.status).toBe(200);
     const b = await body(resp);
     expect(b.has_upgrade).toBe(false);
-    expect(b.current_dna_hash).toBe(PLACEHOLDER_DNA);
+    expect(b.current_dna_hash).toBe(UNREGISTERED_DNA);
   });
 
   it("missing current_dna_hash → 400 unknown_current_dna", async () => {
@@ -61,13 +58,13 @@ describe("worker.fetch — GET /v1/update-check", () => {
 });
 
 describe("worker.fetch — GET /v1/migration-options", () => {
-  it("still routes (regression): placeholder root → 200 with empty options", async () => {
+  it("still routes (regression): an unregistered DNA → 200 with empty options", async () => {
     const resp = await get(
-      `/v1/migration-options?to_dna_hash=${encodeURIComponent(PLACEHOLDER_DNA)}`,
+      `/v1/migration-options?to_dna_hash=${encodeURIComponent(UNREGISTERED_DNA)}`,
     );
     expect(resp.status).toBe(200);
     const b = await body(resp);
-    expect(b.to_dna_hash).toBe(PLACEHOLDER_DNA);
+    expect(b.to_dna_hash).toBe(UNREGISTERED_DNA);
     expect(b.options).toEqual([]);
   });
 

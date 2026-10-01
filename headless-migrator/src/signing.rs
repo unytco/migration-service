@@ -4,7 +4,7 @@
 //! connect writes nothing. Without it, `ham` authorizes a throwaway signing key
 //! by committing a capability grant to the agent's chain on EVERY connect. A
 //! closed chain rejects that action, peers warrant the author for it, and
-//! `read_predecessor_close` will not serve a warranted agent's close, so one
+//! notaries will not attest a warranted agent's close, so one
 //! connect too many permanently destroys the agent's ability to migrate.
 //!
 //! The decision itself is `ham`'s.
