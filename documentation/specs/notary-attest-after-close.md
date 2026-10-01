@@ -90,6 +90,7 @@ Healthy only when the conductor answers `ping` and the cell answers `whoami`. It
 ### Registry
 
 - Every notary's `api` is `v2`. The router refuses to load any other.
+- An entry lists each notary once: two `url`s that differ only in host case, a default port or trailing slashes are one notary. The router refuses to load a registry that breaks this.
 - Every entry with `upgrade_targets` carries `closing_threshold`, an integer from 1 to the entry's number of `notaries`. The router refuses to load a registry that breaks this.
 
 ### `POST /v1/migrate`
