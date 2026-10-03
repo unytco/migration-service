@@ -5,13 +5,13 @@
 export interface NotaryEntry {
   /** Cloudflare-Tunnel URL of a notary daemon serving this DNA, e.g. https://notary-1-v01.unyt.dev */
   url: string;
-  /** Daemon HTTP API version the router speaks to this daemon (e.g. "v1"). */
+  /** Daemon HTTP API version the router speaks to this daemon (e.g. "v2"). */
   api: string;
 }
 
 /** Daemon HTTP API versions this router build knows how to speak. A registry
  * pinning anything else fails at startup, never at request time. */
-export const SUPPORTED_DAEMON_APIS: ReadonlySet<string> = new Set(["v1"]);
+export const SUPPORTED_DAEMON_APIS: ReadonlySet<string> = new Set(["v2"]);
 
 export interface DnaEntry {
   dna_hash: string;
@@ -23,18 +23,43 @@ export interface DnaEntry {
    * on-chain GD `upgrade_targets`). Each must resolve to a descendant along the
    * `upgrades_from` chain — written by the release registry generator. */
   upgrade_targets?: string[];
+  /** M, a mirror of the on-chain GD `closing_threshold`: how many notary
+   * attestations of a close on this DNA an open needs. Required with
+   * `upgrade_targets`. */
+  closing_threshold?: number;
   /** Where to download the build for this DNA (e.g. a GitHub release page). Surfaced by /v1/update-check. */
   release_url?: string;
-  /** 1..N notary daemons serving this DNA (redundancy / failover). */
+  /** The notary daemons serving this DNA. On a source, `closing_threshold` of
+   * them must each attest a close. */
   notaries: NotaryEntry[];
   /** Customer-visibility gate for this DNA as a migration TARGET (customers-last, Stage 7.1).
    * HONORED by /v1/update-check (`furthestTargetOf`): an unpublished successor is invisible, so
    * the app shows no upgrade banner. IGNORED by /v1/migrate + /v1/migration-options
-   * (`reaches` / `sourcesReaching`): the close-package is served regardless, so the headless
+   * (`source` / `sourcesReaching`): the close-package is served regardless, so the headless
    * server open can fetch the successor BEFORE it is surfaced to customers. Absent = unpublished
    * (the safe default): the routing phase registers a target `false`, the publish phase flips it
    * `true` once the whole fleet has migrated. */
   published?: boolean;
+}
+
+/** An entry a close can migrate from: one with `upgrade_targets`, which
+ * `Registry.load` holds to a valid `closing_threshold`. */
+export interface SourceEntry extends DnaEntry {
+  upgrade_targets: string[];
+  closing_threshold: number;
+}
+
+function reachesTarget(entry: DnaEntry, toDnaHash: string): entry is SourceEntry {
+  return entry.upgrade_targets?.includes(toDnaHash) ?? false;
+}
+
+function notaryKey(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname.replace(/\/+$/, "");
+  } catch {
+    return undefined;
+  }
 }
 
 export interface RawRegistry {
@@ -92,6 +117,7 @@ export class Registry {
         throw new Error(`registry entry ${d.dna_hash}: published must be a boolean`);
       if (!Array.isArray(d.notaries))
         throw new Error(`registry entry ${d.dna_hash} missing notaries`);
+      const notaryByKey = new Map<string, string>();
       for (const n of d.notaries) {
         const httpAdmitted =
           opts?.allowHttpNotaries === true && n.url?.startsWith("http://");
@@ -103,6 +129,32 @@ export class Registry {
         if (!SUPPORTED_DAEMON_APIS.has(n.api)) {
           throw new Error(
             `registry entry ${d.dna_hash}: unsupported notary api ${n.api}`,
+          );
+        }
+        const key = notaryKey(n.url);
+        if (key === undefined) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: notary url ${n.url} does not parse`,
+          );
+        }
+        const first = notaryByKey.get(key);
+        if (first !== undefined) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: duplicate notary ${n.url} (also listed as ${first})`,
+          );
+        }
+        notaryByKey.set(key, n.url);
+      }
+      if (d.upgrade_targets !== undefined || d.closing_threshold !== undefined) {
+        const m = d.closing_threshold;
+        if (
+          typeof m !== "number" ||
+          !Number.isInteger(m) ||
+          m < 1 ||
+          m > d.notaries.length
+        ) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: closing_threshold must be an integer from 1 to its ${d.notaries.length} notaries`,
           );
         }
       }
@@ -212,19 +264,16 @@ export class Registry {
 
   /** Entries whose `upgrade_targets` include `toDnaHash` — the candidate sources
    * a chain could have closed toward `toDnaHash` from (registry insertion order). */
-  sourcesReaching(toDnaHash: string): DnaEntry[] {
-    const out: DnaEntry[] = [];
-    for (const entry of this.byHash.values()) {
-      if (entry.upgrade_targets?.includes(toDnaHash)) out.push(entry);
-    }
-    return out;
-  }
-
-  /** Is `toDnaHash` a proven upgrade target of `fromDnaHash`? */
-  reaches(fromDnaHash: string, toDnaHash: string): boolean {
-    return (
-      this.byHash.get(fromDnaHash)?.upgrade_targets?.includes(toDnaHash) ??
-      false
+  sourcesReaching(toDnaHash: string): SourceEntry[] {
+    return [...this.byHash.values()].filter((entry): entry is SourceEntry =>
+      reachesTarget(entry, toDnaHash),
     );
   }
+
+  /** `fromDnaHash`'s entry when `toDnaHash` is one of its proven upgrade targets. */
+  source(fromDnaHash: string, toDnaHash: string): SourceEntry | undefined {
+    const entry = this.byHash.get(fromDnaHash);
+    return entry && reachesTarget(entry, toDnaHash) ? entry : undefined;
+  }
+
 }

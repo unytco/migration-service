@@ -18,9 +18,9 @@ use headless_migrator::joining::NonceSigner;
 use headless_migrator::open::Connector;
 use holo_hash::{ActionHash, AgentPubKey, DnaHash};
 use holochain_types::prelude::CellId;
-use rave_engine::types::entries::migration::v0_1::{
-    AgreementCarryForward, CommittedClose, MigrationInitRequest, NotarySignature,
-    PrepareCloseResponse, SignClosingResponse, SignRequest, SummaryState, SummaryStatePayload,
+use rave_engine::types::entries::migration::v0_2::{
+    AgreementCarryForward, CloseCheckRequest, CloseCheckResponse, CommittedClose,
+    MigrationInitRequest, NotarySignature, PrepareCloseResponse, SummaryState, SummaryStatePayload,
     SummaryTx,
 };
 use rave_engine::types::ledger::CarryForwardUnits;
@@ -39,7 +39,7 @@ pub enum Call {
     PrepareClosingSummary {
         target: holo_hash::DnaHash,
     },
-    RequestClosingSignature,
+    RequestCloseCheck,
     CloseAgentChain,
     GetMigrationCloseState,
     VerifyIfMigrated,
@@ -60,8 +60,11 @@ pub struct MockConductor {
     /// every pass, the shape a schema mismatch actually has.
     pub ledger: Mutex<Option<anyhow::Result<Ledger>>>,
     pub drop_fees: Mutex<Option<anyhow::Result<String>>>,
-    pub prepare: Mutex<Option<anyhow::Result<PrepareCloseResponse>>>,
-    pub sign_responses: Mutex<VecDeque<anyhow::Result<SignClosingResponse>>>,
+    pub prepare: Mutex<VecDeque<anyhow::Result<PrepareCloseResponse>>>,
+    pub check_responses: Mutex<VecDeque<anyhow::Result<CloseCheckResponse>>>,
+    /// Every check request, and every payload `close_agent_chain` committed.
+    pub checks: Mutex<Vec<CloseCheckRequest>>,
+    pub closed_with: Mutex<Vec<SummaryStatePayload>>,
     pub close_result: Mutex<Option<anyhow::Result<ActionHash>>>,
     pub close_state: Mutex<VecDeque<anyhow::Result<CommittedClose>>>,
     pub verify_migrated: Mutex<VecDeque<anyhow::Result<bool>>>,
@@ -129,26 +132,20 @@ impl Conductor for MockConductor {
         target: holo_hash::DnaHash,
     ) -> anyhow::Result<PrepareCloseResponse> {
         self.record(Call::PrepareClosingSummary { target });
-        self.prepare
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_else(|| Err(anyhow::anyhow!("mock: no prepare scripted")))
+        Self::pop(&self.prepare, "prepare_closing_summary")
     }
 
-    async fn request_closing_signature(
+    async fn request_close_check(
         &self,
-        _req: SignRequest,
-    ) -> anyhow::Result<SignClosingResponse> {
-        self.record(Call::RequestClosingSignature);
-        Self::pop(&self.sign_responses, "request_closing_signature")
+        req: CloseCheckRequest,
+    ) -> anyhow::Result<CloseCheckResponse> {
+        self.record(Call::RequestCloseCheck);
+        self.checks.lock().unwrap().push(req);
+        Self::pop(&self.check_responses, "request_close_check")
     }
 
-    async fn close_agent_chain(
-        &self,
-        _payload: SummaryStatePayload,
-        _notary_signatures: Vec<NotarySignature>,
-    ) -> anyhow::Result<ActionHash> {
+    async fn close_agent_chain(&self, payload: SummaryStatePayload) -> anyhow::Result<ActionHash> {
+        self.closed_with.lock().unwrap().push(payload);
         self.record(Call::CloseAgentChain);
         self.close_result
             .lock()
@@ -343,10 +340,6 @@ pub fn prepare_response(
 pub fn committed_close(agent_seed: u8, closing: SummaryState) -> CommittedClose {
     CommittedClose {
         payload: payload(agent_seed, closing),
-        notary_signatures: vec![NotarySignature {
-            notary: agent(50),
-            signature: hdi::prelude::Signature([1u8; 64]),
-        }],
         close_action: action_hash(6),
     }
 }

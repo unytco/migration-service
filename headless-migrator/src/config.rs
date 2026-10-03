@@ -20,7 +20,7 @@ use crate::policy::PolicyOpts;
 use ham::SigningPolicy;
 
 /// How the supervised loops connect to the local conductor and where they
-/// record progress, plus the M-of-N collection policy knobs.
+/// record progress, plus the pre-close check policy knobs.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Holochain conductor admin websocket port (local).
@@ -40,7 +40,7 @@ pub struct Config {
     /// from `ham`'s connect backoff, which is internal to the connection).
     pub retry_initial: Duration,
     pub retry_max: Duration,
-    /// The signature-collection policy (open question knobs all live here).
+    /// The pre-close check policy.
     pub policy: PolicyOpts,
     /// How every `ham` connection this service makes signs its zome calls.
     /// Resolved here so a service that cannot sign through lair dies at startup

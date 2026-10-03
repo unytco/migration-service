@@ -23,7 +23,7 @@ pub struct Config {
     pub bind_addr: String,
     /// Port this daemon's HTTP server binds.
     pub bind_port: u16,
-    /// Bearer token the router must present on `/v1/fetch-close`.
+    /// Bearer token the router must present on `/v2/attest-close`.
     pub bearer_token: String,
     /// `ham` per-request timeout (seconds).
     pub request_timeout_secs: u64,

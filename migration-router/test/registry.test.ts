@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
+import bundled from "../registry.json";
+import localExample from "../registry.local.example.json";
 
 const v01 = "uhC0k_v01";
 const v02 = "uhC0k_v02";
@@ -12,19 +14,19 @@ function chain(): RawRegistry {
       {
         dna_hash: v01,
         version: "alliance-v0.1.0",
-        notaries: [{ url: "https://n1", api: "v1" }],
+        notaries: [{ url: "https://n1", api: "v2" }],
       },
       {
         dna_hash: v02,
         version: "alliance-v0.2.0",
         upgrades_from: v01,
-        notaries: [{ url: "https://n2", api: "v1" }],
+        notaries: [{ url: "https://n2", api: "v2" }],
       },
       {
         dna_hash: v03,
         version: "alliance-v0.3.0",
         upgrades_from: v02,
-        notaries: [{ url: "https://n3", api: "v1" }],
+        notaries: [{ url: "https://n3", api: "v2" }],
       },
     ],
   };
@@ -41,22 +43,24 @@ function skipChain(): RawRegistry {
         dna_hash: v01,
         version: "alliance-v0.1.0",
         upgrade_targets: [v02, v03],
-        notaries: [{ url: "https://n1", api: "v1" }],
+        closing_threshold: 1,
+        notaries: [{ url: "https://n1", api: "v2" }],
       },
       {
         dna_hash: v02,
         version: "alliance-v0.2.0",
         upgrades_from: v01,
         upgrade_targets: [v03],
+        closing_threshold: 1,
         published: true,
-        notaries: [{ url: "https://n2", api: "v1" }],
+        notaries: [{ url: "https://n2", api: "v2" }],
       },
       {
         dna_hash: v03,
         version: "alliance-v0.3.0",
         upgrades_from: v02,
         published: true,
-        notaries: [{ url: "https://n3", api: "v1" }],
+        notaries: [{ url: "https://n3", api: "v2" }],
       },
     ],
   };
@@ -162,6 +166,12 @@ describe("Registry.load", () => {
     expect(() => Registry.load(raw)).toThrow(/unsupported notary api v9/);
   });
 
+  it("rejects a v1 daemon: it serves a close without attesting it", () => {
+    const raw = chain();
+    raw.dnas[1].notaries[0].api = "v1";
+    expect(() => Registry.load(raw)).toThrow(/unsupported notary api v1/);
+  });
+
   it("rejects a cycle", () => {
     const raw: RawRegistry = {
       version: 1,
@@ -217,6 +227,93 @@ describe("Registry.load", () => {
     expect(() => Registry.load(raw)).toThrow(/duplicate upgrade_target/);
   });
 
+  it("accepts a closing_threshold from 1 to the entry's notary count, notaries apart by host or port", () => {
+    for (const m of [1, 2, 3]) {
+      const raw = skipChain();
+      raw.dnas[0].notaries = [
+        { url: "https://n1", api: "v2" },
+        { url: "https://n1b", api: "v2" },
+        { url: "https://n1:8443", api: "v2" },
+      ];
+      raw.dnas[0].closing_threshold = m;
+      expect(Registry.load(raw).get(v01)?.closing_threshold).toBe(m);
+    }
+  });
+
+  it("rejects a notary listed twice on one entry, however its url is spelled", () => {
+    for (const twin of ["https://n1", "https://n1/", "https://n1//", "https://N1", "https://n1:443"]) {
+      const raw = skipChain();
+      raw.dnas[0].notaries = [
+        { url: "https://n1", api: "v2" },
+        { url: twin, api: "v2" },
+      ];
+      expect(() => Registry.load(raw), twin).toThrow(
+        `registry entry ${v01}: duplicate notary ${twin} (also listed as https://n1)`,
+      );
+    }
+  });
+
+  it("rejects a notary listed twice on an entry that is not a source yet", () => {
+    const raw = chain();
+    raw.dnas[0].notaries.push({ url: "https://n1/", api: "v2" });
+    expect(() => Registry.load(raw)).toThrow(
+      `registry entry ${v01}: duplicate notary https://n1/ (also listed as https://n1)`,
+    );
+  });
+
+  it("rejects a closing_threshold met only by counting one notary twice", () => {
+    const raw = skipChain();
+    raw.dnas[0].notaries = [
+      { url: "https://n1", api: "v2" },
+      { url: "https://n1/", api: "v2" },
+    ];
+    raw.dnas[0].closing_threshold = 2;
+    expect(() => Registry.load(raw)).toThrow(/duplicate notary https:\/\/n1\//);
+  });
+
+  it("rejects a notary url that does not parse", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "https://";
+    expect(() => Registry.load(raw)).toThrow(
+      `registry entry ${v01}: notary url https:// does not parse`,
+    );
+  });
+
+  it("loads the bundled registry and the local example", () => {
+    expect(() => Registry.load(bundled as RawRegistry)).not.toThrow();
+    expect(() =>
+      Registry.load(localExample as RawRegistry, { allowHttpNotaries: true }),
+    ).not.toThrow();
+  });
+
+  it("rejects an entry with upgrade_targets and no closing_threshold", () => {
+    const raw = skipChain();
+    delete raw.dnas[0].closing_threshold;
+    expect(() => Registry.load(raw)).toThrow(
+      /closing_threshold must be an integer from 1 to its 1 notaries/,
+    );
+  });
+
+  it("rejects a closing_threshold outside 1 to the notary count, or not an integer", () => {
+    for (const bad of [0, 2, 1.5, -1, "1"]) {
+      const raw = skipChain();
+      raw.dnas[0].closing_threshold = bad as number;
+      expect(() => Registry.load(raw), String(bad)).toThrow(/closing_threshold/);
+    }
+  });
+
+  it("rejects a source with no notaries: no threshold can be met", () => {
+    const raw = skipChain();
+    raw.dnas[0].notaries = [];
+    expect(() => Registry.load(raw)).toThrow(/closing_threshold/);
+  });
+
+  it("checks a closing_threshold on an entry without upgrade_targets too", () => {
+    const raw = chain();
+    raw.dnas[0].closing_threshold = 3;
+    expect(() => Registry.load(raw)).toThrow(/closing_threshold/);
+  });
+
   it("furthestTargetOf returns the deepest proven descendant", () => {
     const r = Registry.load(skipChain());
     expect(r.furthestTargetOf(v01)?.dna_hash).toBe(v03); // [v02,v03] → furthest v03
@@ -239,17 +336,24 @@ describe("Registry.load", () => {
     expect(r.sourcesReaching(v01)).toEqual([]);
   });
 
-  it("reaches reflects the upgrade_targets list", () => {
+  it("source returns the typed entry only for a proven target", () => {
     const r = Registry.load(skipChain());
-    expect(r.reaches(v01, v03)).toBe(true);
-    expect(r.reaches(v02, v03)).toBe(true);
-    expect(r.reaches(v02, v01)).toBe(false);
-    expect(r.reaches("unknown", v03)).toBe(false);
+    expect(r.source(v01, v03)?.closing_threshold).toBe(1);
+    expect(r.source(v02, v01)).toBeUndefined();
+    expect(r.source("unknown", v03)).toBeUndefined();
+  });
+
+  it("source reflects the upgrade_targets list", () => {
+    const r = Registry.load(skipChain());
+    expect(r.source(v01, v03)).toBeDefined();
+    expect(r.source(v02, v03)).toBeDefined();
+    expect(r.source(v02, v01)).toBeUndefined();
+    expect(r.source("unknown", v03)).toBeUndefined();
   });
 });
 
 // The customers-last visibility gate: `published` is HONORED by furthestTargetOf (the
-// /v1/update-check banner) but IGNORED by reaches / sourcesReaching (the /v1/migrate close-package
+// /v1/update-check banner) but IGNORED by source / sourcesReaching (the /v1/migrate close-package
 // fetch), so a successor can be served to the headless server open BEFORE it is surfaced to
 // customers. Absent `published` = unpublished (the safe default).
 describe("Registry — published (customer-visibility) gate", () => {
@@ -259,7 +363,7 @@ describe("Registry — published (customer-visibility) gate", () => {
       dna_hash: v02,
       version: "alliance-v0.2.0",
       upgrades_from: v01,
-      notaries: [{ url: "https://n2", api: "v1" }],
+      notaries: [{ url: "https://n2", api: "v2" }],
     };
     if (published !== undefined) v02Entry.published = published;
     return {
@@ -269,7 +373,8 @@ describe("Registry — published (customer-visibility) gate", () => {
           dna_hash: v01,
           version: "alliance-v0.1.0",
           upgrade_targets: [v02],
-          notaries: [{ url: "https://n1", api: "v1" }],
+          closing_threshold: 1,
+          notaries: [{ url: "https://n1", api: "v2" }],
         },
         v02Entry,
       ],
@@ -301,22 +406,24 @@ describe("Registry — published (customer-visibility) gate", () => {
           dna_hash: v01,
           version: "alliance-v0.1.0",
           upgrade_targets: [v02, v03],
-          notaries: [{ url: "https://n1", api: "v1" }],
+          closing_threshold: 1,
+          notaries: [{ url: "https://n1", api: "v2" }],
         },
         {
           dna_hash: v02,
           version: "alliance-v0.2.0",
           upgrades_from: v01,
           upgrade_targets: [v03],
+          closing_threshold: 1,
           published: true,
-          notaries: [{ url: "https://n2", api: "v1" }],
+          notaries: [{ url: "https://n2", api: "v2" }],
         },
         {
           dna_hash: v03,
           version: "alliance-v0.3.0",
           upgrades_from: v02,
           published: false,
-          notaries: [{ url: "https://n3", api: "v1" }],
+          notaries: [{ url: "https://n3", api: "v2" }],
         },
       ],
     };
@@ -327,9 +434,9 @@ describe("Registry — published (customer-visibility) gate", () => {
     expect(r.furthestTargetOf(v02)).toBeUndefined();
   });
 
-  it("reaches IGNORES published — an unpublished target is still reachable (migrate serves it)", () => {
+  it("source IGNORES published: an unpublished target is still reachable (migrate serves it)", () => {
     const r = Registry.load(gated(false));
-    expect(r.reaches(v01, v02)).toBe(true);
+    expect(r.source(v01, v02)).toBeDefined();
   });
 
   it("sourcesReaching IGNORES published — an unpublished target still lists its sources", () => {
