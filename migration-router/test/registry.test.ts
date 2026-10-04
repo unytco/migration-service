@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
+import bundled from "../registry.json";
+import localExample from "../registry.local.example.json";
 
 const v01 = "uhC0k_v01";
 const v02 = "uhC0k_v02";
@@ -225,16 +227,63 @@ describe("Registry.load", () => {
     expect(() => Registry.load(raw)).toThrow(/duplicate upgrade_target/);
   });
 
-  it("accepts a closing_threshold from 1 to the entry's notary count", () => {
-    for (const m of [1, 2]) {
+  it("accepts a closing_threshold from 1 to the entry's notary count, notaries apart by host or port", () => {
+    for (const m of [1, 2, 3]) {
       const raw = skipChain();
       raw.dnas[0].notaries = [
         { url: "https://n1", api: "v2" },
         { url: "https://n1b", api: "v2" },
+        { url: "https://n1:8443", api: "v2" },
       ];
       raw.dnas[0].closing_threshold = m;
       expect(Registry.load(raw).get(v01)?.closing_threshold).toBe(m);
     }
+  });
+
+  it("rejects a notary listed twice on one entry, however its url is spelled", () => {
+    for (const twin of ["https://n1", "https://n1/", "https://n1//", "https://N1", "https://n1:443"]) {
+      const raw = skipChain();
+      raw.dnas[0].notaries = [
+        { url: "https://n1", api: "v2" },
+        { url: twin, api: "v2" },
+      ];
+      expect(() => Registry.load(raw), twin).toThrow(
+        `registry entry ${v01}: duplicate notary ${twin} (also listed as https://n1)`,
+      );
+    }
+  });
+
+  it("rejects a notary listed twice on an entry that is not a source yet", () => {
+    const raw = chain();
+    raw.dnas[0].notaries.push({ url: "https://n1/", api: "v2" });
+    expect(() => Registry.load(raw)).toThrow(
+      `registry entry ${v01}: duplicate notary https://n1/ (also listed as https://n1)`,
+    );
+  });
+
+  it("rejects a closing_threshold met only by counting one notary twice", () => {
+    const raw = skipChain();
+    raw.dnas[0].notaries = [
+      { url: "https://n1", api: "v2" },
+      { url: "https://n1/", api: "v2" },
+    ];
+    raw.dnas[0].closing_threshold = 2;
+    expect(() => Registry.load(raw)).toThrow(/duplicate notary https:\/\/n1\//);
+  });
+
+  it("rejects a notary url that does not parse", () => {
+    const raw = chain();
+    raw.dnas[0].notaries[0].url = "https://";
+    expect(() => Registry.load(raw)).toThrow(
+      `registry entry ${v01}: notary url https:// does not parse`,
+    );
+  });
+
+  it("loads the bundled registry and the local example", () => {
+    expect(() => Registry.load(bundled as RawRegistry)).not.toThrow();
+    expect(() =>
+      Registry.load(localExample as RawRegistry, { allowHttpNotaries: true }),
+    ).not.toThrow();
   });
 
   it("rejects an entry with upgrade_targets and no closing_threshold", () => {

@@ -25,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- router: the registry loads only `v2` notary daemons, and every entry with `upgrade_targets` names its `closing_threshold`.
+- router: the registry loads only `v2` notary daemons, each listed once per DNA, and every entry with `upgrade_targets` names its `closing_threshold`.
 - router: the bundled registry lists no `v0_1` releases.
 - router: `/v1/migrate` asks M notaries to attest the closed chain and returns their M signatures, and `/healthz` reports protocol `v0_2`.
 - router: a notary behind a failing tunnel or Access reads as unreachable or refused, not as a faulty daemon, and each answer that does not count is logged with its daemon.
