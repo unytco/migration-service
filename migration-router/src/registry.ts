@@ -53,6 +53,15 @@ function reachesTarget(entry: DnaEntry, toDnaHash: string): entry is SourceEntry
   return entry.upgrade_targets?.includes(toDnaHash) ?? false;
 }
 
+function notaryKey(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname.replace(/\/+$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
 export interface RawRegistry {
   /** Registry schema version; the router refuses unknown values. */
   version: number;
@@ -108,6 +117,7 @@ export class Registry {
         throw new Error(`registry entry ${d.dna_hash}: published must be a boolean`);
       if (!Array.isArray(d.notaries))
         throw new Error(`registry entry ${d.dna_hash} missing notaries`);
+      const notaryByKey = new Map<string, string>();
       for (const n of d.notaries) {
         const httpAdmitted =
           opts?.allowHttpNotaries === true && n.url?.startsWith("http://");
@@ -121,6 +131,19 @@ export class Registry {
             `registry entry ${d.dna_hash}: unsupported notary api ${n.api}`,
           );
         }
+        const key = notaryKey(n.url);
+        if (key === undefined) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: notary url ${n.url} does not parse`,
+          );
+        }
+        const first = notaryByKey.get(key);
+        if (first !== undefined) {
+          throw new Error(
+            `registry entry ${d.dna_hash}: duplicate notary ${n.url} (also listed as ${first})`,
+          );
+        }
+        notaryByKey.set(key, n.url);
       }
       if (d.upgrade_targets !== undefined || d.closing_threshold !== undefined) {
         const m = d.closing_threshold;

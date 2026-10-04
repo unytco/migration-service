@@ -12,7 +12,7 @@ Two components:
 
 The app (and the headless-migrator's open service) completes the flow by installing the new-DNA app with the package as the alliance role's `init_properties`, so the DNA's `init` opens the agent's own chain at genesis — no off-chain service can do that.
 
-The contract is [`documentation/specs/notary-attest-after-close.md`](documentation/specs/notary-attest-after-close.md).
+The contract is [`documentation/specs/version-migration/`](https://github.com/unytco/workshop/tree/main/documentation/specs/version-migration) in `unytco/workshop`.
 
 ## Layout
 
