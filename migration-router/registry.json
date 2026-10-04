@@ -1,4 +1,17 @@
 {
   "version": 1,
-  "dnas": []
+  "dnas": [
+    {
+      "dna_hash": "uhC0kHcM3upGH-QOneMlO0Kjsup0Rj2n4qL4HOIyClxFxe6hMw1d4",
+      "version": "alliance-v0.109.0",
+      "release_url": "https://github.com/unytco/unyt-sandbox/releases/tag/v0.109.0",
+      "notaries": [
+        {
+          "url": "https://notary-1-v0-109-0.unyt.dev",
+          "api": "v2"
+        }
+      ],
+      "published": false
+    }
+  ]
 }
