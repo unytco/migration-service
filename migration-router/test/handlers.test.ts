@@ -1,14 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Registry, type RawRegistry } from "../src/registry";
 import { migrationOptions, shuffled, updateCheck } from "../src/handlers";
 import type { Env, FetchLike } from "../src/notary";
 import type { Build, CacheLike } from "../src/builds";
+import { jsonResp, releasesResp } from "./github-fixtures";
 
 const v01 = "uhC0k_v01";
 const v02 = "uhC0k_v02";
 const v03 = "uhC0k_v03";
 
-const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
+const ENV: Env = {
+  MIGRATION_NOTARY_BEARER_TOKEN: "test-token",
+  GITHUB_RELEASES_URL:
+    "https://api.github.com/repos/unytco/unyt-sandbox/releases",
+};
 
 // Seeded `rand` values for the two-candidate dispatch ([n1a, n1b]): Fisher–Yates
 // with i=1 swaps when floor(rand()*2) === 0, so a high value keeps the registry
@@ -63,12 +68,6 @@ function mockFetch(byOrigin: Record<string, () => Response>): FetchLike {
     throw new TypeError(`network error: no mock for ${url}`);
   }) as FetchLike;
 }
-
-const jsonResp = (status: number, body: unknown) =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
 
 async function body(resp: Response): Promise<any> {
   return resp.json();
@@ -144,30 +143,6 @@ describe("migrationOptions", () => {
     expect((await body(resp)).error.code).toBe("unknown_to_dna");
   });
 });
-
-// A GitHub releases listing (newest-first). draft/prerelease/rc entries prove the filter.
-const ghReleases = (
-  rels: Array<{
-    tag: string;
-    draft?: boolean;
-    prerelease?: boolean;
-    assets?: Array<{ name: string; url: string; digest?: string }>;
-  }>,
-) =>
-  jsonResp(
-    200,
-    rels.map((r) => ({
-      tag_name: r.tag,
-      draft: r.draft ?? false,
-      prerelease: r.prerelease ?? false,
-      html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
-      assets: (r.assets ?? []).map((a) => ({
-        name: a.name,
-        browser_download_url: a.url,
-        ...(a.digest ? { digest: a.digest } : {}),
-      })),
-    })),
-  );
 
 /** A fetch that answers only api.github.com (via `make`) and throws for anything else. */
 function ghFetch(make: () => Response): FetchLike {
@@ -303,7 +278,7 @@ describe("updateCheck: the published (customers-last) gate", () => {
 describe("updateCheck — build axis (app_version present)", () => {
   it("reports the newest published build on the caller's lineage as latest_build", async () => {
     const fetch = ghFetch(() =>
-      ghReleases([{ tag: "v0.3.2" }, { tag: "v0.3.1" }, { tag: "v0.2.9" }]),
+      releasesResp([{ tag: "v0.3.2" }, { tag: "v0.3.1" }, { tag: "v0.2.9" }]),
     );
     const b = await body(
       await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
@@ -329,7 +304,7 @@ describe("updateCheck — build axis (app_version present)", () => {
       url: "https://github.com/unytco/unyt-sandbox/releases/download/v0.3.2/unyt_0.3.2_full-arc_x86_64_linux.deb",
     };
     const fetch = ghFetch(() =>
-      ghReleases([{ tag: "v0.3.2", assets: [dmg, deb] }, { tag: "v0.3.1" }]),
+      releasesResp([{ tag: "v0.3.2", assets: [dmg, deb] }, { tag: "v0.3.1" }]),
     );
     const b = await body(
       await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
@@ -344,7 +319,7 @@ describe("updateCheck — build axis (app_version present)", () => {
 
   it("excludes drafts, pre-releases and non-anchored tags", async () => {
     const fetch = ghFetch(() =>
-      ghReleases([
+      releasesResp([
         { tag: "v0.3.9", draft: true },
         { tag: "v0.3.8", prerelease: true },
         { tag: "v0.3.7-dev.1" },
@@ -358,7 +333,7 @@ describe("updateCheck — build axis (app_version present)", () => {
   });
 
   it("omits latest_build when the caller's lineage has no published build (never falsy)", async () => {
-    const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }]));
+    const fetch = ghFetch(() => releasesResp([{ tag: "v0.9.0" }]));
     const b = await body(
       await updateCheck(registry(), v03, "0.3.0", fetch, ENV),
     );
@@ -391,7 +366,7 @@ describe("updateCheck — build axis (app_version present)", () => {
       ],
     });
     const fetch = ghFetch(() =>
-      ghReleases([{ tag: "v0.5.3" }, { tag: "v0.5.0" }]),
+      releasesResp([{ tag: "v0.5.3" }, { tag: "v0.5.0" }]),
     );
     const b = await body(await updateCheck(r, from, "0.5.0", fetch, ENV));
     expect(b.has_upgrade).toBe(true);
@@ -425,7 +400,7 @@ describe("updateCheck — build axis (app_version present)", () => {
         },
       ],
     });
-    const fetch = ghFetch(() => ghReleases([{ tag: "v0.9.0" }])); // nothing on 0.5
+    const fetch = ghFetch(() => releasesResp([{ tag: "v0.9.0" }])); // nothing on 0.5
     const b = await body(await updateCheck(r, from, "0.9.0", fetch, ENV));
     expect(b.target.release_url).toBe(
       "https://github.com/unytco/unyt-sandbox/releases/tag/v0.5.0",
@@ -444,6 +419,31 @@ describe("updateCheck — build axis (app_version present)", () => {
     expect("latest_build" in b).toBe(false);
   });
 
+  it("keeps the migration answer and omits latest_build, reading no releases, when GITHUB_RELEASES_URL is unset", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls++;
+      return releasesResp([{ tag: "v0.3.2" }]);
+    }) as FetchLike;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let resp: Response;
+    try {
+      resp = await updateCheck(registry(), v01, "0.3.0", fetch, {
+        ...ENV,
+        GITHUB_RELEASES_URL: undefined,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+    expect(resp.status).toBe(200);
+    expect(await body(resp)).toEqual({
+      current_dna_hash: v01,
+      has_upgrade: true,
+      target: { to_dna_hash: v03, to_version: "alliance-v0.3.0" },
+    });
+    expect(calls).toBe(0);
+  });
+
   it("treats a rate-limited / erroring upstream as no builds (still 2xx, migration intact)", async () => {
     const fetch = ghFetch(() => jsonResp(429, { message: "rate limited" }));
     const resp = await updateCheck(registry(), v01, "0.3.0", fetch, ENV);
@@ -457,7 +457,7 @@ describe("updateCheck — build axis (app_version present)", () => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.startsWith("https://api.github.com")) {
         calls++;
-        return ghReleases([{ tag: "v0.3.1" }]);
+        return releasesResp([{ tag: "v0.3.1" }]);
       }
       throw new TypeError(`no mock for ${url}`);
     }) as FetchLike;

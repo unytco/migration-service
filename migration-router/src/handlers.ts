@@ -93,8 +93,8 @@ export async function updateCheck(
     return ok(migrationAnswer(currentDnaHash, target, target?.release_url));
   }
 
-  // app_version present → resolve published builds ONCE (never throws; [] on any failure), reused
-  // for both the target's freshest download link and the caller's own latest_build.
+  // app_version present → resolve published builds ONCE, reused for both the target's freshest
+  // download link and the caller's own latest_build.
   const builds = await publishedBuilds(fetchImpl, env, cache);
 
   // Target link: newest published build of the TARGET's lineage (parsed from the tag in its

@@ -1,8 +1,9 @@
 name: Deploy router
 
-# Deploys the Cloudflare Worker router AFTER the CI workflow succeeds on main.
+# Deploys the TestNet router (migration-router/wrangler.toml) AFTER the CI
+# workflow succeeds on main or main-0.6.
 # Gated on CI's success (workflow_run) rather than re-running typecheck/test here,
-# so the checks run once. The notary daemon is NOT deployed here — it ships to
+# so the checks run once. The notary daemon is NOT deployed here: it ships to
 # HEART droplets via unyt's automation hub.
 
 on:

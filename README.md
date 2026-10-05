@@ -4,7 +4,12 @@ Off-chain pipeline for unyt DNA migration. Once an agent's chain has closed, it 
 
 Two components:
 
-- **`migration-router/`**: a Cloudflare Worker (TypeScript) and the public HTTP entry point. It reads a bundled registry (the version chain, and for each DNA its notary daemons, each pinned to a daemon API version, and its `closing_threshold` M), validates the `(from_dna_hash, to_dna_hash)` pair, asks M of the source's daemons at once for `/{api}/attest-close`, asks the next daemon in a per-request random order for each answer that does not count, and returns `{ payload, notary_signatures, close_action }` with M signatures over one close, in the daemons' own JSON text. It holds no keys.
+- **`migration-router/`**: a Cloudflare Worker (TypeScript) and the public HTTP entry point. It reads a bundled registry (the version chain, and for each DNA its notary daemons, each pinned to a daemon API version, and its `closing_threshold` M), validates the `(from_dna_hash, to_dna_hash)` pair, asks M of the source's daemons at once for `/{api}/attest-close`, asks the next daemon in a per-request random order for each answer that does not count, and returns `{ payload, notary_signatures, close_action }` with M signatures over one close, in the daemons' own JSON text. It holds no keys. One router runs per network, each with its own registry and the releases of its own app:
+
+  | Network | Config | Registry | Releases |
+  | --- | --- | --- | --- |
+  | TestNet | `wrangler.toml` | `registry.json` | `unytco/unyt-sandbox` |
+  | MainNet | `wrangler.mainnet.toml` | `registry.mainnet.json` | `unytco/unyt` |
 
 - **`notary-daemon/`**: a Rust `axum` + [`ham`](https://github.com/unytco/ham) service, run beside a Holochain conductor whose cell is a closing notary on the old (from-DNA) network. Its `/v2/attest-close` calls the alliance `notary_attest_close` zome fn, which reads the agent's closed chain and signs the close, and serves the package carrying that one signature; the router combines M of them. Attesting commits nothing, and the daemon signs its own zome calls through the node's lair, so connecting commits nothing either. Exposed to the router via a Cloudflare Tunnel; healthy only when both the conductor and its app cell answer.
 
@@ -20,7 +25,7 @@ The contract is [`documentation/specs/version-migration/`](https://github.com/un
 migration-router/ Cloudflare Worker (TS) — wrangler + vitest
 notary-daemon/   Rust crate — axum + ham
 headless-migrator/ Rust crate — clap + ham (headless server-agent close/open services)
-.github/workflows/  ci.yml (test on push/PR to develop + main) + deploy.yml (router → CF on main)
+.github/workflows/  ci.yml (tests on push/PR) + deploy.yml (TestNet router → CF)
                     + release.yml (binaries → GitHub release on tag)
 ```
 
@@ -83,4 +88,4 @@ The asset names carry no version, so `--version` on either binary is how a deplo
 
 - Integrate on `develop`; release by merging `develop → main`.
 - CI runs `cargo test` (daemon + headless-migrator) + `vitest` (router) on push/PR.
-- The **router Worker auto-deploys to Cloudflare on push to `main`**. The daemon and headless-migrator are CI-tested and published as release assets on a tag (see [Releases](#releases)); they reach HEART droplets from there via unyt's deployment-automation hub (not auto-deployed).
+- The **TestNet router auto-deploys to Cloudflare on push to `main` or `main-0.6`**. The MainNet router deploys only on demand: `cd migration-router && npm run deploy:mainnet`. The daemon and headless-migrator are CI-tested and published as release assets on a tag (see [Releases](#releases)); they reach HEART droplets from there via unyt's deployment-automation hub (not auto-deployed).

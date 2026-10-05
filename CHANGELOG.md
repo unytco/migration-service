@@ -8,10 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- router: the Unyt app's update check offers only Unyt builds, never Unyt Sandbox ones.
 - **Tag-driven release workflow.** Pushing a semver tag builds both Rust binaries and publishes them — each with a `.sha256` — as fixed-name GitHub release assets. The tag must match the version in both crates' `Cargo.toml`; they release together, so one tag is one tested pairing of the close-side and open-side halves of a migration.
 - `--version` on `headless-migrator` and `migration-notary`, derived from the crate version. The release assets have fixed filenames, so this is how a deployed binary identifies itself.
 - **router: per-entry `published` visibility gate — customers-last migration surfacing.** Registry `DnaEntry` gains an optional `published` boolean (absent = unpublished): honored by `/v1/update-check`, ignored by `/v1/migrate` + `/v1/migration-options`. Additive + backward-compatible.
-- **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry point stays strict https-only.
+- **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry points stay strict https-only.
 - **router: `latest_build.assets` — the release's downloadable installers, for the in-app updater (release-patterns task 07).** `/v1/update-check`'s `latest_build` carries each asset's `name` + `url` + optional `digest`; the router stays platform-agnostic. Additive + backward-compatible.
 - headless-migrator: the verify step cross-checks the committed agreement state (via the DNA's `get_opened_agreement_state`) against the fetched close package.
 - **headless-migrator: new Rust crate — the headless server-agent migration driver.** A `clap` + `ham` binary with four modes (`status`, `close-service`, `open-service`, `verify`), each probe-first and idempotent under systemd `Restart=on-failure`. Operates on an already-carried agent key.

@@ -1,6 +1,4 @@
 // Registry: the version-upgrade chain + per-DNA notary daemon endpoints.
-// Bundled with the Worker (imported JSON) or loaded from KV. The router
-// validates it once at load; an invalid registry is a hard startup error.
 
 export interface NotaryEntry {
   /** Cloudflare-Tunnel URL of a notary daemon serving this DNA, e.g. https://notary-1-v01.unyt.dev */
@@ -21,7 +19,7 @@ export interface DnaEntry {
   upgrades_from?: string;
   /** Proven forward destinations a close on this DNA may bind to (a mirror of the
    * on-chain GD `upgrade_targets`). Each must resolve to a descendant along the
-   * `upgrades_from` chain — written by the release registry generator. */
+   * `upgrades_from` chain. */
   upgrade_targets?: string[];
   /** M, a mirror of the on-chain GD `closing_threshold`: how many notary
    * attestations of a close on this DNA an open needs. Required with
@@ -72,12 +70,7 @@ export const SUPPORTED_REGISTRY_VERSION = 1;
 
 /** Options for [`Registry.load`]. */
 export interface RegistryLoadOptions {
-  /**
-   * Local-testnet mode ONLY (documentation/specs/local-testnet/): admit `http://` notary URLs so a
-   * local registry can name plain-http daemons on container IPs. The deployed Worker entry point
-   * (`index.ts`) never passes this — it exists solely for the local entry point (`index.local.ts`),
-   * so the relaxation is structurally absent from a deployed bundle rather than merely defaulted off.
-   */
+  /** For local-testnet daemons on container IPs. A deployed entry must never pass it. */
   allowHttpNotaries?: boolean;
 }
 
@@ -95,7 +88,7 @@ export class Registry {
     this.successorOfHash = successorOfHash;
   }
 
-  /** Parse + validate. Throws on any invariant violation (caller fails the Worker health). */
+  /** Parse + validate. Throws on any invariant violation. */
   static load(raw: RawRegistry, opts?: RegistryLoadOptions): Registry {
     if (raw.version !== SUPPORTED_REGISTRY_VERSION) {
       throw new Error(
@@ -177,7 +170,6 @@ export class Registry {
         successorOfHash.set(d.upgrades_from, d.dna_hash);
       }
     }
-    // no cycles — walk each chain back to a root
     const byHash = new Map(raw.dnas.map((d) => [d.dna_hash, d]));
     for (const start of raw.dnas) {
       const path = new Set<string>();
@@ -190,8 +182,7 @@ export class Registry {
         cur = cur.upgrades_from ? byHash.get(cur.upgrades_from) : undefined;
       }
     }
-    // Each upgrade_target must resolve to a known DNA that is a forward descendant, and be
-    // duplicate-free — a generator bug must fail at startup, never at request time.
+    // A generator bug must fail at startup, never at request time.
     for (const d of raw.dnas) {
       if (!d.upgrade_targets) continue;
       const descendants = new Set<string>();
@@ -227,7 +218,7 @@ export class Registry {
     return this.byHash.get(dnaHash);
   }
 
-  /** The immediate successor of `fromDnaHash` — the entry that upgrades_from it, if any. */
+  /** The entry that upgrades_from `fromDnaHash`, if any. */
   successorOf(fromDnaHash: string): DnaEntry | undefined {
     const h = this.successorOfHash.get(fromDnaHash);
     return h ? this.byHash.get(h) : undefined;
@@ -248,7 +239,7 @@ export class Registry {
    * forward chain that is both listed in its `upgrade_targets` and `published` (customer-visible).
    * A multi-version skip lands here in one hop. An unpublished target is skipped as if absent, so
    * this falls back to the nearest published proven target (and returns `undefined` when none is
-   * published yet) — the customers-last gate that keeps a routable-but-unpublished successor out of
+   * published yet). This customers-last gate keeps a routable but unpublished successor out of
    * the /v1/update-check banner. `undefined` when there is no proven target. */
   furthestTargetOf(currentDnaHash: string): DnaEntry | undefined {
     const current = this.byHash.get(currentDnaHash);
@@ -262,8 +253,8 @@ export class Registry {
     return undefined;
   }
 
-  /** Entries whose `upgrade_targets` include `toDnaHash` — the candidate sources
-   * a chain could have closed toward `toDnaHash` from (registry insertion order). */
+  /** The candidate sources a chain could have closed toward `toDnaHash` from, in registry
+   * insertion order. */
   sourcesReaching(toDnaHash: string): SourceEntry[] {
     return [...this.byHash.values()].filter((entry): entry is SourceEntry =>
       reachesTarget(entry, toDnaHash),

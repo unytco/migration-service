@@ -8,6 +8,7 @@
     "dev": "wrangler dev",
     "dev:local": "node -e \"const fs=require('fs');fs.existsSync('registry.local.json')||fs.copyFileSync('registry.local.example.json','registry.local.json');fs.existsSync('.dev.vars')||fs.copyFileSync('.dev.vars.example','.dev.vars')\" && wrangler dev -c wrangler.local.toml",
     "deploy": "wrangler deploy",
+    "deploy:mainnet": "wrangler deploy -c wrangler.mainnet.toml",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

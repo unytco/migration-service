@@ -10,11 +10,11 @@ export interface Env {
   /** Cloudflare Access service-token credentials (so only this Worker reaches the daemon). */
   CF_ACCESS_CLIENT_ID?: string;
   CF_ACCESS_CLIENT_SECRET?: string;
-  /** Optional read-only GitHub token for /v1/update-check's build lookup — unauthenticated by
-   * default; set only to raise the rate ceiling if the live-lineage count ever grows. */
+  /** Optional read-only GitHub token for /v1/update-check's build lookup. Set it only to raise
+   * the rate ceiling. */
   GITHUB_TOKEN?: string;
-  /** Local-testnet only (never set on the deployed Worker): point the build axis at a local
-   * artifact server speaking the GitHub releases JSON shape. See builds.ts `releasesApi`. */
+  /** The releases listing of this network's app, in GitHub's releases JSON shape. When unset,
+   * update checks carry no `latest_build`. */
   GITHUB_RELEASES_URL?: string;
 }
 
