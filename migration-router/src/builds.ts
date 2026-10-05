@@ -140,8 +140,10 @@ export async function publishedBuilds(
       return bail(page, String(err));
     }
     if (!Array.isArray(batch)) return bail(page, "not a JSON array");
-    const releases = batch as GhRelease[];
-    for (const r of releases) {
+    const releases: unknown[] = batch;
+    for (const entry of releases) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const r = entry as GhRelease;
       // A listing read with a token that has push access includes drafts.
       if (r.draft === true || r.prerelease === true) continue;
       const tag = typeof r.tag_name === "string" ? r.tag_name : "";

@@ -271,6 +271,25 @@ describe("publishedBuilds", () => {
     expect(calls).toBe(afterFirst); // no re-fetch — earlier pages not re-requested
   });
 
+  it("skips listing entries that are not objects (never throws)", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() =>
+        jsonResp(200, [
+          null,
+          7,
+          "v0.93.1",
+          {
+            tag_name: "v0.93.2",
+            html_url:
+              "https://github.com/unytco/unyt-sandbox/releases/tag/v0.93.2",
+          },
+        ]),
+      ),
+      ENV,
+    );
+    expect(builds.map((b) => b.version)).toEqual(["0.93.2"]);
+  });
+
   it("returns [] when the upstream fetch throws", async () => {
     const boom = (async () => {
       throw new TypeError("down");
