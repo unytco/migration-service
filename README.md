@@ -9,7 +9,7 @@ Two components:
   | Network | Config | Registry | Releases |
   | --- | --- | --- | --- |
   | TestNet | `wrangler.toml` | `registry.json` | `unytco/unyt-sandbox` |
-  | MainNet | `wrangler.mainnet.toml` | `registry.mainnet.json` | `unytco/unyt` |
+  | MainNet | `wrangler.mainnet.toml` | `registry.mainnet.json` | `unytco/unyt-release` |
 
 - **`notary-daemon/`**: a Rust `axum` + [`ham`](https://github.com/unytco/ham) service, run beside a Holochain conductor whose cell is a closing notary on the old (from-DNA) network. Its `/v2/attest-close` calls the alliance `notary_attest_close` zome fn, which reads the agent's closed chain and signs the close, and serves the package carrying that one signature; the router combines M of them. Attesting commits nothing, and the daemon signs its own zome calls through the node's lair, so connecting commits nothing either. Exposed to the router via a Cloudflare Tunnel; healthy only when both the conductor and its app cell answer.
 

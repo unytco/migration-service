@@ -4,7 +4,8 @@ import type { Env } from "../src/notary";
 import testnet from "../registry.json";
 import { releasesResp } from "./github-fixtures";
 
-const UNYT_RELEASES = "https://api.github.com/repos/unytco/unyt/releases";
+const UNYT_RELEASES =
+  "https://api.github.com/repos/unytco/unyt-release/releases";
 
 const ENV = { GITHUB_RELEASES_URL: UNYT_RELEASES } as Env;
 
@@ -23,7 +24,7 @@ function stubReleases(tags: string[]): string[] {
     seen.push(typeof input === "string" ? input : input.toString());
     return releasesResp(
       tags.map((tag) => ({ tag })),
-      "unytco/unyt",
+      "unytco/unyt-release",
     );
   });
   return seen;
@@ -45,7 +46,8 @@ describe("MainNet router, empty registry", () => {
       has_upgrade: false,
       latest_build: {
         version: "1.1.5",
-        release_url: "https://github.com/unytco/unyt/releases/tag/v1.1.5",
+        release_url:
+          "https://github.com/unytco/unyt-release/releases/tag/v1.1.5",
         assets: [],
       },
     });

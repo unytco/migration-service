@@ -157,7 +157,7 @@ describe("publishedBuilds", () => {
 
   it("two releases URLs keep two Worker cache entries, so neither serves the other's builds", async () => {
     const sandbox = "https://api.github.com/repos/unytco/unyt-sandbox/releases";
-    const unyt = "https://api.github.com/repos/unytco/unyt/releases";
+    const unyt = "https://api.github.com/repos/unytco/unyt-release/releases";
     let calls = 0;
     const fetch = (async (input: RequestInfo | URL) => {
       calls++;

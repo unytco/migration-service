@@ -7,7 +7,7 @@ main = "src/index.mainnet.ts"
 compatibility_date = "2024-12-30"
 
 [vars]
-GITHUB_RELEASES_URL = "https://api.github.com/repos/unytco/unyt/releases"
+GITHUB_RELEASES_URL = "https://api.github.com/repos/unytco/unyt-release/releases"
 
 [observability]
 enabled = true

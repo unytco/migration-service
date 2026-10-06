@@ -27,7 +27,7 @@ const NETWORKS: Network[] = [
     config: "wrangler.mainnet.toml",
     name: "migration-router-mainnet",
     entry: "src/index.mainnet.ts",
-    repo: "unytco/unyt",
+    repo: "unytco/unyt-release",
     registry: mainnetRegistry,
   },
   {
