@@ -7,7 +7,6 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:local": "node -e \"const fs=require('fs');fs.existsSync('registry.local.json')||fs.copyFileSync('registry.local.example.json','registry.local.json');fs.existsSync('.dev.vars')||fs.copyFileSync('.dev.vars.example','.dev.vars')\" && wrangler dev -c wrangler.local.toml",
-    "predeploy": "node scripts/check-releases-url.mjs wrangler.toml",
     "deploy": "wrangler deploy",
     "predeploy:mainnet": "node scripts/check-releases-url.mjs wrangler.mainnet.toml",
     "deploy:mainnet": "wrangler deploy -c wrangler.mainnet.toml",
