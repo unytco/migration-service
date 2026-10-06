@@ -1,6 +1,6 @@
 [package]
 name = "migration-notary"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Notary daemon for unyt DNA migration: attests an agent's closed chain from the notary's own conductor, for the migration-service to combine into the package that agent opens its successor with"
 license = "CAL-1.0"

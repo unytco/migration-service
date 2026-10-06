@@ -6,23 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-06
+
 ### Added
 
 - router: the Unyt app's update check offers only Unyt builds, never Unyt Sandbox ones.
-- **Tag-driven release workflow.** Pushing a semver tag builds both Rust binaries and publishes them — each with a `.sha256` — as fixed-name GitHub release assets. The tag must match the version in both crates' `Cargo.toml`; they release together, so one tag is one tested pairing of the close-side and open-side halves of a migration.
-- `--version` on `headless-migrator` and `migration-notary`, derived from the crate version. The release assets have fixed filenames, so this is how a deployed binary identifies itself.
-- **router: per-entry `published` visibility gate — customers-last migration surfacing.** Registry `DnaEntry` gains an optional `published` boolean (absent = unpublished): honored by `/v1/update-check`, ignored by `/v1/migrate` + `/v1/migration-options`. Additive + backward-compatible.
-- **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry points stay strict https-only.
-- **router: `latest_build.assets` — the release's downloadable installers, for the in-app updater (release-patterns task 07).** `/v1/update-check`'s `latest_build` carries each asset's `name` + `url` + optional `digest`; the router stays platform-agnostic. Additive + backward-compatible.
-- headless-migrator: the verify step cross-checks the committed agreement state (via the DNA's `get_opened_agreement_state`) against the fetched close package.
-- **headless-migrator: new Rust crate — the headless server-agent migration driver.** A `clap` + `ham` binary with four modes (`status`, `close-service`, `open-service`, `verify`), each probe-first and idempotent under systemd `Restart=on-failure`. Operates on an already-carried agent key.
-- headless-migrator: wired into the repo `flake.nix`/musl toolchain and CI (`ci.yml` `agent` job: fmt + clippy + test, mirroring `notary-daemon`).
-- notary-daemon: build-only `flake.nix` providing the musl cross-toolchain for the static deploy binary.
-- router: `GET /v1/update-check?current_dna_hash=` — forward successor lookup so an app can detect a newer network and get its download link
-- router: optional `release_url` field on registry DNA entries (surfaced by `/v1/update-check`)
-- **router: two-channel `/v1/update-check` — a `latest_build` answer beside the migration answer.** An optional `app_version` resolves the newest published GitHub release on the caller's lineage, so a UI-only release is detectable. Additive + backward-compatible.
-- notary-daemon: gated live round-trip test (`tests/live_roundtrip.rs`, `cargo test --test live_roundtrip -- --ignored`) — the real daemon + `ham` against a live conductor with a closed agent.
-- **Skip-version migration routing + single-landing close target (M14).** Registry entries carry `upgrade_targets`; reachability is computed over that forward graph across `/v1/update-check`, `/v1/migration-options` and `/v1/migrate`. The headless close binds to one configured successor (`MIGRATION_AGENT_TO_DNA`, required).
 
 ### Changed
 
@@ -40,13 +28,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Breaking.** Both services connect to the conductor through lair, so connecting no longer writes to the agent's chain, and a service that cannot sign through lair exits at startup. An existing deployment fails until its environment sets `MIGRATION_AGENT_LAIR_URL` / `MIGRATION_AGENT_LAIR_PASSPHRASE` (`MIGRATION_NOTARY_*` for the daemon). `MIGRATION_AGENT_ALLOW_CAP_GRANT_SIGNING` (`MIGRATION_NOTARY_*` for the daemon) set to `1`, `true`, `yes` or `on` is the one exception: it restores the capability-grant path, which writes to the chain on connect and corrupts a chain that is already closed. Neither binary loads a `.env` file any more: the environment is the only source.
 - **Breaking.** The open service names the network it joins and reads the joining service's roles-keyed provision, and a refusal it can never act on ends the run instead of retrying forever. An existing deployment fails at startup until its environment sets `MIGRATION_AGENT_JOINING_SERVICE_HAPP_ID` to that service's static happ id.
 - headless-migrator: an open service whose carried key has already joined reconnects for its membrane proof.
+- headless-migrator: a debt on any unit blocks a close, not just the base one (`rave_engine` 0.10.0).
+- headless-migrator: a global definition outside its validity window waits under the bounded deadline rather than retrying unbounded.
+- Both crates pin `ham` to an exact revision (`4e10636`) rather than its `main` branch, so a change to it reaches them only in a commit that names the new revision.
+
+### Fixed
+
+- **A migrating agent keeps its agreement credit limit (`rave_engine` 0.11.0 in both binaries).** A close carrying a per-agreement `credit_limit` lost it passing through the migrator and the notary daemon, and the notary's DNA then refused to sign the close as a state mismatch.
+
+- headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
+
+## [0.1.0] - 2026-08-20
+
+### Added
+
+- **Tag-driven release workflow.** Pushing a semver tag builds both Rust binaries and publishes them — each with a `.sha256` — as fixed-name GitHub release assets. The tag must match the version in both crates' `Cargo.toml`; they release together, so one tag is one tested pairing of the close-side and open-side halves of a migration.
+- `--version` on `headless-migrator` and `migration-notary`, derived from the crate version. The release assets have fixed filenames, so this is how a deployed binary identifies itself.
+- **router: per-entry `published` visibility gate — customers-last migration surfacing.** Registry `DnaEntry` gains an optional `published` boolean (absent = unpublished): honored by `/v1/update-check`, ignored by `/v1/migrate` + `/v1/migration-options`. Additive + backward-compatible.
+- **router: local-testnet mode (local-testnet task 02).** A local entry point (`src/index.local.ts`, `npm run dev:local`) loads a gitignored `registry.local.json` admitting `http://` notaries and an optional `GITHUB_RELEASES_URL`; the deployed entry points stay strict https-only.
+- **router: `latest_build.assets` — the release's downloadable installers, for the in-app updater (release-patterns task 07).** `/v1/update-check`'s `latest_build` carries each asset's `name` + `url` + optional `digest`; the router stays platform-agnostic. Additive + backward-compatible.
+- headless-migrator: the verify step cross-checks the committed agreement state (via the DNA's `get_opened_agreement_state`) against the fetched close package.
+- **headless-migrator: new Rust crate — the headless server-agent migration driver.** A `clap` + `ham` binary with four modes (`status`, `close-service`, `open-service`, `verify`), each probe-first and idempotent under systemd `Restart=on-failure`. Operates on an already-carried agent key.
+- headless-migrator: wired into the repo `flake.nix`/musl toolchain and CI (`ci.yml` `agent` job: fmt + clippy + test, mirroring `notary-daemon`).
+- notary-daemon: build-only `flake.nix` providing the musl cross-toolchain for the static deploy binary.
+- router: `GET /v1/update-check?current_dna_hash=` — forward successor lookup so an app can detect a newer network and get its download link
+- router: optional `release_url` field on registry DNA entries (surfaced by `/v1/update-check`)
+- **router: two-channel `/v1/update-check` — a `latest_build` answer beside the migration answer.** An optional `app_version` resolves the newest published GitHub release on the caller's lineage, so a UI-only release is detectable. Additive + backward-compatible.
+- notary-daemon: gated live round-trip test (`tests/live_roundtrip.rs`, `cargo test --test live_roundtrip -- --ignored`) — the real daemon + `ham` against a live conductor with a closed agent.
+- **Skip-version migration routing + single-landing close target (M14).** Registry entries carry `upgrade_targets`; reachability is computed over that forward graph across `/v1/update-check`, `/v1/migration-options` and `/v1/migrate`. The headless close binds to one configured successor (`MIGRATION_AGENT_TO_DNA`, required).
+
+### Changed
+
 - **Operators:** a droplet can be provisioned straight from a release — `https://github.com/unytco/migration-service/releases/latest/download/migration-notary` — with no repo checkout and no build on the operator's host. `latest` resolves to the newest non-prerelease, so an `-rc` tag is not picked up by a droplet pointed at it.
 - `[profile.release]` sets `strip = "symbols"` in both crates, so a release build produces the same binary whether it comes from CI or an operator's host.
 - **Operators:** stripped binaries no longer carry function names in panic backtraces. Ordinary failures are unaffected — errors still print their full `anyhow` context chain.
-- headless-migrator: a debt on any unit blocks a close, not just the base one (`rave_engine` 0.10.0).
-- headless-migrator: a global definition outside its validity window waits under the bounded deadline rather than retrying unbounded.
 - **Upgrade to Holochain 0.7** (`headless-migrator` + `notary-daemon`): exact pins `holochain_client =0.9.0`, `holo_hash` / `holochain_types` `=0.7.0`, `hdi =0.8.0`; holonix moves `main-0.6` → `main-0.7`. CI now also fires on `develop-0.7`.
-- Both crates pin `ham` to an exact revision (`4e10636`) rather than its `main` branch, so a change to it reaches them only in a commit that names the new revision.
 - **Operational consequence — close and open need binaries from different branches for the 0.6→0.7 hop:** the close is built from `develop` (0.6 conductor), the open from `develop-0.7`. Config-level in `automation` (`.migrate.migration_service_repo`); no deploy change here.
 - **router: client-fault responses now use `bad_request`, not `internal`** — malformed-JSON `POST /v1/migrate` and unmatched routes return `400` / `404 bad_request`; statuses + messages unchanged.
 - **CI/deploy: every GitHub Actions `uses:` is pinned to an immutable commit SHA with `persist-credentials: false`, and CI now runs on pull requests to `main` as well as `develop`.** Router `compatibility_date` bumped `2024-09-23 → 2024-12-30`.
@@ -68,10 +84,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - router: registry now rejects a fork (two DNAs upgrading from the same predecessor) so forward lookup is unambiguous
 
 ### Fixed
-
-- **A migrating agent keeps its agreement credit limit (`rave_engine` 0.11.0 in both binaries).** A close carrying a per-agreement `credit_limit` lost it passing through the migrator and the notary daemon, and the notary's DNA then refused to sign the close as a state mismatch.
-
-- headless-migrator: a reply it cannot decode stops the run instead of retrying forever, and no longer reports it as an exhausted notary list. A reply to a write still retries.
 
 - **router: `/v1/migrate` is now fully fail-closed on the served close's `source_dna_hash`** — the guard rejects (`500 internal`) whenever the normalized source ≠ the queried DNA, including `undefined`, and `normalizeDnaHashB64` accepts only a 39-byte HoloHash array.
 - **headless-migrator: the migrating install now applies the network's DNA properties — the cell lands on the network's DNA instead of an isolated one.** Carried from the joining service's `dna_modifiers.properties` as order-preserving `YamlProperties`; the open now hard-stops on a cell that isn't on the `to_dna` or the carried key.
