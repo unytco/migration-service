@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  cfCache,
   compareVersions,
   lineageOf,
   lineageOfReleaseUrl,
@@ -9,37 +10,37 @@ import {
   type CacheLike,
 } from "../src/builds";
 import type { Env, FetchLike } from "../src/notary";
+import { jsonResp, releasesResp } from "./github-fixtures";
 
-const ENV: Env = { MIGRATION_NOTARY_BEARER_TOKEN: "test-token" };
+const ENV: Env = {
+  MIGRATION_NOTARY_BEARER_TOKEN: "test-token",
+  GITHUB_RELEASES_URL:
+    "https://api.github.com/repos/unytco/unyt-sandbox/releases",
+};
 
-const jsonResp = (status: number, b: unknown) =>
-  new Response(JSON.stringify(b), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+function mapCache(): CacheLike & { store: Map<string, Build[]> } {
+  const store = new Map<string, Build[]>();
+  return {
+    store,
+    async get(k) {
+      return store.get(k) ?? null;
+    },
+    async set(k, v) {
+      store.set(k, v);
+    },
+  };
+}
 
-const releasesResp = (
-  rels: Array<{
-    tag: string;
-    draft?: boolean;
-    prerelease?: boolean;
-    assets?: Array<{ name: string; url: string; digest?: string }>;
-  }>,
-) =>
-  jsonResp(
-    200,
-    rels.map((r) => ({
-      tag_name: r.tag,
-      draft: r.draft ?? false,
-      prerelease: r.prerelease ?? false,
-      html_url: `https://github.com/unytco/unyt-sandbox/releases/tag/${r.tag}`,
-      assets: (r.assets ?? []).map((a) => ({
-        name: a.name,
-        browser_download_url: a.url,
-        ...(a.digest ? { digest: a.digest } : {}),
-      })),
-    })),
-  );
+async function warnsOf<T>(fragment: string, run: () => Promise<T>): Promise<T> {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const result = await run();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(fragment));
+    return result;
+  } finally {
+    warn.mockRestore();
+  }
+}
 
 const ghFetch = (make: () => Response): FetchLike =>
   (async () => make()) as FetchLike;
@@ -139,21 +140,60 @@ describe("publishedBuilds", () => {
     expect(newestOnLineage(builds, "0.93")?.version).toBe("0.93.7"); // found on page 2
   });
 
-  it("fetches from the GitHub releases API by default", async () => {
-    const seen: string[] = [];
-    const fetch = (async (input: RequestInfo | URL) => {
-      seen.push(typeof input === "string" ? input : input.toString());
-      return releasesResp([]);
+  it("reads no releases when GITHUB_RELEASES_URL is unset, and says so", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls++;
+      return releasesResp([{ tag: "v0.93.1" }]);
     }) as FetchLike;
-    await publishedBuilds(fetch, ENV);
-    expect(seen[0]).toMatch(
-      /^https:\/\/api\.github\.com\/repos\/unytco\/unyt-sandbox\/releases\?/,
+    const cache = mapCache();
+    const builds = await warnsOf("GITHUB_RELEASES_URL is unset", () =>
+      publishedBuilds(fetch, { ...ENV, GITHUB_RELEASES_URL: undefined }, cache),
     );
+    expect(builds).toEqual([]);
+    expect(calls).toBe(0);
+    expect(cache.store.size).toBe(0);
   });
 
-  it("GITHUB_RELEASES_URL points the build axis at a local artifact server", async () => {
-    // Local-testnet seam (an env the deployed Worker never sets): the override must
-    // speak the GitHub releases JSON shape — everything downstream is unchanged.
+  it("two releases URLs keep two Worker cache entries, so neither serves the other's builds", async () => {
+    const sandbox = "https://api.github.com/repos/unytco/unyt-sandbox/releases";
+    const unyt = "https://api.github.com/repos/unytco/unyt-release/releases";
+    let calls = 0;
+    const fetch = (async (input: RequestInfo | URL) => {
+      calls++;
+      const u = typeof input === "string" ? input : input.toString();
+      return releasesResp([
+        { tag: u.startsWith(unyt) ? "v1.0.2" : "v0.109.3" },
+      ]);
+    }) as FetchLike;
+    const stored = new Map<string, string>();
+    const cache = cfCache({
+      async match(req: Request) {
+        const hit = stored.get(req.url);
+        return hit === undefined ? undefined : new Response(hit);
+      },
+      async put(req: Request, resp: Response) {
+        stored.set(req.url, await resp.text());
+      },
+    } as unknown as Cache);
+    const versions = async (url: string) =>
+      (
+        await publishedBuilds(
+          fetch,
+          { ...ENV, GITHUB_RELEASES_URL: url },
+          cache,
+        )
+      ).map((b) => b.version);
+    for (let round = 0; round < 2; round++) {
+      expect(await versions(sandbox)).toEqual(["0.109.3"]);
+      expect(await versions(unyt)).toEqual(["1.0.2"]);
+    }
+    expect(calls).toBe(2);
+    expect(stored.size).toBe(2);
+    for (const key of stored.keys()) expect(new URL(key).search).toBe("");
+  });
+
+  it("reads the releases at GITHUB_RELEASES_URL, such as a local artifact server", async () => {
     const seen: string[] = [];
     const fetch = (async (input: RequestInfo | URL) => {
       seen.push(typeof input === "string" ? input : input.toString());
@@ -174,13 +214,26 @@ describe("publishedBuilds", () => {
     ]);
   });
 
-  it("returns [] on a non-2xx upstream (never throws)", async () => {
-    expect(
-      await publishedBuilds(
-        ghFetch(() => jsonResp(403, {})),
+  it("returns [] on a non-2xx upstream (never throws), and logs the URL and status", async () => {
+    const builds = await warnsOf(
+      `${ENV.GITHUB_RELEASES_URL} failed on page 1 (HTTP 404); latest_build is omitted`,
+      () =>
+        publishedBuilds(
+          ghFetch(() => jsonResp(404, {})),
+          ENV,
+        ),
+    );
+    expect(builds).toEqual([]);
+  });
+
+  it("returns [] on a body that is not a JSON array, and logs it", async () => {
+    const builds = await warnsOf("failed on page 1 (not a JSON array)", () =>
+      publishedBuilds(
+        ghFetch(() => jsonResp(200, { message: "moved" })),
         ENV,
       ),
-    ).toEqual([]);
+    );
+    expect(builds).toEqual([]);
   });
 
   it("negative-caches [] briefly on a total failure so a GitHub outage isn't re-hit every poll", async () => {
@@ -189,15 +242,7 @@ describe("publishedBuilds", () => {
       calls++;
       return jsonResp(503, {});
     }) as FetchLike;
-    const store = new Map<string, Build[]>();
-    const cache: CacheLike = {
-      async get(k) {
-        return store.get(k) ?? null;
-      },
-      async set(k, v) {
-        store.set(k, v);
-      },
-    };
+    const cache = mapCache();
     expect(await publishedBuilds(fetch, ENV, cache)).toEqual([]);
     expect(await publishedBuilds(fetch, ENV, cache)).toEqual([]); // served from the negative cache
     expect(calls).toBe(1); // GitHub hit once, not on every call
@@ -214,16 +259,11 @@ describe("publishedBuilds", () => {
       const page = /[?&]page=(\d+)/.exec(u)?.[1] ?? "1";
       return page === "1" ? releasesResp(page1) : jsonResp(503, {}); // page 2 persistently fails
     }) as FetchLike;
-    const store = new Map<string, Build[]>();
-    const cache: CacheLike = {
-      async get(k) {
-        return store.get(k) ?? null;
-      },
-      async set(k, v) {
-        store.set(k, v);
-      },
-    };
-    const first = await publishedBuilds(fetch, ENV, cache); // page 1 ok, page 2 fails → partial
+    const cache = mapCache();
+    const first = await warnsOf(
+      "failed on page 2 (HTTP 503); latest_build is partial",
+      () => publishedBuilds(fetch, ENV, cache),
+    );
     expect(newestOnLineage(first, "0.95")?.version).toBe("0.95.99");
     const afterFirst = calls; // page 1 + page 2
     const second = await publishedBuilds(fetch, ENV, cache); // served from the partial cache
@@ -231,11 +271,34 @@ describe("publishedBuilds", () => {
     expect(calls).toBe(afterFirst); // no re-fetch — earlier pages not re-requested
   });
 
+  it("skips listing entries that are not objects (never throws)", async () => {
+    const builds = await publishedBuilds(
+      ghFetch(() =>
+        jsonResp(200, [
+          null,
+          7,
+          "v0.93.1",
+          {
+            tag_name: "v0.93.2",
+            html_url:
+              "https://github.com/unytco/unyt-sandbox/releases/tag/v0.93.2",
+          },
+        ]),
+      ),
+      ENV,
+    );
+    expect(builds.map((b) => b.version)).toEqual(["0.93.2"]);
+  });
+
   it("returns [] when the upstream fetch throws", async () => {
     const boom = (async () => {
       throw new TypeError("down");
     }) as FetchLike;
-    expect(await publishedBuilds(boom, ENV)).toEqual([]);
+    expect(
+      await warnsOf("failed on page 1 (TypeError: down)", () =>
+        publishedBuilds(boom, ENV),
+      ),
+    ).toEqual([]);
   });
 
   it("serves a cache hit without fetching, and populates the cache on a miss", async () => {
@@ -244,15 +307,7 @@ describe("publishedBuilds", () => {
       calls++;
       return releasesResp([{ tag: "v0.3.1" }]);
     }) as FetchLike;
-    const store = new Map<string, Build[]>();
-    const cache: CacheLike = {
-      async get(k) {
-        return store.get(k) ?? null;
-      },
-      async set(k, v) {
-        store.set(k, v);
-      },
-    };
+    const cache = mapCache();
     const first = await publishedBuilds(fetch, ENV, cache);
     const second = await publishedBuilds(fetch, ENV, cache);
     expect(calls).toBe(1);

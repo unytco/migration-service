@@ -1,13 +1,8 @@
-// The Worker body, shared by both entry points: index.ts (deployed — strict
-// registry load) and index.local.ts (local testnet — http notaries admitted).
-// Wires a validated registry + env into the pure handlers, adds CORS, and
-// routes by method + path.
-//
-// Rate limiting for POST /v1/migrate is enforced at the Cloudflare zone level
-// (a rate-limiting rule on the route), not in Worker code — so no Durable Object
-// is needed. See unyt's internal migration-router.md spec § Auth / rate-limit.
-
-import { Registry, type RawRegistry } from "./registry";
+import {
+  Registry,
+  type RawRegistry,
+  type RegistryLoadOptions,
+} from "./registry";
 import { errorJson } from "./errors";
 import type { Env } from "./notary";
 import {
@@ -31,12 +26,9 @@ function withCors(resp: Response): Response {
   return new Response(resp.body, { status: resp.status, headers });
 }
 
-// B7: the shipped registry still carries the placeholder DNA hash + stub notary
-// URL. Log an un-provisioned line at startup so a mis-deploy of the placeholder
-// to a real environment is obvious in the logs.
 const REGISTRY_PLACEHOLDER = "uhC0kREPLACE_WITH_v0_1_DNA_HASH";
 
-export function warnIfUnprovisioned(raw: RawRegistry): void {
+function warnIfUnprovisioned(raw: RawRegistry): void {
   if (raw.dnas.some((d) => d.dna_hash === REGISTRY_PLACEHOLDER)) {
     console.warn(
       "migration-router: registry.json is UN-PROVISIONED — still contains the " +
@@ -46,8 +38,14 @@ export function warnIfUnprovisioned(raw: RawRegistry): void {
   }
 }
 
-/** Build the Worker export around an already-validated registry. */
-export function createWorker(registry: Registry) {
+/** Call it at module load, so a bad registry fails the Worker before it serves. */
+export function workerFor(raw: RawRegistry, opts?: RegistryLoadOptions) {
+  const registry = Registry.load(raw, opts);
+  warnIfUnprovisioned(raw);
+  return createWorker(registry);
+}
+
+function createWorker(registry: Registry) {
   return {
     async fetch(request: Request, env: Env): Promise<Response> {
       if (request.method === "OPTIONS") {
@@ -67,8 +65,6 @@ export function createWorker(registry: Registry) {
           );
         }
         if (request.method === "GET" && pathname === "/v1/update-check") {
-          // The Cache API lives only in the Worker runtime; in the node unit env it's absent, so the
-          // shield is simply skipped (correctness is unchanged — it only bounds GitHub traffic).
           const buildCache =
             typeof caches !== "undefined" ? cfCache(caches.default) : undefined;
           return withCors(
@@ -82,6 +78,9 @@ export function createWorker(registry: Registry) {
             ),
           );
         }
+        // POST /v1/migrate has no rate limit in Worker code. Each router's route needs a
+        // Cloudflare zone rate-limiting rule (unyt's internal migration-router.md spec
+        // § Auth / rate-limit).
         if (request.method === "POST" && pathname === "/v1/migrate") {
           let body: MigrateBody;
           try {

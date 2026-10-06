@@ -1,0 +1,13 @@
+# No workflow deploys this Worker.
+# Before registry.mainnet.json names a notary, set the secrets listed in wrangler.toml
+# on this Worker: `wrangler secret put <NAME> -c wrangler.mainnet.toml`.
+
+name = "migration-router-mainnet"
+main = "src/index.mainnet.ts"
+compatibility_date = "2024-12-30"
+
+[vars]
+GITHUB_RELEASES_URL = "https://api.github.com/repos/unytco/unyt-release/releases"
+
+[observability]
+enabled = true
