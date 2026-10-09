@@ -23,6 +23,10 @@ const CLOSED: &str = "Failed to probe app_info: Websocket error: Websocket close
 const REFUSED: &str = "Failed to connect to admin interface: Websocket error: IO error: \
                        Connection refused (os error 111)";
 const REQUEST_TIMEOUT: &str = "Failed to call zome: Websocket error: Timeout";
+/// A signed call once the lair this connection signs through has restarted.
+const LAIR_GONE: &str = r#"Failed to call zome: Unable to sign zome call: {"error":"BrokenPipe"}"#;
+/// The conductor answering that its own keystore failed under a host fn.
+const CONDUCTORS_KEYSTORE_FAILED: &str = r#"Failed to call zome: External API wire error: RibosomeError("KeystoreError: {\"error\":\"BrokenPipe\"}")"#;
 
 /// A connection to it answers until the next restart, as a websocket does.
 struct FakeConductor {
@@ -32,6 +36,8 @@ struct FakeConductor {
     connect_takes_ms: AtomicU64,
     closes_new_connections: AtomicBool,
     times_out: AtomicBool,
+    lair_restarts: AtomicU64,
+    keystore_fails: AtomicBool,
     holds_whoami: AtomicBool,
     release_whoami: Notify,
     connects: AtomicUsize,
@@ -47,6 +53,8 @@ impl FakeConductor {
             connect_takes_ms: AtomicU64::new(100),
             closes_new_connections: AtomicBool::new(false),
             times_out: AtomicBool::new(false),
+            lair_restarts: AtomicU64::new(0),
+            keystore_fails: AtomicBool::new(false),
             holds_whoami: AtomicBool::new(false),
             release_whoami: Notify::new(),
             connects: AtomicUsize::new(0),
@@ -72,6 +80,7 @@ impl FakeConductor {
         }
         Ok(Connection {
             opened_at,
+            lair_at_open: self.lair_restarts.load(SeqCst),
             conductor: self,
         })
     }
@@ -84,6 +93,7 @@ impl FakeConductor {
 struct Connection {
     conductor: Arc<FakeConductor>,
     opened_at: u64,
+    lair_at_open: u64,
 }
 
 impl Connection {
@@ -96,6 +106,16 @@ impl Connection {
         }
         Ok(())
     }
+
+    fn answer_signed(&self) -> anyhow::Result<()> {
+        if self.conductor.lair_restarts.load(SeqCst) != self.lair_at_open {
+            anyhow::bail!(LAIR_GONE);
+        }
+        if self.conductor.keystore_fails.load(SeqCst) {
+            anyhow::bail!(CONDUCTORS_KEYSTORE_FAILED);
+        }
+        self.answer()
+    }
 }
 
 #[async_trait]
@@ -105,7 +125,7 @@ impl Conductor for Connection {
     }
 
     async fn notary_attest_close(&self, _: AgentPubKey) -> anyhow::Result<AttestCloseResponse> {
-        self.answer()?;
+        self.answer_signed()?;
         Ok(AttestCloseResponse::NoCloseFound)
     }
 
@@ -113,7 +133,7 @@ impl Conductor for Connection {
         if self.conductor.holds_whoami.load(SeqCst) {
             self.conductor.release_whoami.notified().await;
         }
-        self.answer()?;
+        self.answer_signed()?;
         Ok(AgentPubKey::from_raw_36(vec![9; 36]))
     }
 }
@@ -342,4 +362,37 @@ async fn healthz_answers_again_after_a_restart_and_keeps_the_cause_out_of_its_bo
 
     conductor.down.store(false, SeqCst);
     assert_eq!(healthz(&daemon).await.0, StatusCode::OK);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lair_restart_under_a_running_conductor_is_answered_on_a_new_connection() {
+    let (conductor, daemon) = connected().await;
+    conductor.lair_restarts.fetch_add(1, SeqCst);
+
+    daemon.ping().await.unwrap();
+    assert_eq!(
+        conductor.connects(),
+        1,
+        "an unsigned call still answers on the old connection"
+    );
+    for call in EVERY_CALL {
+        call.on(&daemon)
+            .await
+            .unwrap_or_else(|e| panic!("{call:?}: {e:#}"));
+    }
+    assert_eq!(conductor.connects(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_conductors_own_keystore_failing_does_not_reconnect() {
+    let (conductor, daemon) = connected().await;
+    conductor.keystore_fails.store(true, SeqCst);
+
+    let err = format!("{:#}", daemon.whoami().await.unwrap_err());
+    assert!(err.contains("KeystoreError"), "{err}");
+    assert_eq!(
+        conductor.connects(),
+        1,
+        "the conductor answered, so the connection is good and a new one would not help"
+    );
 }
