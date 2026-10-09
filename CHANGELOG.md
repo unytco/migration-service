@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- notary-daemon: the daemon answers again after its conductor restarts, without being restarted itself.
+
 ## [0.2.0] - 2026-10-06
 
 ### Added

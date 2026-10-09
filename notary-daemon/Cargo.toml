@@ -48,6 +48,7 @@ hdi = "=0.8.0"
 rave_engine = "=0.13.0"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Real-HTTP client for the gated live round-trip test only.

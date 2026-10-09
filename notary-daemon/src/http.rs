@@ -70,9 +70,11 @@ fn error_with_details(
 
 /// Healthy means BOTH the conductor and the app cell answer: a conductor can be
 /// reachable while its cell is wedged. The two failures carry distinct messages
-/// so ops can tell them apart.
+/// so ops can tell them apart. The endpoint is unauthenticated, so a failure's
+/// cause goes to the log rather than the body.
 async fn healthz(State(state): State<AppState>) -> Response {
     if let Err(e) = state.conductor.ping().await {
+        tracing::warn!(error = %format!("{e:#}"), "healthz: conductor unreachable");
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             codes::INTERNAL,
@@ -80,6 +82,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
         );
     }
     if let Err(e) = state.conductor.whoami().await {
+        tracing::warn!(error = %format!("{e:#}"), "healthz: app cell unresponsive");
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             codes::INTERNAL,
