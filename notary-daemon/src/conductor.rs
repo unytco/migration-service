@@ -14,8 +14,6 @@ use rave_engine::types::entries::migration::v0_2::AttestCloseResponse;
 
 use crate::config::Config;
 
-/// Every method must be safe to run twice: [`Reconnecting`] runs a call again
-/// on a new connection when the one it ran on had been closed.
 #[async_trait]
 pub trait Conductor: Send + Sync {
     async fn ping(&self) -> Result<()>;
@@ -148,7 +146,7 @@ impl<C: Conductor + 'static> Reconnecting<C> {
 
     async fn call<R, F, Fut>(&self, call: F) -> Result<R>
     where
-        F: Fn(Arc<C>) -> Fut,
+        F: FnOnce(Arc<C>) -> Fut,
         Fut: Future<Output = Result<R>>,
     {
         let (link, attempts) = {
@@ -159,20 +157,28 @@ impl<C: Conductor + 'static> Reconnecting<C> {
             };
             (link, state.attempts)
         };
-        let lost = match link {
+        match link {
             Some(connection) => match call(connection).await {
-                Err(lost) if ham::is_connection_error(&lost) => Some(format!("{lost:#}")),
-                answered => return answered,
+                Err(lost) if ham::is_connection_error(&lost) => {
+                    // The call may have run before its answer was lost, and a
+                    // request is one zome call, so this request keeps its
+                    // error and the next one gets the new connection.
+                    let _ = self.reconnect(attempts, Some(format!("{lost:#}"))).await;
+                    Err(lost)
+                }
+                answered => answered,
             },
-            None => None,
-        };
+            None => call(self.reconnect(attempts, None).await?).await,
+        }
+    }
+
+    async fn reconnect(&self, attempts: u64, lost: Option<String>) -> Result<Arc<C>> {
         // In a task of its own, so a caller that gives up does not cancel the
         // attempt the callers queued behind it are waiting on.
         let shared = self.shared.clone();
-        let connection = tokio::spawn(async move { shared.reconnect(attempts, lost).await })
+        tokio::spawn(async move { shared.reconnect(attempts, lost).await })
             .await
-            .context("reconnecting to the conductor")??;
-        call(connection).await
+            .context("reconnecting to the conductor")?
     }
 }
 
@@ -246,11 +252,8 @@ impl<C: Conductor + 'static> Conductor for Reconnecting<C> {
     }
 
     async fn notary_attest_close(&self, agent: AgentPubKey) -> Result<AttestCloseResponse> {
-        self.call(|c| {
-            let agent = agent.clone();
-            async move { c.notary_attest_close(agent).await }
-        })
-        .await
+        self.call(|c| async move { c.notary_attest_close(agent).await })
+            .await
     }
 
     async fn whoami(&self) -> Result<AgentPubKey> {
