@@ -224,6 +224,27 @@ async fn a_request_whose_answer_was_lost_makes_one_zome_call_and_the_next_is_ans
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_replacement_that_closes_under_its_first_call_is_replaced_before_the_next_request() {
+    let (conductor, daemon) = connected().await;
+    conductor.down.store(true, SeqCst);
+    conductor.restart();
+    let (status, _) = send(daemon.clone(), attest_req(Some(TOKEN))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(conductor.connects(), 2, "the reconnect failed");
+
+    conductor.down.store(false, SeqCst);
+    conductor.loses_next_answer.store(true, SeqCst);
+    let (status, body) = send(daemon.clone(), attest_req(Some(TOKEN))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(conductor.attestations_run(), 1, "one call, not run again");
+
+    let (status, body) = send(daemon.clone(), attest_req(Some(TOKEN))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(conductor.attestations_run(), 2);
+    assert_eq!(conductor.connects(), 4);
+}
+
+#[tokio::test(start_paused = true)]
 async fn while_the_conductor_is_down_each_request_tries_again_and_says_why_it_failed() {
     let (conductor, daemon) = connected().await;
     conductor.down.store(true, SeqCst);

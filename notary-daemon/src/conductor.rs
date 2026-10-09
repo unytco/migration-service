@@ -157,22 +157,24 @@ impl<C: Conductor + 'static> Reconnecting<C> {
             };
             (link, state.attempts)
         };
-        match link {
-            Some(connection) => match call(connection).await {
-                Err(lost) if ham::is_connection_error(&lost) => {
-                    // The call may have run before its answer was lost, and a
-                    // request is one zome call, so this request keeps its
-                    // error and the next one gets the new connection.
-                    let _ = self.reconnect(attempts, Some(format!("{lost:#}"))).await;
-                    Err(lost)
-                }
-                answered => answered,
-            },
-            None => call(self.reconnect(attempts, None).await?).await,
+        let (connection, attempts) = match link {
+            Some(connection) => (connection, attempts),
+            None => self.reconnect(attempts, None).await?,
+        };
+        match call(connection).await {
+            Err(lost) if ham::is_connection_error(&lost) => {
+                // The call may have run before its answer was lost, and a
+                // request is one zome call, so this request keeps its error
+                // and the next one gets the new connection.
+                let _ = self.reconnect(attempts, Some(format!("{lost:#}"))).await;
+                Err(lost)
+            }
+            answered => answered,
         }
     }
 
-    async fn reconnect(&self, attempts: u64, lost: Option<String>) -> Result<Arc<C>> {
+    /// The connection to use and the reconnect count it is current at.
+    async fn reconnect(&self, attempts: u64, lost: Option<String>) -> Result<(Arc<C>, u64)> {
         // In a task of its own, so a caller that gives up does not cancel the
         // attempt the callers queued behind it are waiting on.
         let shared = self.shared.clone();
@@ -187,14 +189,15 @@ impl<C: Conductor + 'static> Shared<C> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn link(&self) -> Result<Arc<C>> {
-        match &self.state().link {
-            Link::Open(connection) => Ok(connection.clone()),
+    fn link(&self) -> Result<(Arc<C>, u64)> {
+        let state = self.state();
+        match &state.link {
+            Link::Open(connection) => Ok((connection.clone(), state.attempts)),
             Link::ReconnectFailed(cause) => Err(reconnect_failed(cause)),
         }
     }
 
-    async fn reconnect(&self, seen: u64, lost: Option<String>) -> Result<Arc<C>> {
+    async fn reconnect(&self, seen: u64, lost: Option<String>) -> Result<(Arc<C>, u64)> {
         let connect = self.connect.lock().await;
         let attempted_meanwhile = self.state().attempts != seen;
         if attempted_meanwhile {
@@ -213,10 +216,10 @@ impl<C: Conductor + 'static> Shared<C> {
             })
             .map(Arc::new)
             .map_err(|e| Arc::<str>::from(format!("{e:#}")));
-        let failures = {
+        let (failures, attempts) = {
             let mut state = self.state();
             state.attempts += 1;
-            match &opened {
+            let failures = match &opened {
                 Ok(connection) => {
                     state.link = Link::Open(connection.clone());
                     std::mem::take(&mut state.failures_in_a_row)
@@ -226,12 +229,13 @@ impl<C: Conductor + 'static> Shared<C> {
                     state.failures_in_a_row = state.failures_in_a_row.saturating_add(1);
                     state.failures_in_a_row
                 }
-            }
+            };
+            (failures, state.attempts)
         };
         match opened {
             Ok(connection) => {
                 tracing::info!(failed_before = failures, "reconnected to the conductor");
-                Ok(connection)
+                Ok((connection, attempts))
             }
             Err(cause) => {
                 if failures >= ham::BackoffConfig::default().escalate_after {
