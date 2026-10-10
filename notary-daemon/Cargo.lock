@@ -1175,8 +1175,8 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "ham"
-version = "0.1.0"
-source = "git+https://github.com/unytco/ham.git?rev=73b4bdeec025f4697df9fb7064aa8538495e520b#73b4bdeec025f4697df9fb7064aa8538495e520b"
+version = "0.2.0"
+source = "git+https://github.com/unytco/ham.git?rev=caee6eeed9a0e2a96e163dd21db57869426decca#caee6eeed9a0e2a96e163dd21db57869426decca"
 dependencies = [
  "anyhow",
  "holochain_client",
