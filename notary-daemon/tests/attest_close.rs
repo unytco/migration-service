@@ -219,12 +219,9 @@ async fn healthz_is_503_naming_whichever_of_conductor_and_cell_is_down() {
         let (status, body) = send(conductor, healthz_req()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "internal");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected),
-            "{body}"
+        assert_eq!(
+            body["error"]["message"], expected,
+            "the cause stays in the log"
         );
     }
 }

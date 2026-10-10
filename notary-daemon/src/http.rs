@@ -78,7 +78,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             codes::INTERNAL,
-            format!("conductor unreachable: {e}"),
+            "conductor unreachable",
         );
     }
     if let Err(e) = state.conductor.whoami().await {
@@ -86,7 +86,7 @@ async fn healthz(State(state): State<AppState>) -> Response {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             codes::INTERNAL,
-            format!("app cell unresponsive: {e}"),
+            "app cell unresponsive",
         );
     }
     (

@@ -430,26 +430,33 @@ async fn a_call_in_flight_across_a_restart_fails_without_another_reconnect() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn healthz_answers_again_after_a_restart_and_keeps_reconnect_causes_out_of_its_body() {
+async fn healthz_answers_again_after_a_restart_and_its_body_carries_no_error_detail() {
     let (conductor, daemon) = connected().await;
     assert_eq!(send(daemon.clone(), healthz_req()).await.0, StatusCode::OK);
+    let unreachable_and_nothing_more = |(status, body): (StatusCode, serde_json::Value)| {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["message"], "conductor unreachable");
+        for detail in [
+            "Websocket",
+            "Connection refused",
+            "admin interface",
+            "reconnecting",
+        ] {
+            assert!(
+                !body.to_string().contains(detail),
+                "an unauthenticated endpoint names the failure, not its cause: {body}"
+            );
+        }
+    };
 
     conductor.restart();
-    assert_eq!(
-        send(daemon.clone(), healthz_req()).await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    unreachable_and_nothing_more(send(daemon.clone(), healthz_req()).await);
     assert_eq!(send(daemon.clone(), healthz_req()).await.0, StatusCode::OK);
 
     conductor.down.store(true, SeqCst);
     conductor.restart();
-    send(daemon.clone(), healthz_req()).await;
-    let (status, body) = send(daemon.clone(), healthz_req()).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        body["error"]["message"], "conductor unreachable: reconnecting to the conductor",
-        "an unauthenticated endpoint names the failure, not the node's paths and ports"
-    );
+    unreachable_and_nothing_more(send(daemon.clone(), healthz_req()).await);
+    unreachable_and_nothing_more(send(daemon.clone(), healthz_req()).await);
 
     conductor.down.store(false, SeqCst);
     assert_eq!(send(daemon.clone(), healthz_req()).await.0, StatusCode::OK);
