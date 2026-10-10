@@ -1,35 +1,20 @@
 //! HTTP↔zome mapping tests for `/v2/attest-close` + `/healthz`, driving the real
 //! `router()` with a mock `Conductor` (no Holochain conductor needed).
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
-
-use migration_notary::conductor::Conductor;
-use migration_notary::http::{router, AppState};
-
+use axum::http::StatusCode;
 use holo_hash::AgentPubKey;
-use rave_engine::types::entries::migration::v0_2::{
-    AgreementCarryForward, AttestCloseResponse, MigrationInitRequest, NotarySignature,
-    SummaryState, SummaryStatePayload, SummaryTx,
+use rave_engine::types::entries::migration::v0_2::{AttestCloseResponse, MigrationInitRequest};
+
+use common::{
+    agent, agent_b64, attest_req, attested, healthz_req, payload, request, send, send_raw,
+    signature, TOKEN,
 };
-use rave_engine::types::units::UnitMap;
-
-const TOKEN: &str = "test-token";
-
-/// A checksum-valid `AgentPubKeyB64`: a hand-typed literal fails its decode, so
-/// the handler would answer 400 before the conductor is consulted.
-fn agent_b64() -> String {
-    holo_hash::AgentPubKeyB64::from(agent()).to_string()
-}
-
-fn agent() -> AgentPubKey {
-    AgentPubKey::from_raw_32(vec![0u8; 32])
-}
+use migration_notary::conductor::Conductor;
 
 /// A conductor answering one attestation call as scripted, recording whom it
 /// was asked about, with independently failable `ping` / `whoami`.
@@ -90,102 +75,6 @@ impl Conductor for MockConductor {
         } else {
             anyhow::bail!("cell not responding")
         }
-    }
-}
-
-fn state(conductor: Arc<dyn Conductor>) -> AppState {
-    AppState {
-        conductor,
-        bearer_token: Arc::new(TOKEN.to_string()),
-    }
-}
-
-fn request(uri: &str, token: Option<&str>, body: String) -> Request<Body> {
-    let mut b = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json");
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
-    }
-    b.body(Body::from(body)).unwrap()
-}
-
-fn attest_req(token: Option<&str>) -> Request<Body> {
-    request(
-        "/v2/attest-close",
-        token,
-        format!(r#"{{"agent_pubkey":"{}"}}"#, agent_b64()),
-    )
-}
-
-fn healthz_req() -> Request<Body> {
-    Request::builder()
-        .method("GET")
-        .uri("/healthz")
-        .body(Body::empty())
-        .unwrap()
-}
-
-async fn send_raw(conductor: Arc<dyn Conductor>, req: Request<Body>) -> (StatusCode, Vec<u8>) {
-    let resp = router(state(conductor)).oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, bytes.to_vec())
-}
-
-async fn send(
-    conductor: Arc<dyn Conductor>,
-    req: Request<Body>,
-) -> (StatusCode, serde_json::Value) {
-    let (status, bytes) = send_raw(conductor, req).await;
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
-}
-
-fn payload() -> SummaryStatePayload {
-    SummaryStatePayload {
-        agent_pubkey: agent(),
-        source_dna_hash: holo_hash::DnaHash::from_raw_36(vec![1; 36]),
-        target_dna_hash: holo_hash::DnaHash::from_raw_36(vec![5; 36]),
-        closing_state: SummaryState {
-            opening_balance: Default::default(),
-            opening_carry_forward_units: Default::default(),
-            closing_balance: Default::default(),
-            closing_carry_forward_units: Default::default(),
-            summary_tx: SummaryTx {
-                proposals: vec![],
-                commitments: vec![],
-                accepts: vec![],
-                receipts: vec![],
-                rejects: vec![],
-                reclaims: vec![],
-                spend_links: vec![],
-            },
-            agreement_carry_forward: vec![AgreementCarryForward {
-                smart_agreement_hash: holo_hash::ActionHash::from_raw_36(vec![10; 36]),
-                last_execution_action_hash: holo_hash::ActionHash::from_raw_36(vec![11; 36]),
-                carryover: serde_json::json!({ "10": 1, "9": 2 }),
-                locked: None,
-                credit_limit: Some(UnitMap::from(vec![(0, "500")])),
-            }],
-        },
-        chain_top: holo_hash::ActionHash::from_raw_36(vec![2; 36]),
-    }
-}
-
-fn signature() -> NotarySignature {
-    NotarySignature {
-        notary: AgentPubKey::from_raw_36(vec![4; 36]),
-        signature: hdi::prelude::Signature([7u8; 64]),
-    }
-}
-
-fn attested() -> AttestCloseResponse {
-    AttestCloseResponse::Attested {
-        payload: payload(),
-        close_action: holo_hash::ActionHash::from_raw_36(vec![6; 36]),
-        notary_signature: signature(),
     }
 }
 
@@ -330,12 +219,9 @@ async fn healthz_is_503_naming_whichever_of_conductor_and_cell_is_down() {
         let (status, body) = send(conductor, healthz_req()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "internal");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected),
-            "{body}"
+        assert_eq!(
+            body["error"]["message"], expected,
+            "the cause stays in the log"
         );
     }
 }
