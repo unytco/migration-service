@@ -1,9 +1,9 @@
 //! The close service: a supervised loop that takes the old chain from open to
 //! closed and exits 0 only once it is closed. Probe-first and idempotent, so a
 //! restart (or reboot) re-enters from a fresh probe and never double-closes.
-//! Transient failures back off and re-probe (no overall deadline — systemd
-//! `Restart=on-failure` owns process death; this loop owns in-process
-//! progress).
+//! Transient failures back off and re-probe, with no overall deadline. A lost
+//! conductor or lair connection exits instead: a closed `ham` connection never
+//! reopens, so systemd `Restart=on-failure` resumes the service on a fresh one.
 
 use std::time::Duration;
 
@@ -26,21 +26,17 @@ enum CloseOutcome {
     Closed,
     /// A fault no retry fixes. Exit nonzero; the operator must act.
     HardStop(String),
-    /// A transient failure; back off and re-probe.
+    /// A failure a later pass can clear.
     Transient(anyhow::Error),
 }
 
-/// Run the close service to completion (or a hard stop). Returns `Ok(())` once
-/// the chain is closed; `Err` only on a hard stop the operator must resolve.
+/// Run the close service until the chain is closed (`Ok`). Every other end is an
+/// `Err`.
 pub async fn run(
     conductor: &dyn Conductor,
     cfg: &Config,
     shutdown: &mut ham::ShutdownRx,
 ) -> Result<()> {
-    // The close binds to a configured successor (single-landing). Resolve it up
-    // front so a missing/garbled MIGRATION_AGENT_TO_DNA fails the close service
-    // immediately (not mid-loop); open/verify/status, which don't set it, are
-    // unaffected (validated only here, the way OpenConfig is only by `open`).
     let target: DnaHash = cfg
         .to_dna
         .clone()
@@ -70,6 +66,14 @@ pub async fn run(
                 });
                 anyhow::bail!("close hard-stopped: {why}");
             }
+            CloseOutcome::Transient(e) if is_connection_lost(&e) => {
+                let e = e.context("conductor or lair connection lost, exiting to reconnect");
+                persist(cfg, &mut state, |s| {
+                    s.step = Step::Probing;
+                    s.message = format!("{e:#}");
+                });
+                return Err(e);
+            }
             CloseOutcome::Transient(e) => {
                 // Jittered backoff via ham's shared curve (de-synchronizes many
                 // agents retrying after the same gossip blip).
@@ -86,6 +90,12 @@ pub async fn run(
             }
         }
     }
+}
+
+/// `ham`'s `"io error"` needle also matches a response that failed to decode, and
+/// a response means the socket answered.
+fn is_connection_lost(e: &anyhow::Error) -> bool {
+    ham::is_connection_error(e) && !crate::dna_errors::is_response_decode_failure(&format!("{e:#}"))
 }
 
 /// One probe → act pass.
@@ -198,6 +208,7 @@ async fn prepare_check_close(
         Err(PolicyError::Misconfigured(why) | PolicyError::Fatal(why)) => {
             return CloseOutcome::HardStop(why)
         }
+        Err(PolicyError::ConnectionLost(e)) => return CloseOutcome::Transient(anyhow::anyhow!(e)),
     };
 
     persist(cfg, state, |s| {
@@ -211,10 +222,6 @@ async fn prepare_check_close(
     }
 }
 
-/// Classify a close-side zome-call failure. A target-binding fault (the configured
-/// `to_dna` is not in this DNA's `upgrade_targets`) is a HARD stop: retrying can
-/// never fix a misconfigured target. Everything else (gossip lag, a websocket
-/// blip) stays transient.
 fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     if crate::dna_errors::is_close_target_hard_failure(&format!("{e:#}")) {
         CloseOutcome::HardStop(format!("{ctx}: {e:#}"))
@@ -223,10 +230,9 @@ fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     }
 }
 
-/// [`classify_close_failure`] for a call whose RESPONSE VALUE the close needs.
-/// A response that did not decode is a second hard stop here and nowhere else:
-/// for a read the state cannot be learned, while for a write it says nothing
-/// about whether the write landed, which the next pass's probe reads back.
+/// [`classify_close_failure`] for a read: a response that did not decode leaves
+/// the state unknowable, so it hard-stops. A write never does, since the next
+/// pass's probe reads back whether it landed.
 fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     let rendered = format!("{e:#}");
     if crate::dna_errors::is_response_decode_failure(&rendered) {
@@ -236,10 +242,6 @@ fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutc
     }
 }
 
-/// Bridges the policy's [`Checker`] to a live `request_close_check` zome call,
-/// applying the per-request timeout and mapping the response. `Warranted` is
-/// raised through the `Err` channel so the policy hard-stops the whole
-/// migration rather than substituting.
 struct ConductorChecker<'a> {
     conductor: &'a dyn Conductor,
     payload: SummaryStatePayload,
@@ -267,6 +269,9 @@ impl Checker for ConductorChecker<'_> {
                         ),
                     ));
                 }
+                if is_connection_lost(&e) {
+                    return Err(PolicyError::ConnectionLost(rendered));
+                }
                 tracing::warn!(notary = %notary, error = %rendered,
                     "request_close_check errored");
                 Ok(CheckOutcome::Errored)
@@ -281,7 +286,6 @@ impl Checker for ConductorChecker<'_> {
     }
 }
 
-/// Real sleeper for the policy backoff.
 struct TokioSleeper;
 
 impl Sleeper for TokioSleeper {
@@ -298,25 +302,15 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
     }
 }
 
-/// Shutdown fired before the chain was closed: the migration is INCOMPLETE, so
-/// the service must exit nonzero (not `Ok`). A supervised one-shot exits 0 only
-/// on success — exiting 0 here would let systemd's `Restart=on-failure` treat an
-/// interrupted (e.g. reboot mid-close) run as done and never resume it. The
-/// in-progress step is the operator-must-intervene `Step::Failed`'s opposite —
-/// a restart re-probes and resumes — so we deliberately do NOT touch the state
-/// file here: leaving the last meaningful record (agent + approval attribution
-/// a prior pass wrote) intact rather than clobbering it with this pass's
-/// possibly-bare in-memory `State` (the top-of-loop bail can fire before any
-/// `attempt` has populated it). The next restart's first probe rewrites it.
+/// Exits nonzero: exiting 0 would leave the unit looking finished, and
+/// `Restart=on-failure` would not resume a run stopped from outside systemd. The
+/// state file is left alone, so until the next run probes it keeps the agent and
+/// approvals a prior pass recorded; the in-memory `State` can still be bare here.
 fn shutdown_before_complete() -> Result<()> {
     anyhow::bail!("shutdown before close completed (chain still open)")
 }
 
-/// Apply `f` to the carried `state` and persist it, swallowing (logging) a
-/// write error — a failed status write must never abort the migration itself.
-/// Mutating the carried `state` in place (rather than re-stamping a fresh
-/// `State::new`) is what makes `agent` / `approvals_*` progress persist across
-/// passes and into the final closed record.
+/// A failed write must never abort the migration.
 fn persist(cfg: &Config, state: &mut State, f: impl FnOnce(&mut State)) {
     f(state);
     if let Err(e) = state.write(&cfg.state_file) {

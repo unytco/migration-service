@@ -230,12 +230,10 @@ fn is_migration_init_hard_failure(r_lower: &str) -> bool {
         || r_lower.contains("is not an accepted predecessor")
 }
 
-/// Whether a close-side error — from `prepare_closing_summary`'s pre-check or the
-/// close validator — is a terminal target-binding fault: the configured `to_dna`
-/// is not in the source GD's `upgrade_targets`, so no amount of retrying fixes it
-/// (unlike propagation lag / a transient blip, which the close loop retries
-/// forever). Mirrors the two target strings; lowercased internally so the caller
-/// may pass the raw rendered error.
+/// Whether a close-side error, from `prepare_closing_summary`'s pre-check or the
+/// close validator, is a terminal target-binding fault: the configured `to_dna`
+/// is not in the source GD's `upgrade_targets`, so no amount of retrying fixes it.
+/// Lowercased internally so the caller may pass the raw rendered error.
 pub fn is_close_target_hard_failure(rendered: &str) -> bool {
     if let Some(code) = MigrationError::from_rendered(rendered) {
         return code == MigrationError::CloseTargetNotUpgradeTarget;

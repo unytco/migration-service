@@ -53,7 +53,7 @@ fn tmp_state(name: &str) -> std::path::PathBuf {
 }
 
 /// A shutdown receiver whose sender is already gone, so the loop's first
-/// backoff ends the run: a test reaching it proves the failure was transient.
+/// backoff ends the run: a test reaching it proves the failure backed off.
 fn never_shutdown() -> ham::ShutdownRx {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     rx
@@ -287,12 +287,9 @@ async fn undecodable_ledger_hard_stops_instead_of_looping() {
 
 #[tokio::test]
 async fn a_transient_ledger_failure_still_retries() {
-    // Only a DECODE failure is terminal. A websocket blip must keep backing
-    // off, or an ordinary hiccup mid-window aborts the close.
     let mock = open_chain(vec![agent(70)], 1, vec![]);
     *mock.ledger.lock().unwrap() = Some(Err(anyhow::anyhow!(
-        "get_ledger zome call failed: Failed to call zome: Websocket error: \
-         Websocket closed: No connection"
+        "get_ledger zome call failed: Failed to call zome: Websocket error: Timeout"
     )));
     let err = run_close("transient-ledger", &mock)
         .await
@@ -300,7 +297,7 @@ async fn a_transient_ledger_failure_still_retries() {
         .unwrap_err();
     assert!(
         err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
-        "a transport blip must back off, not hard-stop: {err}"
+        "a request timeout must back off, not hard-stop: {err}"
     );
 }
 
@@ -366,19 +363,23 @@ async fn undecodable_check_response_hard_stops_without_blaming_the_notaries() {
 async fn an_undecodable_write_response_still_retries() {
     // A WRITE whose response did not decode says nothing about whether the write
     // landed, and the next pass's probe reads that back.
-    let mock = open_chain(vec![agent(70)], 1, vec![CloseCheckResponse::Approved]);
-    *mock.close_result.lock().unwrap() = Some(Err(anyhow::anyhow!(
-        "close_agent_chain zome call failed: Failed to deserialize response: \
-         invalid length 32, expected 39"
-    )));
-    let err = run_close("undecodable-write", &mock)
-        .await
-        .result
-        .unwrap_err();
-    assert!(
-        err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
-        "an undecodable write response must re-probe, not hard-stop: {err}"
-    );
+    for cause in [
+        "invalid length 32, expected 39",
+        "IO error while reading marker: failed to fill whole buffer",
+    ] {
+        let mock = open_chain(vec![agent(70)], 1, vec![CloseCheckResponse::Approved]);
+        *mock.close_result.lock().unwrap() = Some(Err(anyhow::anyhow!(
+            "close_agent_chain zome call failed: Failed to deserialize response: {cause}"
+        )));
+        let err = run_close("undecodable-write", &mock)
+            .await
+            .result
+            .unwrap_err();
+        assert!(
+            err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
+            "an undecodable write response must re-probe, not hard-stop or exit: {err}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -513,6 +514,9 @@ async fn an_unavailable_notary_is_substituted() {
         Ok(CloseCheckResponse::UnableToVerify),
         Ok(CloseCheckResponse::NotAClosingNotary),
         Err("request_close_check zome call failed: Failed to call zome: notary call failed"),
+        Err(
+            r#"request_close_check zome call failed: Failed to call zome: External API wire error: RibosomeError("notary call failed: NetworkError(\"connection reset by peer: BrokenPipe\")")"#,
+        ),
     ] {
         let mock = open_chain(vec![agent(70), agent(71)], 1, vec![]);
         mock.check_responses
@@ -623,8 +627,8 @@ async fn an_unrecognized_probe_answer_backs_off_without_preparing() {
         .lock()
         .unwrap()
         .push_back(Err(anyhow::anyhow!(
-            "get_migration_close_state zome call failed: Failed to call zome: \
-             Websocket error: Websocket closed: No connection"
+            "get_migration_close_state zome call failed: Failed to call zome: External API \
+             wire error: RibosomeError(\"Source chain error: deadline has elapsed\")"
         )));
     let run = run_close("unrecognized-probe", &mock).await;
     let err = run.result.unwrap_err();
@@ -672,4 +676,141 @@ async fn a_summary_with_no_close_hard_stops_without_closing_again() {
         "nothing is prepared, checked or closed"
     );
     assert_eq!(run.state.unwrap().step, Step::Failed);
+}
+
+fn socket_closed(call: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{call} zome call failed: Failed to call zome: Websocket error: \
+         Websocket closed: No connection"
+    )
+}
+
+fn lair_gone(call: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{call} zome call failed: Failed to call zome: Unable to sign zome call: \
+         {{\"error\":\"BrokenPipe\"}}"
+    )
+}
+
+fn probes(calls: &[Call]) -> usize {
+    calls
+        .iter()
+        .filter(|c| **c == Call::GetMigrationCloseState)
+        .count()
+}
+
+#[tokio::test]
+async fn a_lost_connection_exits_for_a_restart_instead_of_retrying_on_it() {
+    const SOCKET: &str = "Websocket closed: No connection";
+    let probe_fails = |e: anyhow::Error| {
+        let mock = MockConductor::default();
+        mock.close_state.lock().unwrap().push_back(Err(e));
+        mock
+    };
+    let ledger_fails = open_chain(vec![agent(70)], 1, vec![]);
+    *ledger_fails.ledger.lock().unwrap() = Some(Err(socket_closed("get_ledger")));
+    let fee_drop_fails = open_chain_owing(unit_map(0, 5), vec![agent(70)], 1, vec![]);
+    *fee_drop_fails.drop_fees.lock().unwrap() = Some(Err(socket_closed("drop_off_fees")));
+    let prepare_fails = open_chain(vec![agent(70)], 1, vec![]);
+    *prepare_fails.prepare.lock().unwrap() = [Err(socket_closed("prepare_closing_summary"))].into();
+    let close_fails = open_chain(vec![agent(70)], 1, vec![CloseCheckResponse::Approved]);
+    *close_fails.close_result.lock().unwrap() = Some(Err(socket_closed("close_agent_chain")));
+
+    for (site, mock, cause) in [
+        (
+            "probe",
+            probe_fails(socket_closed("get_migration_close_state")),
+            SOCKET,
+        ),
+        (
+            "probe-lair",
+            probe_fails(lair_gone("get_migration_close_state")),
+            "BrokenPipe",
+        ),
+        ("ledger", ledger_fails, SOCKET),
+        ("fee-drop", fee_drop_fails, SOCKET),
+        ("prepare", prepare_fails, SOCKET),
+        ("close", close_fails, SOCKET),
+    ] {
+        let run = run_close(&format!("connection-lost-{site}"), &mock).await;
+        let err = run.result.unwrap_err();
+        assert!(
+            err.contains("connection lost, exiting to reconnect")
+                && err.contains(cause)
+                && !err.contains("shutdown before close completed")
+                && !err.contains("hard-stopped"),
+            "{site}: a dead connection must end the run, cause intact, without a backoff: {err}"
+        );
+        assert_eq!(probes(&run.calls), 1, "{site}: {:?}", run.calls);
+        let state = run.state.unwrap();
+        assert_eq!(
+            state.step,
+            Step::Probing,
+            "{site}: shows the step a restart resumes at"
+        );
+        assert!(
+            state
+                .message
+                .contains("connection lost, exiting to reconnect")
+                && state.message.contains(cause),
+            "{site}: {}",
+            state.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failure_on_a_live_connection_retries_on_it() {
+    for (name, failure) in [
+        ("live-timeout", "Websocket error: Timeout"),
+        (
+            "live-keystore",
+            r#"External API wire error: RibosomeError("KeystoreError: {\"error\":\"BrokenPipe\"}")"#,
+        ),
+    ] {
+        let tmp = tmp_state(name);
+        let mock = MockConductor::default();
+        let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+        *mock.close_state.lock().unwrap() = [
+            Err(anyhow::anyhow!(
+                "get_migration_close_state zome call failed: Failed to call zome: {failure}"
+            )),
+            Ok(committed_close(3, closing)),
+        ]
+        .into();
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        close::run(&mock, &cfg(&tmp), &mut rx)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the retry reads the close back: {e:#}"));
+        assert_eq!(probes(&mock.calls()), 2, "{name}: {:?}", mock.calls());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[tokio::test]
+async fn a_connection_lost_during_the_checks_exits_without_substituting() {
+    let mock = open_chain(vec![agent(70), agent(71)], 1, vec![]);
+    mock.check_responses
+        .lock()
+        .unwrap()
+        .push_back(Err(socket_closed("request_close_check")));
+    let run = run_close("connection-lost-checks", &mock).await;
+    let err = run.result.unwrap_err();
+    assert!(
+        err.contains("connection lost, exiting to reconnect")
+            && err.contains("request_close_check zome call failed")
+            && !err.contains("notary list exhausted"),
+        "{err}"
+    );
+    assert_eq!(probes(&run.calls), 1, "{:?}", run.calls);
+    assert_eq!(
+        run.calls
+            .iter()
+            .filter(|c| **c == Call::RequestCloseCheck)
+            .count(),
+        1,
+        "no notary is blamed for the dead connection: {:?}",
+        run.calls
+    );
+    assert!(!run.calls.contains(&Call::CloseAgentChain));
 }

@@ -118,6 +118,8 @@ pub enum PolicyError {
     Misconfigured(String),
     /// The injected checker returned a hard error the policy can't classify.
     Fatal(String),
+    /// The checker's connection is gone, so no notary can be asked on it.
+    ConnectionLost(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -133,6 +135,7 @@ impl std::fmt::Display for PolicyError {
             ),
             PolicyError::Misconfigured(why) => write!(f, "{why}"),
             PolicyError::Fatal(e) => write!(f, "fatal error collecting approvals: {e}"),
+            PolicyError::ConnectionLost(e) => write!(f, "{e}"),
         }
     }
 }
@@ -140,9 +143,8 @@ impl std::fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 /// The checker the policy drives: ask `notary` to check the payload, returning
-/// a resolved [`CheckOutcome`] (the timeout is the caller's to apply).
-/// `Warranted` is surfaced as `Err(PolicyError::Warranted)` because it stops
-/// the whole migration, not just this notary.
+/// a resolved [`CheckOutcome`] (the timeout is the caller's to apply). An `Err`
+/// ends collection instead of substituting this notary.
 pub trait Checker {
     fn check(
         &self,
@@ -163,10 +165,7 @@ fn backoff(attempt: u32, opts: &PolicyOpts) -> Duration {
     let cfg = ham::BackoffConfig {
         initial_ms: opts.retry_initial.as_millis().min(u64::MAX as u128) as u64,
         max_ms: opts.retry_max.as_millis().min(u64::MAX as u128) as u64,
-        // The policy substitutes a stuck notary after `state_mismatch_retries`,
-        // so this log-escalation knob is never actually reached; mirror ham's
-        // default rather than invent a meaning for it.
-        escalate_after: ham::BackoffConfig::default().escalate_after,
+        ..ham::BackoffConfig::default()
     };
     Duration::from_millis(ham::compute_delay_ms(attempt, &cfg))
 }
