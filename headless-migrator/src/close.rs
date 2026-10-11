@@ -30,15 +30,13 @@ enum CloseOutcome {
     Transient(anyhow::Error),
 }
 
-/// Run the close service until the chain is closed (`Ok`), or until a hard
-/// stop, a shutdown or a lost connection ends it (`Err`).
+/// Run the close service until the chain is closed (`Ok`). Every other end is an
+/// `Err`.
 pub async fn run(
     conductor: &dyn Conductor,
     cfg: &Config,
     shutdown: &mut ham::ShutdownRx,
 ) -> Result<()> {
-    // Only the close reads MIGRATION_AGENT_TO_DNA, so it is validated here, before
-    // the loop, rather than in `Config::from_env`.
     let target: DnaHash = cfg
         .to_dna
         .clone()
@@ -68,9 +66,12 @@ pub async fn run(
                 });
                 anyhow::bail!("close hard-stopped: {why}");
             }
-            CloseOutcome::Transient(e) if ham::is_connection_error(&e) => {
+            CloseOutcome::Transient(e) if is_connection_lost(&e) => {
                 let e = e.context("conductor or lair connection lost, exiting to reconnect");
-                persist(cfg, &mut state, |s| s.message = format!("{e:#}"));
+                persist(cfg, &mut state, |s| {
+                    s.step = Step::Probing;
+                    s.message = format!("{e:#}");
+                });
                 return Err(e);
             }
             CloseOutcome::Transient(e) => {
@@ -89,6 +90,12 @@ pub async fn run(
             }
         }
     }
+}
+
+/// `ham`'s `"io error"` needle also matches a response that failed to decode, and
+/// a response means the socket answered.
+fn is_connection_lost(e: &anyhow::Error) -> bool {
+    ham::is_connection_error(e) && !crate::dna_errors::is_response_decode_failure(&format!("{e:#}"))
 }
 
 /// One probe → act pass.
@@ -214,9 +221,6 @@ async fn prepare_check_close(
     }
 }
 
-/// Classify a close-side zome-call failure. A target-binding fault (the configured
-/// `to_dna` is not in this DNA's `upgrade_targets`) is a hard stop, since no retry
-/// fixes it. Everything else is transient.
 fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     if crate::dna_errors::is_close_target_hard_failure(&format!("{e:#}")) {
         CloseOutcome::HardStop(format!("{ctx}: {e:#}"))
@@ -299,16 +303,15 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
     }
 }
 
-/// Exits nonzero, or `Restart=on-failure` would treat an interrupted run as done
-/// and never resume it. The state file is left alone: the in-memory `State` can
-/// still be bare here, and writing it would erase the agent and approvals a
-/// prior pass recorded.
+/// Exits nonzero: exiting 0 would leave the unit looking finished, and
+/// `Restart=on-failure` would not resume a run stopped from outside systemd. The
+/// state file is left alone, so a stopped service keeps showing the agent and
+/// approvals a prior pass recorded; the in-memory `State` can still be bare here.
 fn shutdown_before_complete() -> Result<()> {
     anyhow::bail!("shutdown before close completed (chain still open)")
 }
 
-/// Apply `f` to the carried `state` and persist it. A failed write is logged,
-/// never allowed to abort the migration.
+/// A failed write must never abort the migration.
 fn persist(cfg: &Config, state: &mut State, f: impl FnOnce(&mut State)) {
     f(state);
     if let Err(e) = state.write(&cfg.state_file) {
