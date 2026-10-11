@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - notary-daemon: the daemon answers again after its conductor or lair keystore restarts, without being restarted itself.
-- headless-migrator: the close service restarts itself when its conductor or lair restarts.
+- headless-migrator: the close service resumes after its conductor or lair keystore restarts.
 
 ## [0.2.0] - 2026-10-06
 
