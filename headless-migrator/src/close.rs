@@ -230,10 +230,9 @@ fn classify_close_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     }
 }
 
-/// [`classify_close_failure`] for a call whose RESPONSE VALUE the close needs.
-/// A response that did not decode is a second hard stop here and nowhere else:
-/// for a read the state cannot be learned, while for a write it says nothing
-/// about whether the write landed, which the next pass's probe reads back.
+/// [`classify_close_failure`] for a read: a response that did not decode leaves
+/// the state unknowable, so it hard-stops. A write never does, since the next
+/// pass's probe reads back whether it landed.
 fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutcome {
     let rendered = format!("{e:#}");
     if crate::dna_errors::is_response_decode_failure(&rendered) {
@@ -243,10 +242,6 @@ fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutc
     }
 }
 
-/// Bridges the policy's [`Checker`] to a live `request_close_check` zome call,
-/// applying the per-request timeout and mapping the response. `Warranted` and a
-/// lost connection are raised through the `Err` channel, so the policy stops
-/// rather than substituting.
 struct ConductorChecker<'a> {
     conductor: &'a dyn Conductor,
     payload: SummaryStatePayload,
@@ -309,7 +304,7 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &mut ham::ShutdownRx) -> boo
 
 /// Exits nonzero: exiting 0 would leave the unit looking finished, and
 /// `Restart=on-failure` would not resume a run stopped from outside systemd. The
-/// state file is left alone, so a stopped service keeps showing the agent and
+/// state file is left alone, so until the next run probes it keeps the agent and
 /// approvals a prior pass recorded; the in-memory `State` can still be bare here.
 fn shutdown_before_complete() -> Result<()> {
     anyhow::bail!("shutdown before close completed (chain still open)")

@@ -514,6 +514,9 @@ async fn an_unavailable_notary_is_substituted() {
         Ok(CloseCheckResponse::UnableToVerify),
         Ok(CloseCheckResponse::NotAClosingNotary),
         Err("request_close_check zome call failed: Failed to call zome: notary call failed"),
+        Err(
+            r#"request_close_check zome call failed: Failed to call zome: External API wire error: RibosomeError("notary call failed: NetworkError(\"connection reset by peer: BrokenPipe\")")"#,
+        ),
     ] {
         let mock = open_chain(vec![agent(70), agent(71)], 1, vec![]);
         mock.check_responses

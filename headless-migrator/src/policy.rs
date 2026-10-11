@@ -15,7 +15,6 @@
 //! - A threshold of 0, or fewer distinct notaries than M: misconfigured, since
 //!   no attempt can succeed.
 //! - `Warranted` → hard stop for the whole migration.
-//! - `ConnectionLost` ends the attempt without substituting.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -144,9 +143,8 @@ impl std::fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 /// The checker the policy drives: ask `notary` to check the payload, returning
-/// a resolved [`CheckOutcome`] (the timeout is the caller's to apply).
-/// `Warranted` is surfaced as `Err(PolicyError::Warranted)` because it stops
-/// the whole migration, not just this notary.
+/// a resolved [`CheckOutcome`] (the timeout is the caller's to apply). An `Err`
+/// ends collection instead of substituting this notary.
 pub trait Checker {
     fn check(
         &self,
@@ -167,10 +165,7 @@ fn backoff(attempt: u32, opts: &PolicyOpts) -> Duration {
     let cfg = ham::BackoffConfig {
         initial_ms: opts.retry_initial.as_millis().min(u64::MAX as u128) as u64,
         max_ms: opts.retry_max.as_millis().min(u64::MAX as u128) as u64,
-        // The policy substitutes a stuck notary after `state_mismatch_retries`,
-        // so this log-escalation knob is never actually reached; mirror ham's
-        // default rather than invent a meaning for it.
-        escalate_after: ham::BackoffConfig::default().escalate_after,
+        ..ham::BackoffConfig::default()
     };
     Duration::from_millis(ham::compute_delay_ms(attempt, &cfg))
 }
