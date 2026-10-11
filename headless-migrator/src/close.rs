@@ -208,6 +208,7 @@ async fn prepare_check_close(
         Err(PolicyError::Misconfigured(why) | PolicyError::Fatal(why)) => {
             return CloseOutcome::HardStop(why)
         }
+        Err(PolicyError::ConnectionLost(e)) => return CloseOutcome::Transient(anyhow::anyhow!(e)),
     };
 
     persist(cfg, state, |s| {
@@ -243,9 +244,9 @@ fn classify_close_read_failure(e: anyhow::Error, ctx: &'static str) -> CloseOutc
 }
 
 /// Bridges the policy's [`Checker`] to a live `request_close_check` zome call,
-/// applying the per-request timeout and mapping the response. `Warranted` is
-/// raised through the `Err` channel so the policy hard-stops the whole
-/// migration rather than substituting.
+/// applying the per-request timeout and mapping the response. `Warranted` and a
+/// lost connection are raised through the `Err` channel, so the policy stops
+/// rather than substituting.
 struct ConductorChecker<'a> {
     conductor: &'a dyn Conductor,
     payload: SummaryStatePayload,
@@ -272,6 +273,9 @@ impl Checker for ConductorChecker<'_> {
                             &rendered,
                         ),
                     ));
+                }
+                if is_connection_lost(&e) {
+                    return Err(PolicyError::ConnectionLost(rendered));
                 }
                 tracing::warn!(notary = %notary, error = %rendered,
                     "request_close_check errored");

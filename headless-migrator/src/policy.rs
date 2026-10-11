@@ -15,6 +15,7 @@
 //! - A threshold of 0, or fewer distinct notaries than M: misconfigured, since
 //!   no attempt can succeed.
 //! - `Warranted` → hard stop for the whole migration.
+//! - `ConnectionLost` ends the attempt without substituting.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -118,6 +119,8 @@ pub enum PolicyError {
     Misconfigured(String),
     /// The injected checker returned a hard error the policy can't classify.
     Fatal(String),
+    /// The checker's connection is gone, so no notary can be asked on it.
+    ConnectionLost(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -133,6 +136,7 @@ impl std::fmt::Display for PolicyError {
             ),
             PolicyError::Misconfigured(why) => write!(f, "{why}"),
             PolicyError::Fatal(e) => write!(f, "fatal error collecting approvals: {e}"),
+            PolicyError::ConnectionLost(e) => write!(f, "{e}"),
         }
     }
 }

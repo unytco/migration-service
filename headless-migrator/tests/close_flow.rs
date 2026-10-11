@@ -785,28 +785,29 @@ async fn a_failure_on_a_live_connection_retries_on_it() {
 }
 
 #[tokio::test]
-async fn a_connection_lost_during_the_checks_exits_on_the_next_probe() {
-    let tmp = tmp_state("connection-lost-checks");
-    let mock = open_chain(vec![agent(70)], 1, vec![]);
+async fn a_connection_lost_during_the_checks_exits_without_substituting() {
+    let mock = open_chain(vec![agent(70), agent(71)], 1, vec![]);
     mock.check_responses
         .lock()
         .unwrap()
         .push_back(Err(socket_closed("request_close_check")));
-    mock.close_state
-        .lock()
-        .unwrap()
-        .push_back(Err(socket_closed("get_migration_close_state")));
-    let (_tx, mut rx) = tokio::sync::watch::channel(false);
-    let err = close::run(&mock, &cfg(&tmp), &mut rx)
-        .await
-        .map_err(|e| format!("{e:#}"))
-        .unwrap_err();
+    let run = run_close("connection-lost-checks", &mock).await;
+    let err = run.result.unwrap_err();
     assert!(
-        err.contains("connection lost, exiting to reconnect"),
+        err.contains("connection lost, exiting to reconnect")
+            && err.contains("request_close_check zome call failed")
+            && !err.contains("notary list exhausted"),
         "{err}"
     );
-    let calls = mock.calls();
-    assert_eq!(probes(&calls), 2, "{calls:?}");
-    assert!(!calls.contains(&Call::CloseAgentChain), "{calls:?}");
-    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(probes(&run.calls), 1, "{:?}", run.calls);
+    assert_eq!(
+        run.calls
+            .iter()
+            .filter(|c| **c == Call::RequestCloseCheck)
+            .count(),
+        1,
+        "no notary is blamed for the dead connection: {:?}",
+        run.calls
+    );
+    assert!(!run.calls.contains(&Call::CloseAgentChain));
 }
