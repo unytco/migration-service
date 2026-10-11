@@ -287,12 +287,9 @@ async fn undecodable_ledger_hard_stops_instead_of_looping() {
 
 #[tokio::test]
 async fn a_transient_ledger_failure_still_retries() {
-    // Only a DECODE failure is terminal. A websocket blip must keep backing
-    // off, or an ordinary hiccup mid-window aborts the close.
     let mock = open_chain(vec![agent(70)], 1, vec![]);
     *mock.ledger.lock().unwrap() = Some(Err(anyhow::anyhow!(
-        "get_ledger zome call failed: Failed to call zome: Websocket error: \
-         Websocket closed: No connection"
+        "get_ledger zome call failed: Failed to call zome: Websocket error: Timeout"
     )));
     let err = run_close("transient-ledger", &mock)
         .await
@@ -300,7 +297,7 @@ async fn a_transient_ledger_failure_still_retries() {
         .unwrap_err();
     assert!(
         err.contains("shutdown before close completed") && !err.contains("hard-stopped"),
-        "a transport blip must back off, not hard-stop: {err}"
+        "a request timeout must back off, not hard-stop: {err}"
     );
 }
 
@@ -623,8 +620,8 @@ async fn an_unrecognized_probe_answer_backs_off_without_preparing() {
         .lock()
         .unwrap()
         .push_back(Err(anyhow::anyhow!(
-            "get_migration_close_state zome call failed: Failed to call zome: \
-             Websocket error: Websocket closed: No connection"
+            "get_migration_close_state zome call failed: Source chain error: \
+             deadline has elapsed"
         )));
     let run = run_close("unrecognized-probe", &mock).await;
     let err = run.result.unwrap_err();
@@ -672,4 +669,128 @@ async fn a_summary_with_no_close_hard_stops_without_closing_again() {
         "nothing is prepared, checked or closed"
     );
     assert_eq!(run.state.unwrap().step, Step::Failed);
+}
+
+fn socket_closed(call: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{call} zome call failed: Failed to call zome: Websocket error: \
+         Websocket closed: No connection"
+    )
+}
+
+fn lair_gone(call: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{call} zome call failed: Failed to call zome: Unable to sign zome call: \
+         {{\"error\":\"BrokenPipe\"}}"
+    )
+}
+
+fn probes(calls: &[Call]) -> usize {
+    calls
+        .iter()
+        .filter(|c| **c == Call::GetMigrationCloseState)
+        .count()
+}
+
+#[tokio::test]
+async fn a_lost_connection_exits_for_a_restart_instead_of_retrying_on_it() {
+    let probe_fails = |e: anyhow::Error| {
+        let mock = MockConductor::default();
+        mock.close_state.lock().unwrap().push_back(Err(e));
+        mock
+    };
+    let ledger_fails = open_chain(vec![agent(70)], 1, vec![]);
+    *ledger_fails.ledger.lock().unwrap() = Some(Err(socket_closed("get_ledger")));
+    let fee_drop_fails = open_chain_owing(unit_map(0, 5), vec![agent(70)], 1, vec![]);
+    *fee_drop_fails.drop_fees.lock().unwrap() = Some(Err(socket_closed("drop_off_fees")));
+    let prepare_fails = open_chain(vec![agent(70)], 1, vec![]);
+    *prepare_fails.prepare.lock().unwrap() = [Err(socket_closed("prepare_closing_summary"))].into();
+    let close_fails = open_chain(vec![agent(70)], 1, vec![CloseCheckResponse::Approved]);
+    *close_fails.close_result.lock().unwrap() = Some(Err(socket_closed("close_agent_chain")));
+
+    for (site, mock) in [
+        (
+            "probe",
+            probe_fails(socket_closed("get_migration_close_state")),
+        ),
+        (
+            "probe-lair",
+            probe_fails(lair_gone("get_migration_close_state")),
+        ),
+        ("ledger", ledger_fails),
+        ("fee-drop", fee_drop_fails),
+        ("prepare", prepare_fails),
+        ("close", close_fails),
+    ] {
+        let run = run_close(&format!("connection-lost-{site}"), &mock).await;
+        let err = run.result.unwrap_err();
+        assert!(
+            err.contains("connection lost, exiting to reconnect")
+                && !err.contains("shutdown before close completed")
+                && !err.contains("hard-stopped"),
+            "{site}: a dead connection must end the run without a backoff: {err}"
+        );
+        assert_eq!(probes(&run.calls), 1, "{site}: {:?}", run.calls);
+        let state = run.state.unwrap();
+        assert_ne!(
+            state.step,
+            Step::Failed,
+            "{site}: a restart resumes it, so no operator is needed"
+        );
+        assert!(
+            state
+                .message
+                .contains("connection lost, exiting to reconnect"),
+            "{site}: {}",
+            state.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_timeout_retries_on_the_same_connection() {
+    let tmp = tmp_state("live-timeout");
+    let mock = MockConductor::default();
+    let closing = summary_state(unit_map(0, 10), CarryForwardUnits::new(), 0);
+    *mock.close_state.lock().unwrap() = [
+        Err(anyhow::anyhow!(
+            "get_migration_close_state zome call failed: Failed to call zome: \
+             Websocket error: Timeout"
+        )),
+        Ok(committed_close(3, closing)),
+    ]
+    .into();
+    let (_tx, mut rx) = tokio::sync::watch::channel(false);
+    close::run(&mock, &cfg(&tmp), &mut rx)
+        .await
+        .expect("the retry reads the close back");
+    assert_eq!(probes(&mock.calls()), 2, "{:?}", mock.calls());
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn a_connection_lost_during_the_checks_exits_on_the_next_probe() {
+    let tmp = tmp_state("connection-lost-checks");
+    let mock = open_chain(vec![agent(70)], 1, vec![]);
+    mock.check_responses
+        .lock()
+        .unwrap()
+        .push_back(Err(socket_closed("request_close_check")));
+    mock.close_state
+        .lock()
+        .unwrap()
+        .push_back(Err(socket_closed("get_migration_close_state")));
+    let (_tx, mut rx) = tokio::sync::watch::channel(false);
+    let err = close::run(&mock, &cfg(&tmp), &mut rx)
+        .await
+        .map_err(|e| format!("{e:#}"))
+        .unwrap_err();
+    assert!(
+        err.contains("connection lost, exiting to reconnect"),
+        "{err}"
+    );
+    let calls = mock.calls();
+    assert_eq!(probes(&calls), 2, "{calls:?}");
+    assert!(!calls.contains(&Call::CloseAgentChain), "{calls:?}");
+    let _ = std::fs::remove_file(&tmp);
 }
