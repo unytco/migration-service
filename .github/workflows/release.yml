@@ -140,11 +140,52 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The router as a Worker bundle for deployments that supply their own registry
+  # (src/index.binding.ts). The auto-deployed router (deploy.yml) is built from
+  # src/index.ts instead and is not affected. `--dry-run --outdir` emits exactly
+  # what `wrangler deploy` would upload, without credentials.
+  router:
+    name: Build migration-router-worker.js
+    needs: version
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: migration-router
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Uncached, for the reason deploy.yml gives.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Bundle
+        run: |
+          set -euo pipefail
+
+          npx wrangler deploy src/index.binding.ts --dry-run --outdir dist
+
+          # Cloudflare names the main module after the uploaded file, so a
+          # deployment sets its main module to this fixed name.
+          mkdir -p release
+          cp dist/index.binding.js release/migration-router-worker.js
+          ( cd release && sha256sum migration-router-worker.js > migration-router-worker.js.sha256 )
+
+          ls -lh release/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-migration-router-worker
+          path: migration-router/release/
+          if-no-files-found: error
+          retention-days: 1
+
   # Separate job so that compiling the Holochain client stack, and the actions
   # around it, never run with a token that can write releases.
   publish:
     name: Publish
-    needs: [version, build]
+    needs: [version, build, router]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -180,6 +221,8 @@ jobs:
             release/headless-migrator.sha256
             release/migration-notary
             release/migration-notary.sha256
+            release/migration-router-worker.js
+            release/migration-router-worker.js.sha256
           )
 
           # Converge rather than fail when re-running a partially failed release.

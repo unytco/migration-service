@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **router: a release bundle that brings its own registry.** A third entry point, `src/index.binding.ts`, serves the registry in the `REGISTRY_JSON` binding and bundles none, so one bundle deploys to any environment with that environment's version chain. Released as `migration-router-worker.js` (+ `.sha256`). A missing or invalid binding fails every request, `/healthz` included. The auto-deployed router is unchanged.
+
 ### Fixed
 
 - notary-daemon: the daemon answers again after its conductor or lair keystore restarts, without being restarted itself.

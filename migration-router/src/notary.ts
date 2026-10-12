@@ -16,6 +16,9 @@ export interface Env {
   /** The releases listing of this network's app, in GitHub's releases JSON shape. When unset,
    * update checks carry no `latest_build`. */
   GITHUB_RELEASES_URL?: string;
+  /** The registry as JSON text. Read only by the index.binding.ts entry point, which bundles
+   * none; index.ts and index.local.ts serve their bundled registry and ignore it. */
+  REGISTRY_JSON?: string;
 }
 
 /** Injectable fetch so tests can mock daemon responses. */
