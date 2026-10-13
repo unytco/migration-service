@@ -50,6 +50,7 @@ Assets have **fixed names**, so a provisioning script can hardcode the URL:
 |---|---|
 | `headless-migrator` | Stripped release binary — the close/open services |
 | `migration-notary` | Stripped release binary — the notary daemon |
+| `migration-router-worker.js` | The router as a Worker bundle that reads its registry from the `REGISTRY_JSON` binding — see [Deploying the router elsewhere](#deploying-the-router-elsewhere) |
 | `<name>.sha256` | Digest of each, bare filename inside |
 
 ```text
@@ -81,6 +82,18 @@ chmod 755 "$BIN"
 The binaries are built on the same Ubuntu release the fleet droplets run, so a target needs no toolchain and no extra packages: they link nothing beyond glibc, and their TLS roots are compiled in. Neither is configured by file — the daemon reads its config from the environment, `headless-migrator` from flags plus the environment.
 
 The asset names carry no version, so `--version` on either binary is how a deployed build identifies itself.
+
+### Deploying the router elsewhere
+
+The auto-deployed router (`src/index.ts`) bundles `registry.json`, so it serves one version chain. An environment that needs its own — fleet-command deploys one per environment, which every release in it migrates through — deploys `migration-router-worker.js` instead, built from `src/index.binding.ts`. It bundles no registry and serves the one in its bindings:
+
+| Binding | Type | Value |
+|---|---|---|
+| `REGISTRY_JSON` | plain text | The registry, in `registry.json`'s format. Validated as strictly as the bundled one. |
+| `MIGRATION_NOTARY_BEARER_TOKEN` | secret | As for the auto-deployed router. |
+| `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | secret | Optional, as for the auto-deployed router. |
+
+Set its main module to `migration-router-worker.js`. Without a valid `REGISTRY_JSON` every request, `/healthz` included, answers 500 rather than falling back to another chain.
 
 ## Branching / CI
 

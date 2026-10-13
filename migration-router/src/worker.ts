@@ -42,10 +42,42 @@ function warnIfUnprovisioned(raw: RawRegistry): void {
 export function workerFor(raw: RawRegistry, opts?: RegistryLoadOptions) {
   const registry = Registry.load(raw, opts);
   warnIfUnprovisioned(raw);
-  return createWorker(registry);
+  return createWorker(() => registry);
 }
 
-function createWorker(registry: Registry) {
+/** Resolves the registry a request is served from. Throws when there is none
+ * to serve, which fails that request — /healthz included. */
+export type RegistrySource = (env: Env) => Registry;
+
+/** The registry in the REGISTRY_JSON binding, loaded with the strict validator.
+ *
+ * A binding is only readable once a request arrives, so it is parsed on the
+ * first request rather than at module load, and kept for as long as the
+ * isolate sees the same text. A missing or invalid binding throws on every
+ * request instead of being cached, so the Worker stays unhealthy rather than
+ * falling back to some other registry. */
+export function registryFromBinding(): RegistrySource {
+  let loaded: { json: string; registry: Registry } | undefined;
+  return (env) => {
+    const json = env.REGISTRY_JSON;
+    if (!json) {
+      throw new Error("REGISTRY_JSON is not bound, so there is no registry to serve");
+    }
+    if (loaded?.json !== json) {
+      let raw: RawRegistry;
+      try {
+        raw = JSON.parse(json) as RawRegistry;
+      } catch (err) {
+        throw new Error(`REGISTRY_JSON is not JSON: ${String(err)}`);
+      }
+      loaded = { json, registry: Registry.load(raw) };
+    }
+    return loaded.registry;
+  };
+}
+
+/** Build the Worker export around a source of validated registries. */
+export function createWorker(registryFor: RegistrySource) {
   return {
     async fetch(request: Request, env: Env): Promise<Response> {
       if (request.method === "OPTIONS") {
@@ -56,6 +88,10 @@ function createWorker(registry: Registry) {
       const { pathname } = url;
 
       try {
+        // First, so a request is never answered — /healthz least of all —
+        // while there is no valid registry behind it.
+        const registry = registryFor(env);
+
         if (request.method === "GET" && pathname === "/healthz") {
           return withCors(healthz());
         }
