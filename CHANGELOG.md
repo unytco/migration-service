@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+### Changed
+
+- Both binaries run against Holochain 0.7.1.
+
 ## [0.3.0] - 2026-10-13
 
 ### Added
